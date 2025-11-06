@@ -1,0 +1,19 @@
+# Implant RFID Reader Dashboard - Python Dependencies
+# =================================================
+# 
+# PROPRIETARY SOFTWARE
+# Copyright (c) 2025 Establishment Labs
+# Developed by Little Endian Engineering
+# 
+# Version: 1.0
+# Date: January 2025
+# 
+# Installation: pip install -r requirements.txt
+# 
+# CONFIDENTIAL - PROPRIETARY SOFTWARE
+
+streamlit>=1.28.0
+pandas>=1.5.0
+pyserial>=3.5
+plotly>=5.15.0
+pytz>=2023.3 
