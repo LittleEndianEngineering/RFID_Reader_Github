@@ -4,6 +4,7 @@ import 'package:fl_chart/fl_chart.dart';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:async';
 import 'dart:ui' as ui;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
@@ -91,6 +92,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   bool isReadingRFID = false;
   String? lastReadResult; // "success" or "no_tag" or null
   Map<String, dynamic>? lastReadData; // The actual reading data if successful
+  Timer? _readTimeoutTimer; // Timeout timer for Read Now button
 
   // BLE Service and Characteristic UUIDs (matching ESP32 firmware)
   static const String SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
@@ -191,17 +193,43 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
 
   void _handleESP32Response(List<int> value) {
     String response = utf8.decode(value);
-    print("🔍 Received ESP32 response: $response");
+    
+    // Log empty responses to help diagnose BLE issues
+    if (response.isEmpty || response.trim().isEmpty) {
+      print("⚠️ Received EMPTY ESP32 response (length: ${value.length}) - possible BLE buffer issue");
+      return; // Don't process empty responses
+    }
+    
+    print("🔍 Received ESP32 response: $response (length: ${response.length}, bytes: ${value.length})");
     
     setState(() {
       rfidReadings.add(response);
     });
+    
+    // Check for error responses that indicate device reset or failure
+    if (isReadingRFID && (response.contains('[RTC]') || response.contains('Guru Meditation') || response.contains('Rebooting'))) {
+      print("⚠️ Device error detected during read");
+      _readTimeoutTimer?.cancel();
+      setState(() {
+        isReadingRFID = false;
+        lastReadResult = "error";
+        lastReadData = null;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Device error detected. Check RTC connection and power.'),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 3),
+        ),
+      );
+    }
     
     // Check for manual RFID read results
     if (isReadingRFID) {
       if (response.contains('[RFID] Tag detected and stored') || 
           response.contains('Tag detected and stored')) {
         print("✅ RFID TAG DETECTED!");
+        _readTimeoutTimer?.cancel(); // Cancel timeout - we got a response
         setState(() {
           isReadingRFID = false;
           lastReadResult = "success";
@@ -210,6 +238,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       } else if (response.contains('[RFID] No tag detected during window') ||
                  response.contains('No tag detected during window')) {
         print("❌ NO RFID TAG DETECTED");
+        _readTimeoutTimer?.cancel(); // Cancel timeout - we got a response
         setState(() {
           isReadingRFID = false;
           lastReadResult = "no_tag";
@@ -217,13 +246,17 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         });
       } else if (response.startsWith('#') && response.contains('°C') && lastReadResult == "success") {
         // This is the reading data after a successful tag detection
+        // NOTE: The reading is already stored on ESP32 by powerOnAndReadTagWindow()
+        // We parse it here for display only - it will appear in "All Readings" when retrieved
         print("📊 PARSING LIVE READING DATA");
+        _readTimeoutTimer?.cancel(); // Cancel timeout - we got the reading data
         _parseReadings(response);
-        // Extract the reading data from parsedReadings
+        // Extract the reading data from parsedReadings for display
         if (parsedReadings.isNotEmpty) {
           setState(() {
             lastReadData = parsedReadings.last;
             // Clear parsedReadings for manual read (we only want to show the last one)
+            // The reading is stored on ESP32, so it will appear in "All Readings"
             parsedReadings.clear();
             parsedReadings.add(lastReadData!);
           });
@@ -232,25 +265,33 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     }
     
     // Check if this is the start of a new query (clear previous readings)
-    if (response.contains('---BEGIN_READINGS---') || 
-        response.contains('Found') || 
-        (response.contains('Printing') && response.contains('stored readings'))) {
+    // Only clear on ---BEGIN_READINGS--- or Found, NOT on "Printing X stored readings:"
+    // because "Printing" comes AFTER ---BEGIN_READINGS--- and would clear already-parsed readings
+    if (response.contains('---BEGIN_READINGS---') || response.contains('Found')) {
       print("✅ DETECTED NEW QUERY START - clearing previous readings");
       setState(() {
         parsedReadings.clear();
       });
     }
     
-    // Check if this is the start of a range response
+    // Check if this is the start of a range response or "print" command response
     if (response.contains('---BEGIN_READINGS---') || response.contains('Found')) {
-      print("✅ DETECTED RANGE RESPONSE START - calling _parseReadings");
+      print("✅ DETECTED RANGE/PRINT RESPONSE START - calling _parseReadings");
       _parseReadings(response);
     } else if (response.contains('---END_READINGS---')) {
-      print("✅ DETECTED RANGE RESPONSE END - calling _parseReadings");
+      print("✅ DETECTED RANGE/PRINT RESPONSE END - calling _parseReadings");
       _parseReadings(response);
+    } else if (response.contains('Printing') && response.contains('stored readings')) {
+      // This is the "Printing X stored readings:" line from "print" command
+      // Don't parse this line, but ensure we're ready to parse the readings that follow
+      print("✅ DETECTED PRINT COMMAND RESPONSE - ready to parse readings");
     } else if (response.startsWith('#') && response.contains('°C') && !isReadingRFID) {
-      print("✅ DETECTED INDIVIDUAL READING - calling _parseReadings");
+      // Individual reading line from "print" or "range" command
+      print("✅ DETECTED INDIVIDUAL READING - calling _parseReadings (current total: ${parsedReadings.length})");
       _parseReadings(response);
+    } else if (response.startsWith('#') && response.contains('°C') && isReadingRFID) {
+      // Individual reading from "Read Now" - already handled above, skip here
+      print("⏭️ Skipping individual reading parsing (already handled for Read Now)");
     } else {
       print("❌ Not a reading response - skipping _parseReadings");
     }
@@ -264,12 +305,16 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   void _sendCommand(String command) {
     if (commandCharacteristic != null) {
       // Clear previous readings when starting a new query
+      // NOTE: For 'print' (All Readings), we clear to get fresh data from ESP32
+      // The ESP32 stores all readings including those from "Read Now", so they will be included
       if (command == 'print' || command.startsWith('range ')) {
         print("🧹 Clearing previous readings for new query: $command");
         setState(() {
           parsedReadings.clear();
         });
       }
+      // NOTE: For 'readnow', we don't clear parsedReadings - the new reading will be added
+      // and will appear in "All Readings" since it's stored on ESP32
       
       List<int> bytes = utf8.encode(command);
       commandCharacteristic!.write(bytes);
@@ -284,7 +329,28 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       isReadingRFID = true;
       lastReadResult = null;
       lastReadData = null;
-      parsedReadings.clear(); // Clear previous readings for manual read
+      parsedReadings.clear(); // Clear previous readings for manual read display
+      // NOTE: The reading will be stored on ESP32 and will appear in "All Readings"
+    });
+    
+    // Start timeout timer (15 seconds - enough for RFID read window + processing)
+    _readTimeoutTimer?.cancel();
+    _readTimeoutTimer = Timer(const Duration(seconds: 15), () {
+      if (isReadingRFID) {
+        print("⏱️ Read Now timeout - no response received");
+        setState(() {
+          isReadingRFID = false;
+          lastReadResult = "timeout";
+          lastReadData = null;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Read timeout: No response from device. Device may have reset.'),
+            backgroundColor: Colors.orange,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
     });
     
     _sendCommand('readnow');
@@ -559,35 +625,50 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     print("🔧 ENTERING _parseReadings with response: $response");
     
     // Handle individual reading responses (format: #X: timestamp, country, tag, temperature)
-    if (response.startsWith('#') && response.contains('°C')) {
-      print("🔧 Processing individual reading: '$response'");
+    // IMPORTANT: Handle concatenated readings (multiple #X: patterns in one response)
+    if (response.contains('#') && response.contains('°C')) {
+      print("🔧 Processing reading(s): '$response'");
       
-      // Parse reading format: #1: 2025-10-22 4:29:52, 999, 141004263679, 25.87°C
-      // Use the same regex pattern as the dashboard
-      final regex = RegExp(r'#(\d+):\s*(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}),\s*(\d+),\s*(\d+),\s*([\d.]+)°C');
-      print("🔧 Testing regex against: '$response'");
-      final match = regex.firstMatch(response);
-      print("🔧 Regex match result: $match");
+      // Use flexible regex to find ALL readings in the response (handles concatenated readings)
+      // Pattern: #(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*([\d.]+)°C
+      final flexibleRegex = RegExp(r'#(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*([\d.]+)°C');
+      final allMatches = flexibleRegex.allMatches(response);
       
-      // If the strict regex fails, try a more flexible one
-      if (match == null) {
-        print("🔧 Trying flexible regex...");
-        final flexibleRegex = RegExp(r'#(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*([\d.]+)°C');
-        final flexibleMatch = flexibleRegex.firstMatch(response);
-        print("🔧 Flexible regex match result: $flexibleMatch");
-        
-        if (flexibleMatch != null) {
-          final readingNum = flexibleMatch.group(1)!;
-          final timestamp = flexibleMatch.group(2)!;
-          final country = flexibleMatch.group(3)!;
-          final tag = flexibleMatch.group(4)!;
-          final temperature = double.tryParse(flexibleMatch.group(5)!) ?? 0.0;
+      print("🔧 Found ${allMatches.length} reading(s) in response");
+      
+      if (allMatches.isEmpty) {
+        print("❌ No readings found in response: '$response'");
+        return;
+      }
+      
+      // Process each match (handles concatenated readings)
+      for (var match in allMatches) {
+        try {
+          final readingNum = match.group(1)!;
+          final timestamp = match.group(2)!.trim();
+          final country = match.group(3)!;
+          final tag = match.group(4)!;
+          final temperature = double.tryParse(match.group(5)!) ?? 0.0;
           
-          print("✅ PARSED READING (flexible): #$readingNum, $timestamp, $temperature°C");
+          // Validate timestamp - must be RTC format (YYYY-MM-DD HH:MM:SS), not ms timestamp
+          // RTC timestamps start with a year (4 digits), ms timestamps are just numbers
+          if (!timestamp.contains('-') || !timestamp.contains(':')) {
+            print("⚠️ Skipping reading #$readingNum: Invalid timestamp format (likely ms timestamp): '$timestamp'");
+            continue; // Skip this reading but continue with others
+          }
           
-          // Fix timestamp format for DateTime parsing
+          // Check if timestamp looks like RTC format (YYYY-MM-DD HH:MM:SS)
+          // Allow single-digit hours, minutes, and seconds (they'll be padded later)
+          final rtcPattern = RegExp(r'^\d{4}-\d{1,2}-\d{1,2}\s\d{1,2}:\d{1,2}:\d{1,2}');
+          if (!rtcPattern.hasMatch(timestamp)) {
+            print("⚠️ Skipping reading #$readingNum: Timestamp doesn't match RTC format: '$timestamp'");
+            continue; // Skip this reading but continue with others
+          }
+          
+          print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
+          
+          // Fix timestamp format for DateTime parsing (add leading zeros)
           String fixedTimestamp = timestamp;
-          // Add leading zero to hour if needed (4:29:52 -> 04:29:52)
           if (fixedTimestamp.contains(' ')) {
             List<String> parts = fixedTimestamp.split(' ');
             if (parts.length == 2) {
@@ -623,45 +704,32 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             });
             print("🎯 ADDED reading to parsedReadings. Total: ${parsedReadings.length}");
           });
-          return;
+        } catch (e) {
+          print("❌ Error parsing reading: $e");
+          // Continue with next reading even if this one fails
+          continue;
         }
-      }
-      
-      if (match != null) {
-        final readingNum = match.group(1)!;
-        final timestamp = match.group(2)!;
-        final country = match.group(3)!;
-        final tag = match.group(4)!;
-        final temperature = double.tryParse(match.group(5)!) ?? 0.0;
-        
-        print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
-        
-        // Convert UTC timestamp to selected timezone for display
-        final displayTimestamp = _convertUtcToTimezone(timestamp);
-        
-        // Parse UTC DateTime for sorting and chart (keep as UTC internally)
-        final utcDateTime = DateTime.parse(timestamp.replaceAll(' ', 'T') + 'Z');
-        
-        // Add to existing parsedReadings (don't clear them)
-        setState(() {
-          parsedReadings.add({
-            'readingNum': readingNum,
-            'timestamp': displayTimestamp, // Display in selected timezone
-            'country': country,
-            'tag': tag,
-            'temperature': temperature,
-            'dateTime': utcDateTime, // Keep UTC for sorting
-          });
-          print("🎯 ADDED reading to parsedReadings. Total: ${parsedReadings.length}");
-        });
-      } else {
-        print("❌ Individual reading did not match regex: '$response'");
       }
       return;
     }
     
     // Handle range responses (like dashboard does)
     print("🔧 Processing range response with ${response.length} characters");
+    
+    // If this is just "---BEGIN_READINGS---", clear existing readings (start of new query)
+    if (response.trim() == '---BEGIN_READINGS---' || (response.contains('---BEGIN_READINGS---') && !response.contains('#'))) {
+      print("✅ Found BEGIN_READINGS marker - clearing existing readings for new query");
+      setState(() {
+        parsedReadings.clear();
+      });
+      return; // Don't process further - individual readings will come separately
+    }
+    
+    // If this is just "---END_READINGS---", don't do anything (readings already parsed)
+    if (response.trim() == '---END_READINGS---' || (response.contains('---END_READINGS---') && !response.contains('#'))) {
+      print("✅ Found END_READINGS marker - query complete, keeping existing ${parsedReadings.length} readings");
+      return; // Don't process further - all readings already parsed
+    }
     
     final lines = response.split('\n');
     bool inBlock = false;
@@ -680,44 +748,101 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       }
       if (inBlock && line.trim().isNotEmpty) {
         print("🔧 Processing line in block: '$line'");
-        // Parse reading format: #1: 2025-10-22 4:29:52, 999, 141004263679, 25.87°C
-        final regex = RegExp(r'#(\d+):\s*(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}),\s*(\d+),\s*(\d+),\s*([\d.]+)°C');
-        final match = regex.firstMatch(line);
         
-        if (match != null) {
-          final readingNum = match.group(1)!;
-          final timestamp = match.group(2)!;
-          final country = match.group(3)!;
-          final tag = match.group(4)!;
-          final temperature = double.tryParse(match.group(5)!) ?? 0.0;
-          
-          print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
-          
-          // Convert UTC timestamp to selected timezone for display
-          final displayTimestamp = _convertUtcToTimezone(timestamp);
-          
-          // Parse UTC DateTime for sorting and chart (keep as UTC internally)
-          final utcDateTime = DateTime.parse(timestamp.replaceAll(' ', 'T') + 'Z');
-          
-          newReadings.add({
-            'readingNum': readingNum,
-            'timestamp': displayTimestamp, // Display in selected timezone
-            'country': country,
-            'tag': tag,
-            'temperature': temperature,
-            'dateTime': utcDateTime, // Keep UTC for sorting
-          });
-        } else {
+        // Handle concatenated readings (multiple #X: patterns in one line)
+        // Use flexible regex to find ALL readings in the line
+        final flexibleRegex = RegExp(r'#(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*([\d.]+)°C');
+        final allMatches = flexibleRegex.allMatches(line);
+        
+        if (allMatches.isEmpty) {
           print("❌ Line did not match regex: '$line'");
+          continue;
+        }
+        
+        // Process each match (handles concatenated readings)
+        for (var match in allMatches) {
+          try {
+            final readingNum = match.group(1)!;
+            final timestamp = match.group(2)!.trim();
+            final country = match.group(3)!;
+            final tag = match.group(4)!;
+            final temperature = double.tryParse(match.group(5)!) ?? 0.0;
+            
+            // Validate timestamp - must be RTC format (YYYY-MM-DD HH:MM:SS), not ms timestamp
+            if (!timestamp.contains('-') || !timestamp.contains(':')) {
+              print("⚠️ Skipping reading #$readingNum: Invalid timestamp format (likely ms timestamp): '$timestamp'");
+              continue; // Skip this reading but continue with others
+            }
+            
+            // Check if timestamp looks like RTC format (YYYY-MM-DD HH:MM:SS)
+            // Allow single-digit hours, minutes, and seconds (they'll be padded later)
+            final rtcPattern = RegExp(r'^\d{4}-\d{1,2}-\d{1,2}\s\d{1,2}:\d{1,2}:\d{1,2}');
+            if (!rtcPattern.hasMatch(timestamp)) {
+              print("⚠️ Skipping reading #$readingNum: Timestamp doesn't match RTC format: '$timestamp'");
+              continue; // Skip this reading but continue with others
+            }
+            
+            print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
+            
+            // Fix timestamp format for DateTime parsing (add leading zeros)
+            String fixedTimestamp = timestamp;
+            if (fixedTimestamp.contains(' ')) {
+              List<String> parts = fixedTimestamp.split(' ');
+              if (parts.length == 2) {
+                String datePart = parts[0];
+                String timePart = parts[1];
+                List<String> timeComponents = timePart.split(':');
+                if (timeComponents.length == 3) {
+                  String hour = timeComponents[0].padLeft(2, '0');
+                  String minute = timeComponents[1].padLeft(2, '0');
+                  String second = timeComponents[2].padLeft(2, '0');
+                  fixedTimestamp = '$datePart $hour:$minute:$second';
+                }
+              }
+            }
+            
+            // Convert UTC timestamp to selected timezone for display
+            final displayTimestamp = _convertUtcToTimezone(fixedTimestamp);
+            
+            // Parse UTC DateTime for sorting and chart (keep as UTC internally)
+            final utcDateTime = DateTime.parse(fixedTimestamp.replaceAll(' ', 'T') + 'Z');
+            
+            newReadings.add({
+              'readingNum': readingNum,
+              'timestamp': displayTimestamp, // Display in selected timezone
+              'country': country,
+              'tag': tag,
+              'temperature': temperature,
+              'dateTime': utcDateTime, // Keep UTC for sorting
+            });
+          } catch (e) {
+            print("❌ Error parsing reading: $e");
+            // Continue with next reading even if this one fails
+            continue;
+          }
         }
       }
     }
     
+    // Only update if we found new readings AND we're processing a multi-line response
+    // Don't overwrite if this is just a marker line (BEGIN/END) without actual readings
     if (newReadings.isNotEmpty) {
       setState(() {
-        parsedReadings = newReadings;
-        print("🎯 UPDATED parsedReadings with ${parsedReadings.length} readings from range response");
+        // Append new readings instead of replacing (for multi-line responses)
+        // But if this is a fresh range response, replace to avoid duplicates
+        if (response.contains('---BEGIN_READINGS---') && !response.contains('---END_READINGS---')) {
+          // This is the start of a new range - replace existing readings
+          parsedReadings = newReadings;
+        } else {
+          // This is continuation or end - append to avoid losing already-parsed readings
+          parsedReadings.addAll(newReadings);
+        }
+        print("🎯 UPDATED parsedReadings with ${parsedReadings.length} total readings (added ${newReadings.length} from range response)");
       });
+    } else {
+      // No new readings found - don't overwrite existing parsedReadings
+      // This prevents "---END_READINGS---" from wiping out already-parsed readings
+      print("⚠️ No new readings found in range response - keeping existing ${parsedReadings.length} readings");
     }
   }
 
@@ -1412,7 +1537,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           if (lastReadResult != null) ...[
             const SizedBox(height: 16),
             Card(
-              color: lastReadResult == "success" ? Colors.green[50] : Colors.orange[50],
+              color: lastReadResult == "success" 
+                  ? Colors.green[50] 
+                  : (lastReadResult == "timeout" || lastReadResult == "error")
+                      ? Colors.red[50]
+                      : Colors.orange[50],
               child: Padding(
                 padding: const EdgeInsets.all(16.0),
                 child: Column(
@@ -1421,21 +1550,51 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                     Row(
                       children: [
                         Icon(
-                          lastReadResult == "success" ? Icons.check_circle : Icons.info,
-                          color: lastReadResult == "success" ? Colors.green : Colors.orange,
+                          lastReadResult == "success" 
+                              ? Icons.check_circle 
+                              : (lastReadResult == "timeout" || lastReadResult == "error")
+                                  ? Icons.error
+                                  : Icons.info,
+                          color: lastReadResult == "success" 
+                              ? Colors.green 
+                              : (lastReadResult == "timeout" || lastReadResult == "error")
+                                  ? Colors.red
+                                  : Colors.orange,
                           size: 24,
                         ),
                         const SizedBox(width: 8),
                         Text(
-                          lastReadResult == "success" ? 'RFID Tag Detected!' : 'No RFID Tag Detected',
+                          lastReadResult == "success" 
+                              ? 'RFID Tag Detected!' 
+                              : lastReadResult == "timeout"
+                                  ? 'Read Timeout'
+                                  : lastReadResult == "error"
+                                      ? 'Device Error'
+                                      : 'No RFID Tag Detected',
                           style: TextStyle(
                             fontSize: 18,
                             fontWeight: FontWeight.bold,
-                            color: lastReadResult == "success" ? Colors.green[700] : Colors.orange[700],
+                            color: lastReadResult == "success" 
+                                ? Colors.green[700] 
+                                : (lastReadResult == "timeout" || lastReadResult == "error")
+                                    ? Colors.red[700]
+                                    : Colors.orange[700],
                           ),
                         ),
                       ],
                     ),
+                    if (lastReadResult == "timeout" || lastReadResult == "error") ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        lastReadResult == "timeout"
+                            ? 'No response received from device within 15 seconds. The device may have reset.'
+                            : 'Device error detected.',
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: Colors.red[700],
+                        ),
+                      ),
+                    ],
                     if (lastReadResult == "success" && lastReadData != null) ...[
                       const SizedBox(height: 12),
                       Row(
@@ -1602,6 +1761,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                                         const SizedBox(width: 16),
                                         if (isTablet)
                                           Expanded(
+                                            flex: 1,
+                                            child: const Text('Country', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                                          )
+                                        else
+                                          SizedBox(width: 60, child: const Text('Country', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold))),
+                                        const SizedBox(width: 16),
+                                        if (isTablet)
+                                          Expanded(
                                             flex: 3,
                                             child: const Text('Tag ID', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
                                           )
@@ -1691,6 +1858,55 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                                                     const SizedBox(height: 2),
                                                     Text(
                                                       'Temperature',
+                                                      style: TextStyle(
+                                                        fontSize: 10,
+                                                        color: Colors.grey[600],
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                            const SizedBox(width: 16),
+                                            if (isTablet)
+                                              Expanded(
+                                                flex: 1,
+                                                child: Column(
+                                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                                  children: [
+                                                    Text(
+                                                      reading['country'].toString(),
+                                                      style: const TextStyle(
+                                                        fontSize: 12,
+                                                        fontWeight: FontWeight.w500,
+                                                      ),
+                                                    ),
+                                                    const SizedBox(height: 2),
+                                                    Text(
+                                                      'Country',
+                                                      style: TextStyle(
+                                                        fontSize: 11,
+                                                        color: Colors.grey[600],
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              )
+                                            else
+                                              SizedBox(
+                                                width: 60,
+                                                child: Column(
+                                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                                  children: [
+                                                    Text(
+                                                      reading['country'].toString(),
+                                                      style: const TextStyle(
+                                                        fontSize: 10,
+                                                        fontWeight: FontWeight.w500,
+                                                      ),
+                                                    ),
+                                                    const SizedBox(height: 2),
+                                                    Text(
+                                                      'Country',
                                                       style: TextStyle(
                                                         fontSize: 10,
                                                         color: Colors.grey[600],
@@ -2095,12 +2311,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     final sortedReadings = List<Map<String, dynamic>>.from(parsedReadings);
     sortedReadings.sort((a, b) => (a['dateTime'] as DateTime).compareTo(b['dateTime'] as DateTime));
 
-    // Create chart data points
-    final List<FlSpot> spots = [];
-    for (int i = 0; i < sortedReadings.length; i++) {
-      final reading = sortedReadings[i];
-      final temperature = reading['temperature'] as double;
-      spots.add(FlSpot(i.toDouble(), temperature));
+    // Group readings by tag (country + tag ID)
+    final Map<String, List<Map<String, dynamic>>> readingsByTag = {};
+    for (var reading in sortedReadings) {
+      final tagKey = '${reading['country']}_${reading['tag']}';
+      if (!readingsByTag.containsKey(tagKey)) {
+        readingsByTag[tagKey] = [];
+      }
+      readingsByTag[tagKey]!.add(reading);
     }
 
     // Calculate proper Y-axis range with symmetrical padding (rounded to integers)
@@ -2115,6 +2333,58 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     // Round to integers with equal padding above and below
     final minY = (minTemp - padding).floor().toDouble();
     final maxY = (maxTemp + padding).ceil().toDouble();
+
+    // Define colors for different tags (cycle through if more tags than colors)
+    final List<Color> tagColors = [
+      Colors.blue,
+      Colors.red,
+      Colors.green,
+      Colors.orange,
+      Colors.purple,
+      Colors.teal,
+      Colors.pink,
+      Colors.amber,
+    ];
+
+    // Create line chart data for each tag
+    final List<LineChartBarData> lineBarsData = [];
+    int colorIndex = 0;
+    
+    readingsByTag.forEach((tagKey, tagReadings) {
+      final List<FlSpot> spots = [];
+      
+      // Create spots for this tag, using the index in the sorted readings
+      for (var tagReading in tagReadings) {
+        final indexInSorted = sortedReadings.indexOf(tagReading);
+        if (indexInSorted >= 0) {
+          final temperature = tagReading['temperature'] as double;
+          spots.add(FlSpot(indexInSorted.toDouble(), temperature));
+        }
+      }
+      
+      // Get color for this tag
+      final color = tagColors[colorIndex % tagColors.length];
+      colorIndex++;
+      
+      // Create tag label (country + last 4 digits of tag ID)
+      final tagLabel = tagReadings.isNotEmpty 
+          ? '${tagReadings.first['country']}-${tagReadings.first['tag'].toString().substring(tagReadings.first['tag'].toString().length - 4)}'
+          : tagKey;
+      
+      lineBarsData.add(
+        LineChartBarData(
+          spots: spots,
+          isCurved: true,
+          color: color,
+          barWidth: 3,
+          isStrokeCapRound: true,
+          dotData: FlDotData(show: true),
+          belowBarData: BarAreaData(
+            show: false, // Disable area fill for multiple lines
+          ),
+        ),
+      );
+    });
     
     return LineChart(
       LineChartData(
@@ -2168,20 +2438,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
         ),
         borderData: FlBorderData(show: true),
-        lineBarsData: [
-          LineChartBarData(
-            spots: spots,
-            isCurved: true,
-            color: Colors.blue,
-            barWidth: 3,
-            isStrokeCapRound: true,
-            dotData: FlDotData(show: true),
-            belowBarData: BarAreaData(
-              show: true,
-              color: Colors.blue.withOpacity(0.1),
-            ),
-          ),
-        ],
+        lineBarsData: lineBarsData,
         lineTouchData: LineTouchData(
           touchTooltipData: LineTouchTooltipData(
             getTooltipItems: (touchedSpots) {
@@ -2189,8 +2446,9 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                 final index = spot.x.toInt();
                 if (index < sortedReadings.length) {
                   final reading = sortedReadings[index];
+                  final tagLabel = '${reading['country']}-${reading['tag'].toString().substring(reading['tag'].toString().length - 4)}';
                   return LineTooltipItem(
-                    '${reading['temperature'].toStringAsFixed(1)}°C\n${reading['timestamp']}',
+                    'Tag: $tagLabel\n${reading['temperature'].toStringAsFixed(1)}°C\n${reading['timestamp']}',
                     const TextStyle(color: Colors.white),
                   );
                 }
@@ -2205,6 +2463,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
 
   @override
   void dispose() {
+    _readTimeoutTimer?.cancel();
     _horizontalScrollController.dispose();
     _disconnect();
     super.dispose();

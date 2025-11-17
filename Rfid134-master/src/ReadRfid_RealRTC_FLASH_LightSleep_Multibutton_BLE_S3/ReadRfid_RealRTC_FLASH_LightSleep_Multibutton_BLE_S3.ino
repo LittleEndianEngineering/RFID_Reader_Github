@@ -379,6 +379,9 @@ void sendBLEResponse(const String& response) {
     pResponseCharacteristic->setValue(response.c_str());
     pResponseCharacteristic->notify();
     Serial.println("[BLE] Sent response: " + response);
+    // Small delay to prevent BLE buffer overflow when sending many readings quickly
+    // This ensures the BLE stack can process each notification before the next one
+    delay(10); // 10ms delay between BLE notifications
   }
 }
 
@@ -430,6 +433,16 @@ void processBLECommand(const String& command) {
 }
 
 void sendStoredReadingsByBLE() {
+  // Recalculate readingCount from file size to ensure accuracy
+  // This ensures we get the latest count even if readingCount was out of sync
+  File countFile = SPIFFS.open(FLASH_FILENAME, "r");
+  int actualCount = 0;
+  if (countFile) {
+    actualCount = countFile.size() / READING_SIZE;
+    countFile.close();
+    readingCount = actualCount; // Update global count
+  }
+  
   if (readingCount == 0) { 
     sendBLEResponse("No readings stored.");
     return; 
@@ -1007,36 +1020,22 @@ public:
     // Reset error count on successful read
     rfidConsecutiveErrors = 0;
     
+    // Store tag data for later processing in powerOnAndReadTagWindow()
+    // DO NOT store reading here - it will be stored in powerOnAndReadTagWindow()
+    // to prevent duplicate storage
     lastTag = reading;
     lastTagValid = true;
-    uint8_t firstByte = reading.reserved1 & 0xFF;
-    float temperature = 23.3 + (0.112 * firstByte);
-    RfidReading storedReading;
-    storedReading.timestamp = getCurrentTimestamp();
-    storedReading.country = reading.country;
-    storedReading.id = reading.id;
-    storedReading.temp_raw = (uint16_t)(temperature * 100);
-    storedReading.flags = (reading.isData ? 1 : 0) | (reading.isAnimal ? 2 : 0);
-    storedReading.reserved = 0;
-    storeReading(storedReading);
-    Serial.printf("#%d\n", readingCount);
-    Serial.printf("TAG: %03u %012llu %.2f°C\n", reading.country, reading.id, temperature);
-    if (rtcAvailable && storedReading.timestamp > 1000000000) {
-      time_t timestamp = storedReading.timestamp;
-      struct tm* timeinfo = gmtime(&timestamp);
-      Serial.printf("Time: %04d-%02d-%02d %02d:%02d:%02d\n",
-                    timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
-                    timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
-    } else {
-      Serial.printf("Time: %lu ms\n", storedReading.timestamp);
-    }
-    Serial.println();
+    
+    // Don't print tag info here - it will be printed in tryReadAndStoreTag()
+    // to avoid duplicate prints
     
     // Trigger green LED flash for successful tag detection
     setLEDStatus("reading_success");
     
-    // Send BLE status update if connected
+    // Send BLE status update if connected (for immediate feedback)
     if (deviceConnected) {
+      uint8_t firstByte = reading.reserved1 & 0xFF;
+      float temperature = 23.3 + (0.112 * firstByte);
       String statusUpdate = "New reading: " + String(reading.country) + " " + 
                            String(reading.id) + " " + String(temperature, 2) + "°C";
       sendBLEStatus(statusUpdate);
