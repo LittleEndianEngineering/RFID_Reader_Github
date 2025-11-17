@@ -80,8 +80,10 @@ extern "C" {
 // =============================================================================
 
 // WiFi Configuration (can be updated via serial commands)
-String ssid_str = "QuesadaRivas";
-String password_str = "50A5DC34CD20";
+//String ssid_str = "QuesadaRivas";
+//String password_str = "50A5DC34CD20";
+String ssid_str = "opauly";
+String password_str = "tienevirus23";
 const char* ssid = ssid_str.c_str();
 const char* password = password_str.c_str();
 
@@ -106,7 +108,7 @@ unsigned long startTime = 0;
 // =============================================================================
 
 #define BUTTON_PIN 37        // Push button (INPUT_PULLUP): pressed = LOW
-#define RFID_PWR_PIN 36      // RFID power control (active LOW)
+#define RFID_PWR_PIN 40      // RFID power control (active LOW)
 #define RFID_TX_PIN 48       // RFID serial
 
 // I2C Pins for RTC (DS1307) - ESP32-S3 Safe Pins
@@ -114,9 +116,9 @@ unsigned long startTime = 0;
 #define I2C_SCL_PIN 9        // I2C Clock pin (GPIO 9 - safe on ESP32-S3)
 
 // RGB LED Status Indicator (ESP32-S3 Safe Pins)
-#define LED_RED_PIN 2        // Red anode pin (GPIO 2 - safe on ESP32-S3)
+#define LED_RED_PIN 6        // Red anode pin (GPIO 2 - safe on ESP32-S3)
 #define LED_GREEN_PIN 5      // Green anode pin (GPIO 5 - safe on ESP32-S3)  
-#define LED_BLUE_PIN 6       // Blue anode pin (GPIO 6 - safe on ESP32-S3)
+#define LED_BLUE_PIN 4       // Blue anode pin (GPIO 6 - safe on ESP32-S3)
 
 // =============================================================================
 // READING CONFIGURATION
@@ -171,6 +173,13 @@ bool longPressFeedbackStarted = false;
 // Store last tag read (for button logic)
 Rfid134Reading lastTag;
 bool lastTagValid = false;
+
+// RFID Module Failover Tracking
+unsigned int rfidErrorCount = 0;
+unsigned int rfidConsecutiveErrors = 0;
+const unsigned int MAX_RFID_ERRORS = 2; // Max errors before power cycle (reduced for faster recovery)
+const unsigned long RFID_LOOP_TIMEOUT_MS = 100; // Max time for rfid.loop() to take (reduced for faster detection)
+const unsigned long RFID_SAFETY_TIMEOUT_MS = 3000; // Max total time for RFID read window before abort
 
 // --- Host activity heartbeat (prevents sleep while dashboard is active) ---
 unsigned long lastCommandTime = 0;               // updated whenever a serial command is received
@@ -645,6 +654,7 @@ void connectWiFi() {
 void initRTC() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(100000);  // Set I2C clock speed (100kHz)
+  Wire.setTimeout(50);    // Set I2C timeout to 50ms to prevent hanging
   
   // ESP32-S3: Add timeout to prevent hanging if RTC is not connected
   delay(100);  // Give I2C bus time to settle
@@ -687,14 +697,47 @@ void initRTC() {
 
 uint32_t getCurrentTimestamp() {
   if (rtcAvailable) {
-    now = rtc.now();
-    return now.unixtime(); // Store UTC timestamps directly (RTC is now set to UTC)
-  } else {
-    // Fallbacks: try internal time (if previously synced), then millis
-    struct tm ti;
-    if (getLocalTime(&ti)) return (uint32_t)mktime(&ti);
-    return millis();
+    // Add timeout protection: if RTC I2C hangs, fall back to millis
+    // This prevents watchdog resets when RTC is not properly powered
+    unsigned long startTime = millis();
+    bool rtcSuccess = false;
+    
+    // Quick I2C check with timeout (Wire.setTimeout is set in initRTC)
+    // If I2C device doesn't respond quickly, skip RTC read
+    Wire.beginTransmission(0x68); // DS1307 I2C address
+    byte error = Wire.endTransmission();
+    
+    if (error == 0 && (millis() - startTime) < 50) {
+      // I2C device responds quickly, try to read time
+      // Use a quick read attempt with timeout protection
+      unsigned long readStart = millis();
+      now = rtc.now();
+      unsigned long readDuration = millis() - readStart;
+      
+      // Verify the time is reasonable and read was fast
+      if (readDuration < 50 && now.year() >= 2020 && now.year() <= 2100) {
+        rtcSuccess = true;
+      } else {
+        // RTC read took too long or returned invalid time
+        Serial.printf("[RTC] Read slow/invalid (took %lu ms, year %d) - using fallback\n", readDuration, now.year());
+      }
+    } else {
+      // I2C device didn't respond or took too long
+      Serial.printf("[RTC] I2C error/timeout (error: %d, took %lu ms) - using fallback\n", error, millis() - startTime);
+    }
+    
+    if (rtcSuccess) {
+      return now.unixtime(); // Store UTC timestamps directly (RTC is now set to UTC)
+    } else {
+      // RTC read failed or timed out - mark as unavailable to prevent future hangs
+      rtcAvailable = false;
+    }
   }
+  
+  // Fallbacks: try internal time (if previously synced), then millis
+  struct tm ti;
+  if (getLocalTime(&ti)) return (uint32_t)mktime(&ti);
+  return millis();
 }
 
 // Flash Functions
@@ -933,18 +976,37 @@ void tryReadAndStoreTag() {
 class RfidNotify {
 public:
   static void OnError(Rfid134_Error errorCode) {
+    rfidErrorCount++;
+    rfidConsecutiveErrors++;
+    
     Serial.printf("[RFID] Error %d - ", errorCode);
+    String errorMsg = "";
     if (errorCode == 130) {
-      Serial.println("Communication timeout or protocol error");
+      errorMsg = "Communication timeout or protocol error";
+      Serial.println(errorMsg);
     } else if (errorCode == 131) {
-      Serial.println("Checksum error");
+      errorMsg = "Checksum error";
+      Serial.println(errorMsg);
     } else if (errorCode == 132) {
-      Serial.println("Invalid response");
+      errorMsg = "Invalid response";
+      Serial.println(errorMsg);
     } else {
-      Serial.println("Unknown RFID error");
+      errorMsg = "Unknown RFID error";
+      Serial.println(errorMsg);
     }
+    
+    // Send error via BLE if in dashboard mode
+    if (dashboardModeActive && deviceConnected) {
+      String bleError = "[RFID] ERROR: " + errorMsg + " (Count: " + String(rfidConsecutiveErrors) + ")";
+      sendBLEResponse(bleError);
+    }
+    
+    Serial.printf("[RFID] Error count: %u (consecutive: %u)\n", rfidErrorCount, rfidConsecutiveErrors);
   }
   static void OnPacketRead(const Rfid134Reading& reading) {
+    // Reset error count on successful read
+    rfidConsecutiveErrors = 0;
+    
     lastTag = reading;
     lastTagValid = true;
     uint8_t firstByte = reading.reserved1 & 0xFF;
@@ -1300,7 +1362,7 @@ void setup() {
   Serial1.begin(9600, SERIAL_8N2, RFID_TX_PIN);
   rfid.begin();
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(RFID_PWR_PIN, INPUT); // Hi-Z at startup
+  pinMode(RFID_PWR_PIN, OUTPUT); // Initialize RFID Module
   Serial.println("[BOOT] RFID initialized");
 
   Serial.println("[BOOT] Checking stored readings...");
@@ -1341,20 +1403,97 @@ void setup() {
   Serial.flush();  // Ensure all messages are sent
 }
 
+// Power cycle RFID module for recovery
+void powerCycleRFIDModule() {
+  Serial.println("[RFID] Power cycling module for recovery...");
+  if (dashboardModeActive) sendBLEResponse("[RFID] Power cycling module for recovery...");
+  
+  // Power OFF
+  digitalWrite(RFID_PWR_PIN, LOW); // Power OFF (active HIGH)
+  delay(200); // Wait for power to drain
+  
+  // Power ON
+  digitalWrite(RFID_PWR_PIN, HIGH); // Power ON (active HIGH)
+  delay(500); // Wait for module to initialize
+  
+  // Reinitialize RFID communication
+  Serial1.end();
+  delay(100);
+  Serial1.begin(9600, SERIAL_8N2, RFID_TX_PIN);
+  rfid.begin();
+  delay(200);
+  
+  rfidConsecutiveErrors = 0; // Reset error count after power cycle
+  Serial.println("[RFID] Power cycle complete, module reinitialized");
+  if (dashboardModeActive) sendBLEResponse("[RFID] Power cycle complete");
+}
+
 void powerOnAndReadTagWindow(unsigned long windowMs) {
+  // Check if RFID module needs recovery
+  if (rfidConsecutiveErrors >= MAX_RFID_ERRORS) {
+    Serial.printf("[RFID] Too many errors (%u), power cycling module...\n", rfidConsecutiveErrors);
+    if (dashboardModeActive) {
+      sendBLEResponse("[RFID] Module error detected, attempting recovery...");
+    }
+    powerCycleRFIDModule();
+  }
+  
   Serial.printf("[RFID] Powering ON for %lu ms\n", windowMs);
   if (dashboardModeActive) sendBLEResponse("[RFID] Powering ON for " + String(windowMs) + " ms");
-  pinMode(RFID_PWR_PIN, OUTPUT);
-  digitalWrite(RFID_PWR_PIN, LOW); // Power ON (active LOW)
+  digitalWrite(RFID_PWR_PIN, HIGH); // Power ON (active HIGH)
   delay(500); // Increased delay to give RFID module more time to initialize
   Serial.println("[RFID] RFID module powered on, starting read window...");
   if (dashboardModeActive) sendBLEResponse("[RFID] RFID module powered on, starting read window...");
   unsigned long start = millis();
   lastTagValid = false;
   bool tagStored = false;
+  bool rfidHangDetected = false;
 
-  while (millis() - start < windowMs && !tagStored) {
+  unsigned long lastYieldTime = start; // Track last yield time for this read window
+  unsigned long lastLoopTime = start; // Track rfid.loop() execution time
+  unsigned long lastSuccessfulLoop = start; // Track last successful loop completion
+  
+  // Safety: Limit total read window time to prevent infinite hangs
+  unsigned long maxReadTime = (windowMs > RFID_SAFETY_TIMEOUT_MS) ? RFID_SAFETY_TIMEOUT_MS : windowMs;
+  
+  while (millis() - start < maxReadTime && !tagStored && !rfidHangDetected) {
+    // CRITICAL: Feed watchdog BEFORE calling rfid.loop() to prevent reset
+    yield(); // Always yield before potentially blocking operation
+    
+    // Timeout protection: if rfid.loop() takes too long, it might be hung
+    unsigned long loopStart = millis();
     rfid.loop();
+    unsigned long loopDuration = millis() - loopStart;
+    unsigned long now = millis();
+    
+    // Detect if RFID module is hung (loop takes too long)
+    if (loopDuration > RFID_LOOP_TIMEOUT_MS) {
+      Serial.printf("[RFID] WARNING: rfid.loop() took %lu ms (possible hang)\n", loopDuration);
+      rfidConsecutiveErrors++;
+      if (rfidConsecutiveErrors >= MAX_RFID_ERRORS) {
+        Serial.println("[RFID] Module appears hung, aborting read window immediately");
+        if (dashboardModeActive) {
+          sendBLEResponse("[RFID] Module hang detected, aborting read");
+        }
+        rfidHangDetected = true;
+        break; // Exit loop immediately
+      }
+    } else {
+      // Loop completed successfully - reset timeout tracking
+      lastSuccessfulLoop = now;
+    }
+    
+    // Additional safety: If no successful loop for too long, abort
+    if (now - lastSuccessfulLoop > RFID_SAFETY_TIMEOUT_MS) {
+      Serial.println("[RFID] Safety timeout: No successful loop for too long, aborting");
+      if (dashboardModeActive) {
+        sendBLEResponse("[RFID] Safety timeout: Module not responding");
+      }
+      rfidHangDetected = true;
+      rfidConsecutiveErrors = MAX_RFID_ERRORS; // Trigger recovery on next attempt
+      break;
+    }
+    
     if (lastTagValid) {
       tagStored = true;
       Serial.println("[RFID] Tag detected and stored");
@@ -1382,19 +1521,309 @@ void powerOnAndReadTagWindow(unsigned long windowMs) {
       // Clear lastTagValid to prevent duplicate storage
       lastTagValid = false;
     }
-    yield();
+    
+    // ESP32-S3: Feed watchdog more frequently during long RFID read window
+    // This prevents watchdog resets during 5-second read operations
+    // Yield at least every 50ms to keep watchdog happy (more frequent for safety)
+    if (now - lastYieldTime > 50) {
+      yield(); // Feed watchdog and allow other tasks to run
+      lastYieldTime = now;
+    }
   }
-  if (!tagStored) {
-    Serial.println("[RFID] No tag detected during window");
-    if (dashboardModeActive) sendBLEResponse("[RFID] No tag detected during window");
-  }
-
-  pinMode(RFID_PWR_PIN, INPUT); // Hi-Z (power OFF)
+  
+  // CRITICAL: Always power off module, even if aborted
+  digitalWrite(RFID_PWR_PIN, LOW); // Power OFF (active HIGH)
   Serial.println("[RFID] Power OFF");
   if (dashboardModeActive) sendBLEResponse("[RFID] Power OFF");
   
+  // Handle results - ALWAYS send a response to prevent app timeout
+  if (rfidHangDetected) {
+    Serial.println("[RFID] Read aborted due to module hang");
+    if (dashboardModeActive) {
+      sendBLEResponse("[RFID] Read aborted: Module hardware issue detected");
+      // Send explicit "no tag" equivalent so app doesn't timeout
+      sendBLEResponse("[RFID] No tag detected during window");
+    }
+    // Power cycle will happen on next read attempt
+  } else if (!tagStored) {
+    Serial.println("[RFID] No tag detected during window");
+    if (dashboardModeActive) sendBLEResponse("[RFID] No tag detected during window");
+  }
+  
+  // Final yield to ensure all messages are sent before function returns
+  yield();
+  Serial.flush();
+  
   // Don't immediately reset LED status - let updateLEDStatus() handle the timing
   // The green flash will automatically return to the appropriate status after the flash duration
+}
+
+// ============================================================================
+// SERIAL COMMAND PROCESSING FUNCTION
+// ============================================================================
+// Centralized function to process Serial commands - used by both Dashboard Mode
+// priority check and regular Serial processing to ensure consistent behavior
+void processSerialCommand(const String& command) {
+  // Check for status command to show dashboard mode status
+  if (command == "status") {
+    Serial.printf("[DASHBOARD] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
+    Serial.flush();
+    return;
+  }
+  
+  // Check for dashboard mode commands
+  if (command == "dashboardmode on") {
+    dashboardModeActive = true;
+    Serial.println("[DASHBOARD] Dashboard Mode: ON - ESP32 will stay awake");
+    Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED ***");
+    Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
+    setLEDStatus("dashboard_active");  // Red LED for dashboard mode
+    startBLEAdvertising();  // Start BLE advertising for mobile apps
+    Serial.flush();
+    return;
+  }
+  
+  if (command == "dashboardmode off") {
+    dashboardModeActive = false;
+    Serial.println("[DASHBOARD] Dashboard Mode: OFF - ESP32 will use light sleep");
+    Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED ***");
+    Serial.println("[DASHBOARD] BLE advertising stopped");
+    setLEDStatus("sleeping");  // Blue LED for normal sleep mode
+    stopBLEAdvertising();  // Stop BLE advertising
+    Serial.flush();
+    return;
+  }
+  
+  // Alternative dashboard commands for serial debugging
+  if (command == "dashboard on") {
+    dashboardModeActive = true;
+    Serial.println("[DASHBOARD] Dashboard Mode: ON - ESP32 will stay awake");
+    Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED (Serial Debug) ***");
+    Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
+    setLEDStatus("dashboard_active");  // Red LED for dashboard mode
+    startBLEAdvertising();  // Start BLE advertising for mobile apps
+    Serial.flush();
+    return;
+  }
+  
+  if (command == "dashboard off") {
+    dashboardModeActive = false;
+    Serial.println("[DASHBOARD] Dashboard Mode: OFF - ESP32 will use light sleep");
+    Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Serial Debug) ***");
+    Serial.println("[DASHBOARD] BLE advertising stopped");
+    setLEDStatus("sleeping");  // Blue LED for normal sleep mode
+    stopBLEAdvertising();  // Stop BLE advertising
+    Serial.flush();
+    return;
+  }
+  
+  // Simple debug command that responds quickly
+  if (command == "debugsimple") {
+    Serial.println("[DEBUG] ESP32 Status: OK");
+    Serial.printf("[DEBUG] Reading count: %d\n", readingCount);
+    Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
+    Serial.flush();
+    return;
+  }
+  
+  // Debug command with immediate response
+  if (command == "debug") {
+    Serial.println("[DEBUG] --- Device Debug Info ---");
+    Serial.printf("[DEBUG] Reading count: %d\n", readingCount);
+    Serial.printf("[DEBUG] MAX_READINGS: %d\n", MAX_READINGS);
+    Serial.printf("[DEBUG] READING_SIZE: %d\n", READING_SIZE);
+    Serial.printf("[DEBUG] Available slots: %d\n", MAX_READINGS - readingCount);
+    Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
+    if (rtcAvailable) {
+      now = rtc.now();
+      Serial.printf("[DEBUG] Current time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                    now.year(), now.month(), now.day(),
+                    now.hour(), now.minute(), now.second());
+      Serial.printf("[DEBUG] Unix timestamp: %lu\n", now.unixtime() + (6 * 3600));
+    } else {
+      Serial.println("[DEBUG] RTC not available");
+    }
+    Serial.println("[DEBUG] --- End Debug Info ---");
+    Serial.flush();
+    return;
+  }
+  
+  // Get command handlers for dashboard
+  if (command == "get ssid") {
+    Serial.println("<GET_SSID_BEGIN>");
+    Serial.println(ssid_str);
+    Serial.println("<GET_SSID_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get password") {
+    Serial.println("<GET_PASSWORD_BEGIN>");
+    Serial.println(password_str);
+    Serial.println("<GET_PASSWORD_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get rfidOnTimeMs") {
+    Serial.println("<GET_RFIDONTIME_BEGIN>");
+    Serial.println(rfidOnTimeMs);
+    Serial.println("<GET_RFIDONTIME_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get periodicIntervalMs") {
+    Serial.println("<GET_PERIODICINTERVAL_BEGIN>");
+    Serial.println(periodicIntervalMs);
+    Serial.println("<GET_PERIODICINTERVAL_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get longPressMs") {
+    Serial.println("<GET_LONGPRESSMS_BEGIN>");
+    Serial.println(longPressMs);
+    Serial.println("<GET_LONGPRESSMS_END>");
+    Serial.flush();
+    return;
+  }
+  if (command.startsWith("set ssid ")) {
+    String value = command.substring(9);
+    ssid_str = value; ssid = ssid_str.c_str(); saveConfigVar("ssid", value); 
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set password ")) {
+    String value = command.substring(13);
+    password_str = value; password = password_str.c_str(); saveConfigVar("password", value); 
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set rfidOnTimeMs ")) {
+    String value = command.substring(17);
+    rfidOnTimeMs = value.toInt(); saveConfigVar("rfidOnTimeMs", value); 
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set periodicIntervalMs ")) {
+    String value = command.substring(23);
+    periodicIntervalMs = value.toInt(); saveConfigVar("periodicIntervalMs", value); 
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set longPressMs ")) {
+    String value = command.substring(16);
+    longPressMs = value.toInt(); saveConfigVar("longPressMs", value); 
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command == "resetconfig") {
+    if (SPIFFS.exists(configFile)) { SPIFFS.remove(configFile); Serial.println("Config reset. Reboot to use hardcoded values."); }
+    else { Serial.println("No config to reset."); }
+    Serial.flush();
+  } else if (command == "summary") {
+    printReadingsSummary();
+    Serial.flush();
+  } else if (command == "print") {
+    printStoredReadings();
+    Serial.flush();
+  } else if (command == "last") {
+    printLastReading();
+    Serial.flush();
+  } else if (command == "clear") {
+    SPIFFS.remove(FLASH_FILENAME); readingCount = 0; Serial.println("Cleared");
+    Serial.flush();
+  } else if (command.startsWith("range ")) {
+    String rangeCmd = command.substring(6);
+    int spaceIndex = rangeCmd.indexOf(' ');
+    if (spaceIndex > 0) {
+      uint32_t startTime = rangeCmd.substring(0, spaceIndex).toInt();
+      uint32_t endTime = rangeCmd.substring(spaceIndex + 1).toInt();
+      sendStoredReadingsByRange(startTime, endTime);
+    }
+    Serial.flush();
+  } else if (command == "printconfig") {
+    File file = SPIFFS.open(configFile, "r");
+    if (file) {
+      Serial.println("[CONFIG] --- config.txt ---");
+      while (file.available()) { Serial.write(file.read()); }
+      file.close();
+      Serial.println("[CONFIG] --- end ---");
+    } else {
+      Serial.println("[CONFIG] No config file.");
+    }
+    Serial.flush();
+  } else if (command == "time") {
+    if (rtcAvailable) {
+      now = rtc.now();
+      Serial.printf("Current time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                    now.year(), now.month(), now.day(),
+                    now.hour(), now.minute(), now.second());
+      Serial.printf("Unix timestamp: %lu\n", now.unixtime() + (6 * 3600));
+    } else {
+      Serial.println("RTC not available");
+    }
+    Serial.flush();
+  } else if (command == "dashboardmode") {
+    // Empty command - do nothing
+  } else if (command == "sleepstats") {
+    Serial.printf("[STATS] wakes: timer=%u, button=%u (gpio-wake-consumed=%u, timer-consumed=%u)\n",
+                  wake_count_timer, wake_count_button, wake_button_consumed, wake_timer_consumed);
+    Serial.flush();
+  } else if (command == "resetrtc") {
+    Serial.println("[RTC] Resetting RTC to UTC...");
+    Serial.println("[RTC] This will take a moment...");
+    Serial.flush();
+    
+    // Simple approach: just add 6 hours to current RTC time to convert from Costa Rica to UTC
+    if (rtcAvailable) {
+      now = rtc.now();
+      DateTime utcTime = DateTime(now.unixtime() + (6 * 3600)); // Add 6 hours
+      rtc.adjust(utcTime);
+      Serial.println("[RTC] RTC converted from Costa Rica time to UTC");
+      now = rtc.now();
+      Serial.printf("[RTC] New time: %04d-%02d-%02d %02d:%02d:%02d (UTC)\n",
+                    now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+      Serial.println("[RTC] RTC is now set to UTC - new readings will be stored in UTC");
+    } else {
+      Serial.println("[RTC] RTC not available - cannot reset");
+    }
+    Serial.flush();
+  } else if (command == "testuart") {
+    Serial.println("[UART] Testing UART wake-up...");
+    Serial.println("[UART] ESP32 will go to sleep for 10 seconds");
+    Serial.println("[UART] Send any command to wake it up");
+    Serial.flush();
+    delay(1000);
+    lightSleepUntilNextEvent(10000000); // Sleep for 10 seconds
+    Serial.println("[UART] Woke up from sleep!");
+    Serial.flush();
+  } else if (command == "testsleep") {
+    Serial.println("[SLEEP] Testing sleep functionality...");
+    Serial.println("[SLEEP] Going to sleep for 5 seconds");
+    Serial.flush();
+    delay(1000);
+    lightSleepUntilNextEvent(5000000); // Sleep for 5 seconds
+    Serial.println("[SLEEP] Woke up from sleep!");
+    Serial.flush();
+  } else if (command == "testuartlong") {
+    Serial.println("[UART] Testing UART wake-up with 30-second sleep...");
+    Serial.println("[UART] ESP32 will go to sleep for 30 seconds");
+    Serial.println("[UART] Send any command to wake it up via UART");
+    Serial.flush();
+    delay(1000);
+    lightSleepUntilNextEvent(30000000); // Sleep for 30 seconds
+    Serial.println("[UART] Woke up from sleep!");
+    Serial.flush();
+  } else if (command == "buttonmode") {
+    Serial.println("[BUTTON] Multi-Button Mode Status:");
+    Serial.printf("[BUTTON] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
+    Serial.println("[BUTTON] Short press: RFID read");
+    Serial.printf("[BUTTON] Long press (%lums): Toggle Dashboard Mode\n", longPressMs);
+    Serial.printf("[BUTTON] Current button state: %s\n", digitalRead(BUTTON_PIN) == LOW ? "PRESSED" : "RELEASED");
+    Serial.flush();
+  } else if (command == "testbutton") {
+    Serial.println("[BUTTON] Testing multi-button functionality...");
+    Serial.printf("[BUTTON] Press and hold the button for %lu seconds to toggle dashboard mode\n", longPressMs / 1000);
+    Serial.println("[BUTTON] Short press for RFID read");
+    Serial.println("[BUTTON] Current dashboard mode will be toggled on long press");
+    Serial.flush();
+  } else {
+    // Unknown command - do nothing (or could send error message)
+    Serial.flush();
+  }
 }
 
 void loop() {
@@ -1402,6 +1831,34 @@ void loop() {
   yield();
   
   // Heartbeat removed - not needed in production
+  
+  // ============================================================================
+  // PRIORITY: Serial command processing when Dashboard Mode is active
+  // ============================================================================
+  // When Dashboard Mode is active, prioritize Serial commands to ensure
+  // dashboard can communicate with ESP32 without delays from other loop operations
+  if (dashboardModeActive && Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    // Skip empty commands
+    if (command.length() > 0) {
+      // Mark host as active for sleep gating
+      lastCommandTime = millis();
+      
+      // Immediately respond to any command to prevent sleep during processing
+      Serial.println("CMD_RECEIVED");
+      Serial.flush();
+      
+      // Process command using the same handler as the main Serial section
+      // This ensures consistent behavior whether Dashboard Mode is active or not
+      processSerialCommand(command);
+      
+      // After processing command, return to loop start to check for more commands
+      // This ensures Serial commands are processed with highest priority in Dashboard Mode
+      return;
+    }
+  }
   
   // ----- Handle UART wake-up first (highest priority) -----
   if (uartWakePending) {
@@ -1431,48 +1888,12 @@ void loop() {
         Serial.println("CMD_RECEIVED");
         Serial.flush();
         
-        // Handle dashboard mode commands immediately
-        if (command == "dashboardmode on") {
-          dashboardModeActive = true;
-          Serial.println("[DASHBOARD] Dashboard Mode: ON - ESP32 will stay awake");
-          Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED (Serial Command) ***");
-          Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
-          setLEDStatus("dashboard_active");  // Red LED for dashboard mode
-          startBLEAdvertising();  // Start BLE advertising for mobile apps
-          Serial.flush();
-          return; // Exit immediately after processing
-        }
+        // Process command using centralized function for consistency
+        // This handles all commands including dashboard mode, status, debug, get/set, etc.
+        processSerialCommand(command);
         
-        if (command == "dashboardmode off") {
-          dashboardModeActive = false;
-          Serial.println("[DASHBOARD] Dashboard Mode: OFF - ESP32 will use light sleep");
-          Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Serial Command) ***");
-          Serial.println("[DASHBOARD] BLE advertising stopped");
-          setLEDStatus("sleeping");  // Blue LED for normal sleep mode
-          stopBLEAdvertising();  // Stop BLE advertising
-          Serial.flush();
-          return; // Exit immediately after processing
-        }
-        
-        // Handle status command immediately
-        if (command == "status") {
-          Serial.printf("[DASHBOARD] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
-          Serial.flush();
-          return; // Exit immediately after processing
-        }
-        
-        // Handle other quick commands
-        if (command == "debugsimple") {
-          Serial.println("[DEBUG] ESP32 Status: OK");
-          Serial.printf("[DEBUG] Reading count: %d\n", readingCount);
-          Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
-          Serial.flush();
-          return; // Exit immediately after processing
-        }
-        
-        // For other commands, let them fall through to main serial processing
-        // but ensure we stay awake
-        Serial.flush();
+        // Exit immediately after processing to return to loop start
+        return;
       }
     } else {
       // No immediate command available, but stay awake for a bit to allow command to arrive
@@ -1490,42 +1911,58 @@ void loop() {
     buttonWakePending = false;
 
     // GPIO wake-up means button was pressed while sleeping
-    // We need to wait for the button to be released and measure the duration
+    // Check current button state first - if already released, it was a quick press
+    bool buttonCurrentlyPressed = (digitalRead(BUTTON_PIN) == LOW);
     unsigned long pressStartTime = millis();
     
-    // Wait for button release and measure duration
-    while (digitalRead(BUTTON_PIN) == LOW) {
-      delay(10);
-      // Check for long press feedback while waiting
-      unsigned long currentTime = millis();
-      unsigned long pressDuration = currentTime - pressStartTime;
-      
-      // Start feedback at 1 second
-      if (pressDuration >= LONG_PRESS_FEEDBACK_MS && !longPressFeedbackStarted) {
-        longPressFeedbackStarted = true;
-        // Removed verbose feedback message to reduce print clutter
+    if (buttonCurrentlyPressed) {
+      // Button is still pressed - wait for release and measure duration
+      while (digitalRead(BUTTON_PIN) == LOW) {
+        delay(10);
+        // Check for long press feedback while waiting
+        unsigned long currentTime = millis();
+        unsigned long pressDuration = currentTime - pressStartTime;
+        
+        // Start feedback at 1 second
+        if (pressDuration >= LONG_PRESS_FEEDBACK_MS && !longPressFeedbackStarted) {
+          longPressFeedbackStarted = true;
+          // Removed verbose feedback message to reduce print clutter
+        }
+        
+        // Detect long press completion
+        if (pressDuration >= longPressMs && !longPressDetected) {
+          longPressDetected = true;
+          Serial.println("[BUTTON] *** LONG PRESS DETECTED ***");
+          Serial.println("[BUTTON] Release button to toggle dashboard mode");
+        }
       }
-      
-      // Detect long press completion
-      if (pressDuration >= longPressMs && !longPressDetected) {
-        longPressDetected = true;
-        Serial.println("[BUTTON] *** LONG PRESS DETECTED ***");
-        Serial.println("[BUTTON] Release button to toggle dashboard mode");
-      }
+    } else {
+      // Button already released - it was a quick press that woke us up
+      // Give it a minimum duration to ensure it's treated as a valid press
+      // This handles the case where button was pressed and released before we could measure
+      Serial.println("[BUTTON] GPIO wake -> Quick press detected (already released)");
+      delay(50); // Small delay to ensure button state is stable
     }
     
-    // Button was released - measure total duration
+    // Measure total duration (or use minimum for quick presses)
     unsigned long totalDuration = millis() - pressStartTime;
+    
+    // For quick presses that were already released, ensure minimum duration
+    if (!buttonCurrentlyPressed && totalDuration < 50) {
+      totalDuration = 50; // Treat as valid short press
+    }
     
     if (totalDuration < longPressMs) {
       // Short press - trigger RFID read
-      // Use adaptive debounce: 50ms when awake, 100ms when sleeping (reduced from 200ms)
-      unsigned long minPressTime = dashboardModeActive ? 50 : 100;
+      // Use adaptive debounce: 50ms when awake, 50ms minimum for wake-up presses
+      unsigned long minPressTime = 50; // Reduced threshold for wake-up presses
       
-      if (totalDuration > minPressTime) {
+      if (totalDuration >= minPressTime) {
         Serial.println("[BUTTON] GPIO wake -> Short press -> RFID read");
         powerOnAndReadTagWindow(rfidOnTimeMs);
         lastPeriodicRead = millis();
+      } else {
+        Serial.printf("[BUTTON] GPIO wake -> Press too short (%lu ms < %lu ms), ignoring\n", totalDuration, minPressTime);
       }
     } else {
       // Long press - toggle dashboard mode
@@ -1685,7 +2122,10 @@ void loop() {
     Serial.println("[UART] Wake-up processing timeout - clearing flag");
   }
 
-  // --- Serial config commands ---
+  // --- Serial config commands (for non-Dashboard Mode or fallback) ---
+  // Note: When Dashboard Mode is active, Serial commands are processed at the
+  // beginning of loop() for immediate response. This section handles commands
+  // when Dashboard Mode is not active or as a fallback.
   if (Serial.available()) {
     String command = Serial.readStringUntil('\n');
     command.trim();
@@ -1698,258 +2138,14 @@ void loop() {
     // mark host as active for sleep gating
     lastCommandTime = millis();
     
-    // Serial activity detected - will be processed immediately
-    
-    // NOTE: Dashboard Mode is controlled ONLY by the multi-button (long press)
-    // Serial commands do NOT affect Dashboard Mode
-    
     // Immediately respond to any command to prevent sleep during processing
     Serial.println("CMD_RECEIVED");
     Serial.flush(); // Ensure the response is sent immediately
     
-    // Check for status command to show dashboard mode status
-    if (command == "status") {
-      Serial.printf("[DASHBOARD] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
-      return; // Don't process further
-    }
+    // Process command using centralized function
+    processSerialCommand(command);
     
-    // Check for dashboard mode commands
-    if (command == "dashboardmode on") {
-      dashboardModeActive = true;
-      Serial.println("[DASHBOARD] Dashboard Mode: ON - ESP32 will stay awake");
-      Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED ***");
-      Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
-      setLEDStatus("dashboard_active");  // Red LED for dashboard mode
-      startBLEAdvertising();  // Start BLE advertising for mobile apps
-      Serial.flush();
-      return; // Don't process further
-    }
-    
-    if (command == "dashboardmode off") {
-      dashboardModeActive = false;
-      Serial.println("[DASHBOARD] Dashboard Mode: OFF - ESP32 will use light sleep");
-      Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED ***");
-      Serial.println("[DASHBOARD] BLE advertising stopped");
-      setLEDStatus("sleeping");  // Blue LED for normal sleep mode
-      stopBLEAdvertising();  // Stop BLE advertising
-      Serial.flush();
-      return; // Don't process further
-    }
-    
-    // Alternative dashboard commands for serial debugging
-    if (command == "dashboard on") {
-      dashboardModeActive = true;
-      Serial.println("[DASHBOARD] Dashboard Mode: ON - ESP32 will stay awake");
-      Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED (Serial Debug) ***");
-      Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
-      setLEDStatus("dashboard_active");  // Red LED for dashboard mode
-      startBLEAdvertising();  // Start BLE advertising for mobile apps
-      Serial.flush();
-      return; // Don't process further
-    }
-    
-    if (command == "dashboard off") {
-      dashboardModeActive = false;
-      Serial.println("[DASHBOARD] Dashboard Mode: OFF - ESP32 will use light sleep");
-      Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Serial Debug) ***");
-      Serial.println("[DASHBOARD] BLE advertising stopped");
-      setLEDStatus("sleeping");  // Blue LED for normal sleep mode
-      stopBLEAdvertising();  // Stop BLE advertising
-      Serial.flush();
-      return; // Don't process further
-    }
-    
-    
-    // Simple debug command that responds quickly
-    if (command == "debugsimple") {
-      Serial.println("[DEBUG] ESP32 Status: OK");
-      Serial.printf("[DEBUG] Reading count: %d\n", readingCount);
-      Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
-      return; // Don't process further
-    }
-    
-    // Debug command with immediate response
-    if (command == "debug") {
-      Serial.println("[DEBUG] --- Device Debug Info ---");
-      Serial.printf("[DEBUG] Reading count: %d\n", readingCount);
-      Serial.printf("[DEBUG] MAX_READINGS: %d\n", MAX_READINGS);
-      Serial.printf("[DEBUG] READING_SIZE: %d\n", READING_SIZE);
-      Serial.printf("[DEBUG] Available slots: %d\n", MAX_READINGS - readingCount);
-      Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
-      if (rtcAvailable) {
-        now = rtc.now();
-        Serial.printf("[DEBUG] Current time: %04d-%02d-%02d %02d:%02d:%02d\n",
-                      now.year(), now.month(), now.day(),
-                      now.hour(), now.minute(), now.second());
-        Serial.printf("[DEBUG] Unix timestamp: %lu\n", now.unixtime() + (6 * 3600));
-      } else {
-        Serial.println("[DEBUG] RTC not available");
-      }
-      Serial.println("[DEBUG] --- End Debug Info ---");
-      return; // Don't process further
-    }
-    
-    // Get command handlers for dashboard
-    if (command == "get ssid") {
-      Serial.println("<GET_SSID_BEGIN>");
-      Serial.println(ssid_str);
-      Serial.println("<GET_SSID_END>");
-      return; // Don't process further
-    }
-    if (command == "get password") {
-      Serial.println("<GET_PASSWORD_BEGIN>");
-      Serial.println(password_str);
-      Serial.println("<GET_PASSWORD_END>");
-      return; // Don't process further
-    }
-    if (command == "get rfidOnTimeMs") {
-      Serial.println("<GET_RFIDONTIME_BEGIN>");
-      Serial.println(rfidOnTimeMs);
-      Serial.println("<GET_RFIDONTIME_END>");
-      return; // Don't process further
-    }
-    if (command == "get periodicIntervalMs") {
-      Serial.println("<GET_PERIODICINTERVAL_BEGIN>");
-      Serial.println(periodicIntervalMs);
-      Serial.println("<GET_PERIODICINTERVAL_END>");
-      return; // Don't process further
-    }
-    if (command == "get longPressMs") {
-      Serial.println("<GET_LONGPRESSMS_BEGIN>");
-      Serial.println(longPressMs);
-      Serial.println("<GET_LONGPRESSMS_END>");
-      return; // Don't process further
-    }
-    if (command.startsWith("set ssid ")) {
-      String value = command.substring(9);
-      ssid_str = value; ssid = ssid_str.c_str(); saveConfigVar("ssid", value); 
-      Serial.println("OK");
-      Serial.flush();
-    } else if (command.startsWith("set password ")) {
-      String value = command.substring(13);
-      password_str = value; password = password_str.c_str(); saveConfigVar("password", value); 
-      Serial.println("OK");
-      Serial.flush();
-    } else if (command.startsWith("set rfidOnTimeMs ")) {
-      String value = command.substring(17);
-      rfidOnTimeMs = value.toInt(); saveConfigVar("rfidOnTimeMs", value); 
-      Serial.println("OK");
-      Serial.flush();
-    } else if (command.startsWith("set periodicIntervalMs ")) {
-      String value = command.substring(23);
-      periodicIntervalMs = value.toInt(); saveConfigVar("periodicIntervalMs", value); 
-      Serial.println("OK");
-      Serial.flush();
-    } else if (command.startsWith("set longPressMs ")) {
-      String value = command.substring(16);
-      longPressMs = value.toInt(); saveConfigVar("longPressMs", value); 
-      Serial.println("OK");
-      Serial.flush();
-    } else if (command == "resetconfig") {
-      if (SPIFFS.exists(configFile)) { SPIFFS.remove(configFile); Serial.println("Config reset. Reboot to use hardcoded values."); }
-      else { Serial.println("No config to reset."); }
-    } else if (command == "summary") {
-      printReadingsSummary();
-    } else if (command == "print") {
-      printStoredReadings();
-    } else if (command == "last") {
-      printLastReading();
-    } else if (command == "clear") {
-      SPIFFS.remove(FLASH_FILENAME); readingCount = 0; Serial.println("Cleared");
-    } else if (command.startsWith("range ")) {
-      command = command.substring(6);
-      int spaceIndex = command.indexOf(' ');
-      if (spaceIndex > 0) {
-        uint32_t startTime = command.substring(0, spaceIndex).toInt();
-        uint32_t endTime = command.substring(spaceIndex + 1).toInt();
-        sendStoredReadingsByRange(startTime, endTime);
-      }
-    } else if (command == "printconfig") {
-      File file = SPIFFS.open(configFile, "r");
-      if (file) {
-        Serial.println("[CONFIG] --- config.txt ---");
-        while (file.available()) { Serial.write(file.read()); }
-        file.close();
-        Serial.println("[CONFIG] --- end ---");
-      } else {
-        Serial.println("[CONFIG] No config file.");
-      }
-    } else if (command == "time") {
-      if (rtcAvailable) {
-        now = rtc.now();
-        Serial.printf("Current time: %04d-%02d-%02d %02d:%02d:%02d\n",
-                      now.year(), now.month(), now.day(),
-                      now.hour(), now.minute(), now.second());
-        Serial.printf("Unix timestamp: %lu\n", now.unixtime() + (6 * 3600));
-      } else {
-        Serial.println("RTC not available");
-      }
-    } else if (command == "dashboardmode") {
-    } else if (command == "sleepstats") {
-      Serial.printf("[STATS] wakes: timer=%u, button=%u (gpio-wake-consumed=%u, timer-consumed=%u)\n",
-                    wake_count_timer, wake_count_button, wake_button_consumed, wake_timer_consumed);
-    } else if (command == "resetrtc") {
-      Serial.println("[RTC] Resetting RTC to UTC...");
-      Serial.println("[RTC] This will take a moment...");
-      
-      // Simple approach: just add 6 hours to current RTC time to convert from Costa Rica to UTC
-      if (rtcAvailable) {
-        now = rtc.now();
-        DateTime utcTime = DateTime(now.unixtime() + (6 * 3600)); // Add 6 hours
-        rtc.adjust(utcTime);
-        Serial.println("[RTC] RTC converted from Costa Rica time to UTC");
-        now = rtc.now();
-        Serial.printf("[RTC] New time: %04d-%02d-%02d %02d:%02d:%02d (UTC)\n",
-                      now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
-        Serial.println("[RTC] RTC is now set to UTC - new readings will be stored in UTC");
-      } else {
-        Serial.println("[RTC] RTC not available - cannot reset");
-      }
-    } else if (command == "testuart") {
-      Serial.println("[UART] Testing UART wake-up...");
-      Serial.println("[UART] ESP32 will go to sleep for 10 seconds");
-      Serial.println("[UART] Send any command to wake it up");
-      Serial.flush();
-      delay(1000);
-      lightSleepUntilNextEvent(10000000); // Sleep for 10 seconds
-      Serial.println("[UART] Woke up from sleep!");
-    } else if (command == "testsleep") {
-      Serial.println("[SLEEP] Testing sleep functionality...");
-      Serial.println("[SLEEP] Going to sleep for 5 seconds");
-      Serial.flush();
-      delay(1000);
-      lightSleepUntilNextEvent(5000000); // Sleep for 5 seconds
-      Serial.println("[SLEEP] Woke up from sleep!");
-    } else if (command == "testuartlong") {
-      Serial.println("[UART] Testing UART wake-up with 30-second sleep...");
-      Serial.println("[UART] ESP32 will go to sleep for 30 seconds");
-      Serial.println("[UART] Send any command to wake it up via UART");
-      Serial.flush();
-      delay(1000);
-      lightSleepUntilNextEvent(30000000); // Sleep for 30 seconds
-      Serial.println("[UART] Woke up from sleep!");
-    } else if (command == "buttonmode") {
-      Serial.println("[BUTTON] Multi-Button Mode Status:");
-      Serial.printf("[BUTTON] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
-      Serial.println("[BUTTON] Short press: RFID read");
-      Serial.printf("[BUTTON] Long press (%lums): Toggle Dashboard Mode\n", longPressMs);
-      Serial.printf("[BUTTON] Current button state: %s\n", digitalRead(BUTTON_PIN) == LOW ? "PRESSED" : "RELEASED");
-    } else if (command == "testbutton") {
-      Serial.println("[BUTTON] Testing multi-button functionality...");
-      Serial.printf("[BUTTON] Press and hold the button for %lu seconds to toggle dashboard mode\n", longPressMs / 1000);
-      Serial.println("[BUTTON] Short press for RFID read");
-      Serial.println("[BUTTON] Current dashboard mode will be toggled on long press");
-    } else if (command == "status") {
-      Serial.println("[STATUS] Current ESP32 Status:");
-      Serial.printf("[STATUS] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
-      Serial.printf("[STATUS] lastCommandTime: %lu\n", lastCommandTime);
-      Serial.printf("[STATUS] Serial.available(): %s\n", Serial.available() ? "true" : "false");
-      Serial.printf("[STATUS] Current time: %lu ms\n", millis());
-      Serial.printf("[STATUS] Long press timer: %lu ms\n", longPressMs);
-    }
-    
-    // Ensure all responses are sent before potentially going to sleep
-    Serial.flush();
-    delay(10); // Small delay to ensure response is fully transmitted
+    // Small delay to ensure response is fully transmitted
+    delay(10);
   }
 }
