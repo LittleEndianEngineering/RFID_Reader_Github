@@ -244,10 +244,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           lastReadResult = "no_tag";
           lastReadData = null;
         });
-      } else if (response.startsWith('#') && response.contains('°C') && lastReadResult == "success") {
+      } else if (response.startsWith('#') && (response.contains('°C') || response.contains('N/A')) && lastReadResult == "success") {
         // This is the reading data after a successful tag detection
         // NOTE: The reading is already stored on ESP32 by powerOnAndReadTagWindow()
         // We parse it here for display only - it will appear in "All Readings" when retrieved
+        // Handles both temperature values and "N/A" for tags without temperature
         print("📊 PARSING LIVE READING DATA");
         _readTimeoutTimer?.cancel(); // Cancel timeout - we got the reading data
         _parseReadings(response);
@@ -285,11 +286,12 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       // This is the "Printing X stored readings:" line from "print" command
       // Don't parse this line, but ensure we're ready to parse the readings that follow
       print("✅ DETECTED PRINT COMMAND RESPONSE - ready to parse readings");
-    } else if (response.startsWith('#') && response.contains('°C') && !isReadingRFID) {
+    } else if (response.startsWith('#') && (response.contains('°C') || response.contains('N/A')) && !isReadingRFID) {
       // Individual reading line from "print" or "range" command
+      // Handles both temperature values and "N/A" for tags without temperature
       print("✅ DETECTED INDIVIDUAL READING - calling _parseReadings (current total: ${parsedReadings.length})");
       _parseReadings(response);
-    } else if (response.startsWith('#') && response.contains('°C') && isReadingRFID) {
+    } else if (response.startsWith('#') && (response.contains('°C') || response.contains('N/A')) && isReadingRFID) {
       // Individual reading from "Read Now" - already handled above, skip here
       print("⏭️ Skipping individual reading parsing (already handled for Read Now)");
     } else {
@@ -388,7 +390,10 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       // Create CSV content
       String csvContent = 'Reading #,Timestamp,Country,Tag ID,Temperature (°C)\n';
       for (var reading in parsedReadings) {
-        csvContent += '${reading['readingNum']},${reading['timestamp']},${reading['country']},${reading['tag']},${reading['temperature']}\n';
+        final tempStr = reading['temperature'] != null
+            ? (reading['temperature'] as double).toStringAsFixed(2)
+            : 'N/A';
+        csvContent += '${reading['readingNum']},${reading['timestamp']},${reading['country']},${reading['tag']},$tempStr\n';
       }
 
       // iOS: Use application documents directory (cache directory isn't shareable)
@@ -626,12 +631,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     
     // Handle individual reading responses (format: #X: timestamp, country, tag, temperature)
     // IMPORTANT: Handle concatenated readings (multiple #X: patterns in one response)
-    if (response.contains('#') && response.contains('°C')) {
+    // Also handles "N/A" for temperature when sensor is not enabled
+    if (response.contains('#') && (response.contains('°C') || response.contains('N/A'))) {
       print("🔧 Processing reading(s): '$response'");
       
       // Use flexible regex to find ALL readings in the response (handles concatenated readings)
-      // Pattern: #(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*([\d.]+)°C
-      final flexibleRegex = RegExp(r'#(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*([\d.]+)°C');
+      // Pattern: #(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*((?:[\d.]+°C|N/A))
+      // This matches either a temperature value with °C or "N/A"
+      final flexibleRegex = RegExp(r'#(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*((?:[\d.]+°C|N/A))');
       final allMatches = flexibleRegex.allMatches(response);
       
       print("🔧 Found ${allMatches.length} reading(s) in response");
@@ -648,7 +655,22 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           final timestamp = match.group(2)!.trim();
           final country = match.group(3)!;
           final tag = match.group(4)!;
-          final temperature = double.tryParse(match.group(5)!) ?? 0.0;
+          final tempStr = match.group(5)!;
+          
+          // Check if temperature is "N/A" or a numeric value
+          double? temperature;
+          if (tempStr == 'N/A') {
+            temperature = null; // null indicates temperature not available
+            print("⚠️ Temperature not available for reading #$readingNum");
+          } else {
+            // Extract numeric value (remove °C)
+            final tempValue = tempStr.replaceAll('°C', '');
+            temperature = double.tryParse(tempValue);
+            if (temperature == null) {
+              print("⚠️ Could not parse temperature '$tempStr' for reading #$readingNum");
+              temperature = null;
+            }
+          }
           
           // Validate timestamp - must be RTC format (YYYY-MM-DD HH:MM:SS), not ms timestamp
           // RTC timestamps start with a year (4 digits), ms timestamps are just numbers
@@ -665,7 +687,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             continue; // Skip this reading but continue with others
           }
           
-          print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
+          if (temperature != null) {
+            print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
+          } else {
+            print("✅ PARSED READING: #$readingNum, $timestamp, N/A");
+          }
           
           // Fix timestamp format for DateTime parsing (add leading zeros)
           String fixedTimestamp = timestamp;
@@ -692,6 +718,19 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           // Parse UTC DateTime for sorting and chart (keep as UTC internally)
           final utcDateTime = DateTime.parse(fixedTimestamp.replaceAll(' ', 'T') + 'Z');
           
+          // Check for duplicates before adding (same reading number, timestamp, country, and tag)
+          bool isDuplicate = parsedReadings.any((existing) =>
+            existing['readingNum'] == readingNum &&
+            existing['country'] == country &&
+            existing['tag'] == tag &&
+            (existing['dateTime'] as DateTime).difference(utcDateTime).inSeconds.abs() < 1 // Same timestamp (within 1 second)
+          );
+          
+          if (isDuplicate) {
+            print("⚠️ DUPLICATE READING DETECTED - skipping: #$readingNum, $timestamp, $country, $tag");
+            continue; // Skip duplicate reading
+          }
+          
           // Add to existing parsedReadings (don't clear them)
           setState(() {
             parsedReadings.add({
@@ -699,7 +738,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
               'timestamp': displayTimestamp, // Display in selected timezone
               'country': country,
               'tag': tag,
-              'temperature': temperature,
+              'temperature': temperature, // Can be null for N/A
               'dateTime': utcDateTime, // Keep UTC for sorting
             });
             print("🎯 ADDED reading to parsedReadings. Total: ${parsedReadings.length}");
@@ -751,7 +790,8 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         
         // Handle concatenated readings (multiple #X: patterns in one line)
         // Use flexible regex to find ALL readings in the line
-        final flexibleRegex = RegExp(r'#(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*([\d.]+)°C');
+        // Pattern matches either temperature with °C or "N/A"
+        final flexibleRegex = RegExp(r'#(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*((?:[\d.]+°C|N/A))');
         final allMatches = flexibleRegex.allMatches(line);
         
         if (allMatches.isEmpty) {
@@ -766,7 +806,22 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             final timestamp = match.group(2)!.trim();
             final country = match.group(3)!;
             final tag = match.group(4)!;
-            final temperature = double.tryParse(match.group(5)!) ?? 0.0;
+            final tempStr = match.group(5)!;
+            
+            // Check if temperature is "N/A" or a numeric value
+            double? temperature;
+            if (tempStr == 'N/A') {
+              temperature = null; // null indicates temperature not available
+              print("⚠️ Temperature not available for reading #$readingNum");
+            } else {
+              // Extract numeric value (remove °C)
+              final tempValue = tempStr.replaceAll('°C', '');
+              temperature = double.tryParse(tempValue);
+              if (temperature == null) {
+                print("⚠️ Could not parse temperature '$tempStr' for reading #$readingNum");
+                temperature = null;
+              }
+            }
             
             // Validate timestamp - must be RTC format (YYYY-MM-DD HH:MM:SS), not ms timestamp
             if (!timestamp.contains('-') || !timestamp.contains(':')) {
@@ -782,7 +837,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
               continue; // Skip this reading but continue with others
             }
             
-            print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
+            if (temperature != null) {
+              print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
+            } else {
+              print("✅ PARSED READING: #$readingNum, $timestamp, N/A");
+            }
             
             // Fix timestamp format for DateTime parsing (add leading zeros)
             String fixedTimestamp = timestamp;
@@ -812,7 +871,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
               'timestamp': displayTimestamp, // Display in selected timezone
               'country': country,
               'tag': tag,
-              'temperature': temperature,
+              'temperature': temperature, // Can be null for N/A
               'dateTime': utcDateTime, // Keep UTC for sorting
             });
           } catch (e) {
@@ -834,8 +893,21 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           // This is the start of a new range - replace existing readings
           parsedReadings = newReadings;
         } else {
-          // This is continuation or end - append to avoid losing already-parsed readings
-          parsedReadings.addAll(newReadings);
+          // This is continuation or end - filter out duplicates before appending
+          final filteredNewReadings = newReadings.where((newReading) {
+            bool isDuplicate = parsedReadings.any((existing) =>
+              existing['readingNum'] == newReading['readingNum'] &&
+              existing['country'] == newReading['country'] &&
+              existing['tag'] == newReading['tag'] &&
+              (existing['dateTime'] as DateTime).difference(newReading['dateTime'] as DateTime).inSeconds.abs() < 1
+            );
+            if (isDuplicate) {
+              print("⚠️ DUPLICATE READING DETECTED in range response - skipping: #${newReading['readingNum']}, ${newReading['timestamp']}, ${newReading['country']}, ${newReading['tag']}");
+            }
+            return !isDuplicate;
+          }).toList();
+          
+          parsedReadings.addAll(filteredNewReadings);
         }
         print("🎯 UPDATED parsedReadings with ${parsedReadings.length} total readings (added ${newReadings.length} from range response)");
       });
@@ -1611,11 +1683,13 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                                   ),
                                 ),
                                 Text(
-                                  '${lastReadData!['temperature'].toStringAsFixed(1)}°C',
-                                  style: const TextStyle(
+                                  lastReadData!['temperature'] != null
+                                      ? '${(lastReadData!['temperature'] as double).toStringAsFixed(1)}°C'
+                                      : 'N/A',
+                                  style: TextStyle(
                                     fontSize: 18,
                                     fontWeight: FontWeight.bold,
-                                    color: Colors.red,
+                                    color: lastReadData!['temperature'] != null ? Colors.red : Colors.grey,
                                   ),
                                 ),
                               ],
@@ -1681,7 +1755,16 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                     Column(
                       children: [
                         Text(
-                          '${parsedReadings.map((r) => r['temperature'] as double).reduce((a, b) => a > b ? a : b).toStringAsFixed(1)}°C',
+                          () {
+                            final validTemps = parsedReadings
+                                .where((r) => r['temperature'] != null)
+                                .map((r) => r['temperature'] as double)
+                                .toList();
+                            if (validTemps.isEmpty) {
+                              return 'N/A';
+                            }
+                            return validTemps.reduce((a, b) => a > b ? a : b).toStringAsFixed(1) + '°C';
+                          }(),
                           style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.red),
                         ),
                         const Text('Max Temp'),
@@ -1690,7 +1773,16 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                     Column(
                       children: [
                         Text(
-                          '${parsedReadings.map((r) => r['temperature'] as double).reduce((a, b) => a < b ? a : b).toStringAsFixed(1)}°C',
+                          () {
+                            final validTemps = parsedReadings
+                                .where((r) => r['temperature'] != null)
+                                .map((r) => r['temperature'] as double)
+                                .toList();
+                            if (validTemps.isEmpty) {
+                              return 'N/A';
+                            }
+                            return validTemps.reduce((a, b) => a < b ? a : b).toStringAsFixed(1) + '°C';
+                          }(),
                           style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.green),
                         ),
                         const Text('Min Temp'),
@@ -1823,11 +1915,13 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                                                   crossAxisAlignment: CrossAxisAlignment.start,
                                                   children: [
                                                     Text(
-                                                      '${reading['temperature'].toStringAsFixed(1)}°C',
-                                                      style: const TextStyle(
+                                                      reading['temperature'] != null
+                                                          ? '${(reading['temperature'] as double).toStringAsFixed(1)}°C'
+                                                          : 'N/A',
+                                                      style: TextStyle(
                                                         fontSize: 14,
                                                         fontWeight: FontWeight.bold,
-                                                        color: Colors.red,
+                                                        color: reading['temperature'] != null ? Colors.red : Colors.grey,
                                                       ),
                                                     ),
                                                     const SizedBox(height: 2),
@@ -1848,11 +1942,13 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                                                   crossAxisAlignment: CrossAxisAlignment.start,
                                                   children: [
                                                     Text(
-                                                      '${reading['temperature'].toStringAsFixed(1)}°C',
-                                                      style: const TextStyle(
+                                                      reading['temperature'] != null
+                                                          ? '${(reading['temperature'] as double).toStringAsFixed(1)}°C'
+                                                          : 'N/A',
+                                                      style: TextStyle(
                                                         fontSize: 12,
                                                         fontWeight: FontWeight.bold,
-                                                        color: Colors.red,
+                                                        color: reading['temperature'] != null ? Colors.red : Colors.grey,
                                                       ),
                                                     ),
                                                     const SizedBox(height: 2),
@@ -2307,8 +2403,17 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       );
     }
 
+    // Filter out readings with null temperature (N/A)
+    final validReadings = parsedReadings.where((r) => r['temperature'] != null).toList();
+    
+    if (validReadings.isEmpty) {
+      return const Center(
+        child: Text('No temperature data available'),
+      );
+    }
+
     // Sort readings by timestamp
-    final sortedReadings = List<Map<String, dynamic>>.from(parsedReadings);
+    final sortedReadings = List<Map<String, dynamic>>.from(validReadings);
     sortedReadings.sort((a, b) => (a['dateTime'] as DateTime).compareTo(b['dateTime'] as DateTime));
 
     // Group readings by tag (country + tag ID)
@@ -2354,11 +2459,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       final List<FlSpot> spots = [];
       
       // Create spots for this tag, using the index in the sorted readings
+      // Only include readings with valid temperature (not null)
       for (var tagReading in tagReadings) {
-        final indexInSorted = sortedReadings.indexOf(tagReading);
-        if (indexInSorted >= 0) {
-          final temperature = tagReading['temperature'] as double;
-          spots.add(FlSpot(indexInSorted.toDouble(), temperature));
+        if (tagReading['temperature'] != null) {
+          final indexInSorted = sortedReadings.indexOf(tagReading);
+          if (indexInSorted >= 0) {
+            final temperature = tagReading['temperature'] as double;
+            spots.add(FlSpot(indexInSorted.toDouble(), temperature));
+          }
         }
       }
       
@@ -2447,8 +2555,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                 if (index < sortedReadings.length) {
                   final reading = sortedReadings[index];
                   final tagLabel = '${reading['country']}-${reading['tag'].toString().substring(reading['tag'].toString().length - 4)}';
+                  final tempStr = reading['temperature'] != null
+                      ? '${(reading['temperature'] as double).toStringAsFixed(1)}°C'
+                      : 'N/A';
                   return LineTooltipItem(
-                    'Tag: $tagLabel\n${reading['temperature'].toStringAsFixed(1)}°C\n${reading['timestamp']}',
+                    'Tag: $tagLabel\n$tempStr\n${reading['timestamp']}',
                     const TextStyle(color: Colors.white),
                   );
                 }

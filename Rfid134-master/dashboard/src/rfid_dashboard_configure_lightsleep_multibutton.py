@@ -52,6 +52,7 @@ import re
 import calendar
 import plotly.express as px
 import pytz
+import termios  # For serial error handling on macOS/Linux
 
 # =============================================================================
 # SECURITY CONFIGURATION
@@ -79,6 +80,8 @@ if 'serial_connection' not in st.session_state:
     st.session_state.serial_connection = None
 if 'connected' not in st.session_state:
     st.session_state.connected = False
+if 'connected_port' not in st.session_state:
+    st.session_state.connected_port = None
 if 'debug_log' not in st.session_state:
     st.session_state['debug_log'] = []
 if 'set_debug_log' not in st.session_state:
@@ -137,22 +140,88 @@ def get_available_ports():
     return [port.device for port in ports]
 
 def connect_to_arduino(port, baud_rate=115200):
-    """Establish serial connection to ESP32 device"""
+    """Establish serial connection to ESP32 device without causing reset"""
     try:
-        ser = serial.Serial(port, baud_rate, timeout=2)
-        # Avoid toggling DTR/RTS which could reset some ESP32 boards
+        # CRITICAL: Open serial port with dsrdtr=False and rtscts=False to prevent
+        # DTR/RTS toggling during initialization, which causes ESP32 to reset
+        # This is especially important when Dashboard Mode is already active
+        # 
+        # IMPORTANT: Do NOT use exclusive parameter - it may not be supported in all PySerial versions
+        # Instead, rely on proper error handling if port is already open
+        ser = serial.Serial(
+            port, 
+            baud_rate, 
+            timeout=2,
+            dsrdtr=False,  # Disable DSR/DTR flow control (prevents reset)
+            rtscts=False   # Disable RTS/CTS flow control (prevents reset)
+        )
+        
+        # CRITICAL: Set DTR/RTS to False IMMEDIATELY after opening (before any delays)
+        # This must happen before any other operations to prevent toggling that causes reset
         try:
             ser.dtr = False
             ser.rts = False
         except Exception:
             pass
-        time.sleep(2)  # Allow device/USB to settle
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
+        
+        # Minimal delay - just enough for USB-CDC to recognize the connection
+        # Reduced delay since device is already awake in Dashboard Mode
+        time.sleep(0.2)
+        
+        # Clear buffers AFTER DTR/RTS are set and port is stable
+        # Only clear if port is confirmed open
+        try:
+            if ser.is_open:
+                # Use flush instead of reset to be gentler on the connection
+                ser.flushInput()
+                ser.flushOutput()
+        except Exception as e:
+            log_general_debug(f"[DEBUG] Buffer flush warning: {e}")
+        
         return ser
+    except serial.SerialException as e:
+        error_msg = str(e).lower()
+        if "already open" in error_msg or "busy" in error_msg or "access denied" in error_msg:
+            st.error(f"⚠️ Port {port} is already in use. Please disconnect first or close other applications.")
+            log_general_debug(f"[DEBUG] Port busy error: {e}")
+        else:
+            st.error(f"Failed to connect: {e}")
+            log_general_debug(f"[DEBUG] Connection error: {e}")
+        return None
     except Exception as e:
         st.error(f"Failed to connect: {e}")
+        log_general_debug(f"[DEBUG] Unexpected connection error: {e}")
         return None
+
+def is_serial_valid(ser):
+    """Check if serial connection is still valid and can be used"""
+    if ser is None:
+        return False
+    try:
+        # Check if port is open
+        if not ser.is_open:
+            return False
+        # Try to read port name to verify it's still accessible
+        _ = ser.port
+        # Try a gentle operation to verify connection is alive
+        # Don't actually read/write, just check if port is accessible
+        return True
+    except (AttributeError, OSError, termios.error, ValueError):
+        return False
+
+def is_port_already_open(port, existing_connection):
+    """Check if a serial port is already open by checking if we have a valid connection to it"""
+    # NOTE: We cannot safely check if port is open without opening it (which causes reset)
+    # Instead, we rely on our connection object tracking
+    # If we have a valid connection object, the port is effectively "open" to us
+    if existing_connection and is_serial_valid(existing_connection):
+        # Check if it's the same port
+        try:
+            if existing_connection.port == port:
+                return True
+        except Exception:
+            pass
+    return False
 
 def _wake_serial(ser, wake_delay=WAKE_DELAY):
     """
@@ -160,12 +229,15 @@ def _wake_serial(ser, wake_delay=WAKE_DELAY):
     Sends a single newline (likely consumed), waits a beat, then clears any partials.
     """
     try:
-        if ser is None:
+        if ser is None or not is_serial_valid(ser):
             return
         ser.write(b"\n")       # wake byte - device will wake but this byte is lost
         ser.flush()
         time.sleep(wake_delay) # give ESP32 time to fully wake clocks
         # REMOVED: ser.reset_input_buffer() - this was clearing responses!
+    except (OSError, termios.error, AttributeError) as e:
+        log_debug(f"[DEBUG] Wake error: {e}")
+        raise  # Re-raise to be handled by caller
     except Exception as e:
         log_debug(f"[DEBUG] Wake error: {e}")
 
@@ -398,24 +470,35 @@ def parse_readings(response):
             # Handle both debug and normal formats
             # Debug format: #200: [DEBUG] raw_timestamp=1753247585, converted=2025-07-23 05:13:05, 999, 141004265912, 24.86°C
             # Normal format: #200: 2025-07-23 05:13:05, 999, 141004265912, 24.86°C
-            debug_match = re.search(r'#\d+:\s*\[DEBUG\]\s*raw_timestamp=\d+,\s*converted=([\d\-]+\s[\d:]+),\s*([\d]+),\s*([\d]+),\s*([\d.]+)°C', line)
-            normal_match = re.search(r'#\d+:\s*([\d\-]+\s[\d:]+),\s*([\d]+),\s*([\d]+),\s*([\d.]+)°C', line)
+            # Also handles: #200: 2025-07-23 05:13:05, 999, 141004265912, N/A (for tags without temperature)
+            debug_match = re.search(r'#\d+:\s*\[DEBUG\]\s*raw_timestamp=\d+,\s*converted=([\d\-]+\s[\d:]+),\s*([\d]+),\s*([\d]+),\s*((?:[\d.]+°C|N/A))', line)
+            normal_match = re.search(r'#\d+:\s*([\d\-]+\s[\d:]+),\s*([\d]+),\s*([\d]+),\s*((?:[\d.]+°C|N/A))', line)
             
             if debug_match:
                 timestamp, value1, tag, temp = debug_match.groups()
+                # Remove °C suffix if present, keep "N/A" as is
+                if temp == 'N/A':
+                    temp_value = 'N/A'
+                else:
+                    temp_value = temp.replace('°C', '')
                 readings.append({
                     'Timestamp': timestamp,
                     'Value1': value1,
                     'Tag': tag,
-                    'Temperature_C': temp
+                    'Temperature_C': temp_value
                 })
             elif normal_match:
                 timestamp, value1, tag, temp = normal_match.groups()
+                # Remove °C suffix if present, keep "N/A" as is
+                if temp == 'N/A':
+                    temp_value = 'N/A'
+                else:
+                    temp_value = temp.replace('°C', '')
                 readings.append({
                     'Timestamp': timestamp,
                     'Value1': value1,
                     'Tag': tag,
-                    'Temperature_C': temp
+                    'Temperature_C': temp_value
                 })
     
     return readings
@@ -438,9 +521,26 @@ def convert_timestamp_to_timezone(timestamp_str, target_timezone):
 
 def get_variable_with_markers(ser, var):
     """Get ESP32 configuration variable using marker-based parsing"""
-    # Wake device and clear any old data
-    _wake_serial(ser)
-    ser.reset_input_buffer()
+    # Check if serial connection is still valid
+    if not is_serial_valid(ser):
+        log_debug(f"[ERROR] Serial connection is invalid for get {var}")
+        st.error("⚠️ Serial connection lost. Please reconnect to the device.")
+        st.session_state.connected = False
+        st.session_state.connected_port = None
+        st.session_state.serial_connection = None
+        return None
+    
+    try:
+        # Wake device and clear any old data
+        _wake_serial(ser)
+        ser.reset_input_buffer()
+    except (OSError, termios.error, AttributeError) as e:
+        log_debug(f"[ERROR] Serial error in get_variable_with_markers for {var}: {e}")
+        st.error(f"⚠️ Serial communication error: {e}. Please reconnect to the device.")
+        st.session_state.connected = False
+        st.session_state.connected_port = None
+        st.session_state.serial_connection = None
+        return None
     
     # Map variable names to marker base
     marker_map = {
@@ -454,36 +554,60 @@ def get_variable_with_markers(ser, var):
     start_marker = f"<GET_{marker_base}_BEGIN>"
     end_marker = f"<GET_{marker_base}_END>"
     
-    log_debug(f"[DEBUG] Sending get command: get {var}")
-    ser.write(f"get {var}\n".encode())
-    ser.flush()
-    time.sleep(0.05)
-    
-    lines_between = []
-    found = False
-    start_time = time.time()
-    
-    while time.time() - start_time < 4:  # Slightly increased timeout for light-sleep wake
-        if ser.in_waiting:
-            line = ser.readline().decode(errors='ignore').strip()
-            # Filter debug output for get commands
-            _log_filtered_debug(f"get {var}", line)
+    try:
+        log_debug(f"[DEBUG] Sending get command: get {var}")
+        ser.write(f"get {var}\n".encode())
+        ser.flush()
+        time.sleep(0.05)
+        
+        lines_between = []
+        found = False
+        start_time = time.time()
+        
+        while time.time() - start_time < 4:  # Slightly increased timeout for light-sleep wake
+            if not is_serial_valid(ser):
+                log_debug(f"[ERROR] Serial connection lost during get {var}")
+                st.error("⚠️ Serial connection lost during operation. Please reconnect.")
+                st.session_state.connected = False
+                st.session_state.connected_port = None
+                st.session_state.serial_connection = None
+                return None
             
-            if line == start_marker:
-                found = True
-                log_debug(f"[DEBUG] Found start marker")
-                continue
-            if found and line == end_marker:
-                log_debug(f"[DEBUG] Found end marker")
-                break
-            if found:
-                lines_between.append(line)
-                log_debug(f"[DEBUG] Added to lines_between: {line}")
-    
-    log_debug(f"[DEBUG] Lines between markers for {var}: {lines_between}")
-    value = next((l for l in lines_between if l and l != start_marker and l != end_marker), None)
-    log_debug(f"[DEBUG] Final value for {var}: {value}")
-    return value
+            try:
+                if ser.in_waiting:
+                    line = ser.readline().decode(errors='ignore').strip()
+                    # Filter debug output for get commands
+                    _log_filtered_debug(f"get {var}", line)
+                    
+                    if line == start_marker:
+                        found = True
+                        log_debug(f"[DEBUG] Found start marker")
+                        continue
+                    if found and line == end_marker:
+                        log_debug(f"[DEBUG] Found end marker")
+                        break
+                    if found:
+                        lines_between.append(line)
+                        log_debug(f"[DEBUG] Added to lines_between: {line}")
+            except (OSError, termios.error, AttributeError) as e:
+                log_debug(f"[ERROR] Serial read error during get {var}: {e}")
+                st.error(f"⚠️ Serial read error: {e}. Please reconnect.")
+                st.session_state.connected = False
+                st.session_state.connected_port = None
+                st.session_state.serial_connection = None
+                return None
+        
+        log_debug(f"[DEBUG] Lines between markers for {var}: {lines_between}")
+        value = next((l for l in lines_between if l and l != start_marker and l != end_marker), None)
+        log_debug(f"[DEBUG] Final value for {var}: {value}")
+        return value
+    except (OSError, termios.error, AttributeError) as e:
+        log_debug(f"[ERROR] Serial error in get_variable_with_markers for {var}: {e}")
+        st.error(f"⚠️ Serial communication error: {e}. Please reconnect to the device.")
+        st.session_state.connected = False
+        st.session_state.connected_port = None
+        st.session_state.serial_connection = None
+        return None
 
 def extract_latest_readings_block(response):
     """Extract the latest readings block from ESP32 response"""
@@ -560,24 +684,110 @@ with tabs[0]:
             index=1
         )
         col1, col2 = st.sidebar.columns(2)
+        
+        # Use separate button variables to handle state changes properly
+        connect_clicked = False
+        disconnect_clicked = False
+        
         if not st.session_state.connected:
-            if col1.button("🔗 Connect"):
+            connect_clicked = col1.button("🔗 Connect")
+        else:
+            disconnect_clicked = col2.button("❌ Disconnect")
+        
+        # Handle Connect button
+        if connect_clicked:
+            # ROBUST CONNECTION HANDLING: Prevent ESP32 resets on macOS
+            # CRITICAL: Opening serial ports on macOS with ESP32-S3 USB-CDC causes resets
+            # Strategy: Check connection state FIRST, only open port if truly disconnected
+            
+            # Step 1: Check if we're already connected to the same port
+            # This prevents reopening the port on every "Connect" click
+            if (st.session_state.connected and 
+                st.session_state.connected_port == selected_port and
+                st.session_state.serial_connection and
+                is_serial_valid(st.session_state.serial_connection)):
+                # Already connected to same port with valid connection - REUSE IT (no reset)
+                st.sidebar.success("✅ Already connected! (no reset)")
+                log_general_debug(f"[DEBUG] Already connected to {selected_port} - reusing connection (no reset)")
+                st.rerun()
+                # Exit early to prevent any port operations
+                connect_clicked = False
+            
+            # Step 2: If marked as connected but connection object is invalid, try to recover
+            elif (st.session_state.connected and 
+                  st.session_state.connected_port == selected_port and
+                  st.session_state.serial_connection):
+                # Connection object exists but validation failed - test it
+                try:
+                    if test_connection(st.session_state.serial_connection):
+                        # Connection works! Keep using it
+                        st.sidebar.success("✅ Connection recovered (no reset)")
+                        log_general_debug("[DEBUG] Connection recovered - reusing (no reset)")
+                        st.rerun()
+                        connect_clicked = False
+                    else:
+                        # Connection is broken - mark as disconnected
+                        log_general_debug("[DEBUG] Connection test failed - marking as disconnected")
+                        st.session_state.connected = False
+                        st.session_state.connected_port = None
+                        try:
+                            st.session_state.serial_connection.close()
+                        except Exception:
+                            pass
+                        st.session_state.serial_connection = None
+                except Exception as e:
+                    # Test exception - connection is broken
+                    log_general_debug(f"[DEBUG] Connection test exception: {e} - marking as disconnected")
+                    st.session_state.connected = False
+                    st.session_state.connected_port = None
+                    try:
+                        st.session_state.serial_connection.close()
+                    except Exception:
+                        pass
+                    st.session_state.serial_connection = None
+            
+            # Step 3: If we have a connection to a different port, close it first
+            if connect_clicked and st.session_state.serial_connection:
+                try:
+                    current_port = st.session_state.serial_connection.port
+                    if current_port != selected_port:
+                        log_general_debug(f"[DEBUG] Port changed from {current_port} to {selected_port} - closing old connection")
+                        st.session_state.serial_connection.close()
+                        st.session_state.serial_connection = None
+                        st.session_state.connected = False
+                        st.session_state.connected_port = None
+                except Exception:
+                    st.session_state.serial_connection = None
+                    st.session_state.connected = False
+                    st.session_state.connected_port = None
+            
+            # Step 4: Only open NEW connection if we're truly disconnected
+            # This should ONLY happen on first connect or after explicit disconnect
+            if connect_clicked and not st.session_state.connected:
+                log_general_debug(f"[DEBUG] Opening NEW connection to {selected_port} (may cause ESP32 reset)")
                 st.session_state.serial_connection = connect_to_arduino(selected_port, baud_rate)
                 if st.session_state.serial_connection:
                     st.session_state.connected = True
-                    st.sidebar.success("Connected!")
+                    st.session_state.connected_port = selected_port  # Store port name (persists across reruns)
+                    st.sidebar.success("✅ Connected!")
+                    st.rerun()
                 else:
-                    st.sidebar.error("Connection failed!")
-        else:
-            if col2.button("❌ Disconnect"):
-                if st.session_state.serial_connection:
-                    try:
-                        st.session_state.serial_connection.close()
-                    except Exception as e:
-                        log_general_debug(f"[DEBUG] Error closing serial connection: {e}")
-                st.session_state.connected = False
-                st.session_state.serial_connection = None
-                st.sidebar.info("Disconnected!")
+                    st.session_state.connected = False
+                    st.session_state.connected_port = None
+                    st.sidebar.error("❌ Connection failed!")
+        
+        # Handle Disconnect button
+        if disconnect_clicked:
+            if st.session_state.serial_connection:
+                try:
+                    st.session_state.serial_connection.close()
+                except Exception as e:
+                    log_general_debug(f"[DEBUG] Error closing serial connection: {e}")
+            st.session_state.connected = False
+            st.session_state.connected_port = None  # Clear port name
+            st.session_state.serial_connection = None
+            st.sidebar.info("Disconnected!")
+            st.rerun()  # Force rerun to update button display
         
     if st.session_state.connected:
         st.success("✅ Connected to RFID Reader")
@@ -706,46 +916,65 @@ with tabs[0]:
             st.write(f"Date range: {df['Timestamp'].min()} to {df['Timestamp'].max()}")
             
             if not df.empty:
-                # Ensure Temperature_C is numeric
-                df['Temperature_C'] = pd.to_numeric(df['Temperature_C'], errors='coerce')
+                # Count rows with N/A temperature
+                na_count = (df['Temperature_C'] == 'N/A').sum() if 'Temperature_C' in df.columns else 0
                 
-                # Remove any rows with NaN temperature values
-                df_clean = df.dropna(subset=['Temperature_C'])
+                # Create a copy for numeric conversion (keep original for table display)
+                df_chart = df.copy()
                 
-                if len(df_clean) != len(df):
-                    st.warning(f"⚠️ Removed {len(df) - len(df_clean)} rows with invalid temperature data")
+                # Convert Temperature_C to numeric, keeping "N/A" as NaN
+                df_chart['Temperature_C'] = pd.to_numeric(df_chart['Temperature_C'], errors='coerce')
                 
-                fig = px.line(
-                    df_clean,
-                    x="Timestamp",
-                    y="Temperature_C",
-                    color="Tag",
-                    title=f"Temperature vs Timestamp by Tag ({timezone_display})",
-                    labels={"Temperature_C": "Temperature (°C)", "Timestamp": "Timestamp", "Tag": "Tag"}
-                )
+                # Remove any rows with NaN temperature values (includes "N/A" and invalid values)
+                df_clean = df_chart.dropna(subset=['Temperature_C'])
                 
-                # Improve plot configuration for better data visibility
-                fig.update_layout(
-                    xaxis_title="Timestamp", 
-                    yaxis_title="Temperature (°C)",
-                    hovermode='x unified',  # Show all data points on hover
-                    showlegend=True
-                )
+                if na_count > 0:
+                    st.info(f"ℹ️ {na_count} reading(s) have no temperature data (N/A) and are excluded from the chart but shown in the table below.")
                 
-                # Configure x-axis to show more detailed time information
-                fig.update_xaxes(
-                    tickformat='%Y-%m-%d %H:%M',
-                    tickangle=45,
-                    nticks=10  # Show more tick marks
-                )
+                if len(df_clean) != len(df_chart) and na_count == 0:
+                    # Only show warning if there are invalid numeric values (not just N/A)
+                    invalid_count = len(df_chart) - len(df_clean) - na_count
+                    if invalid_count > 0:
+                        st.warning(f"⚠️ Removed {invalid_count} row(s) with invalid temperature data")
                 
-                # Configure y-axis for better temperature display
-                fig.update_yaxes(
-                    tickformat='.1f',  # Show one decimal place
-                    range=[df_clean['Temperature_C'].min() - 1, df_clean['Temperature_C'].max() + 1]
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
+                if not df_clean.empty:
+                    fig = px.line(
+                        df_clean,
+                        x="Timestamp",
+                        y="Temperature_C",
+                        color="Tag",
+                        title=f"Temperature vs Timestamp by Tag ({timezone_display})",
+                        labels={"Temperature_C": "Temperature (°C)", "Timestamp": "Timestamp", "Tag": "Tag"}
+                    )
+                    
+                    # Improve plot configuration for better data visibility
+                    fig.update_layout(
+                        xaxis_title="Timestamp", 
+                        yaxis_title="Temperature (°C)",
+                        hovermode='x unified',  # Show all data points on hover
+                        showlegend=True
+                    )
+                    
+                    # Configure x-axis to show more detailed time information
+                    fig.update_xaxes(
+                        tickformat='%Y-%m-%d %H:%M',
+                        tickangle=45,
+                        nticks=10  # Show more tick marks
+                    )
+                    
+                    # Configure y-axis for better temperature display
+                    fig.update_yaxes(
+                        tickformat='.1f',  # Show one decimal place
+                        range=[df_clean['Temperature_C'].min() - 1, df_clean['Temperature_C'].max() + 1]
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    # All readings have N/A temperature
+                    st.warning("⚠️ No temperature data available for charting (all readings show N/A)")
+                    fig = px.line(title=f"Temperature vs Timestamp by Tag ({timezone_display})")
+                    fig.update_layout(xaxis_title="Timestamp", yaxis_title="Temperature (°C)")
+                    st.plotly_chart(fig, use_container_width=True)
             else:
                 fig = px.line(title=f"Temperature vs Timestamp by Tag ({timezone_display})")
                 fig.update_layout(xaxis_title="Timestamp", yaxis_title="Temperature (°C)")

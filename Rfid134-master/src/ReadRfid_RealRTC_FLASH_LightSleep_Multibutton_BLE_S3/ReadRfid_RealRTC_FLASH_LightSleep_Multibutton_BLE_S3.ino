@@ -465,19 +465,34 @@ void sendStoredReadingsByBLE() {
     RfidReading reading;
     file.read((uint8_t*)&reading, READING_SIZE);
     if (reading.timestamp > 1000000000) {
-      float temp = reading.temp_raw / 100.0f;
       time_t timestamp = reading.timestamp;
       struct tm* ti = gmtime(&timestamp);
-      String readingStr = "#" + String(i + 1) + ": " + 
-                         String(ti->tm_year + 1900) + "-" + 
-                         String(ti->tm_mon + 1) + "-" + 
-                         String(ti->tm_mday) + " " + 
-                         String(ti->tm_hour) + ":" + 
-                         String(ti->tm_min) + ":" + 
-                         String(ti->tm_sec) + ", " + 
-                         String(reading.country) + ", " + 
-                         String(reading.id) + ", " + 
-                         String(temp, 2) + "°C";
+      String readingStr;
+      
+      // Check if temperature is available (0xFFFF = marker for N/A)
+      if (reading.temp_raw == 0xFFFF) {
+        readingStr = "#" + String(i + 1) + ": " + 
+                     String(ti->tm_year + 1900) + "-" + 
+                     String(ti->tm_mon + 1) + "-" + 
+                     String(ti->tm_mday) + " " + 
+                     String(ti->tm_hour) + ":" + 
+                     String(ti->tm_min) + ":" + 
+                     String(ti->tm_sec) + ", " + 
+                     String(reading.country) + ", " + 
+                     String(reading.id) + ", N/A";
+      } else {
+        float temp = reading.temp_raw / 100.0f;
+        readingStr = "#" + String(i + 1) + ": " + 
+                     String(ti->tm_year + 1900) + "-" + 
+                     String(ti->tm_mon + 1) + "-" + 
+                     String(ti->tm_mday) + " " + 
+                     String(ti->tm_hour) + ":" + 
+                     String(ti->tm_min) + ":" + 
+                     String(ti->tm_sec) + ", " + 
+                     String(reading.country) + ", " + 
+                     String(reading.id) + ", " + 
+                     String(temp, 2) + "°C";
+      }
       sendBLEResponse(readingStr);
     }
     i++; 
@@ -518,19 +533,34 @@ void sendStoredReadingsByRangeBLE(uint32_t startTime, uint32_t endTime) {
   
   sendBLEResponse("---BEGIN_READINGS---");
   for (size_t i = 0; i < validReadings.size(); ++i) {
-    float temp = validReadings[i].temp_raw / 100.0f;
     time_t timestamp = validReadings[i].timestamp;
     struct tm* ti = gmtime(&timestamp);
-    String readingStr = "#" + String(i + 1) + ": " + 
-                       String(ti->tm_year + 1900) + "-" + 
-                       String(ti->tm_mon + 1) + "-" + 
-                       String(ti->tm_mday) + " " + 
-                       String(ti->tm_hour) + ":" + 
-                       String(ti->tm_min) + ":" + 
-                       String(ti->tm_sec) + ", " + 
-                       String(validReadings[i].country) + ", " + 
-                       String(validReadings[i].id) + ", " + 
-                       String(temp, 2) + "°C";
+    String readingStr;
+    
+    // Check if temperature is available (0xFFFF = marker for N/A)
+    if (validReadings[i].temp_raw == 0xFFFF) {
+      readingStr = "#" + String(i + 1) + ": " + 
+                   String(ti->tm_year + 1900) + "-" + 
+                   String(ti->tm_mon + 1) + "-" + 
+                   String(ti->tm_mday) + " " + 
+                   String(ti->tm_hour) + ":" + 
+                   String(ti->tm_min) + ":" + 
+                   String(ti->tm_sec) + ", " + 
+                   String(validReadings[i].country) + ", " + 
+                   String(validReadings[i].id) + ", N/A";
+    } else {
+      float temp = validReadings[i].temp_raw / 100.0f;
+      readingStr = "#" + String(i + 1) + ": " + 
+                   String(ti->tm_year + 1900) + "-" + 
+                   String(ti->tm_mon + 1) + "-" + 
+                   String(ti->tm_mday) + " " + 
+                   String(ti->tm_hour) + ":" + 
+                   String(ti->tm_min) + ":" + 
+                   String(ti->tm_sec) + ", " + 
+                   String(validReadings[i].country) + ", " + 
+                   String(validReadings[i].id) + ", " + 
+                   String(temp, 2) + "°C";
+    }
     sendBLEResponse(readingStr);
   }
   sendBLEResponse("---END_READINGS---");
@@ -562,19 +592,34 @@ void sendLastReadingByBLE() {
     RfidReading reading;
     if (file.read((uint8_t*)&reading, READING_SIZE) == READING_SIZE) {
       if (reading.timestamp > 1000000000) {
-        float temp = reading.temp_raw / 100.0f;
         time_t timestamp = reading.timestamp;
         struct tm* ti = gmtime(&timestamp);
-        String readingStr = "#" + String(totalReadings) + ": " + 
-                           String(ti->tm_year + 1900) + "-" + 
-                           String(ti->tm_mon + 1) + "-" + 
-                           String(ti->tm_mday) + " " + 
-                           String(ti->tm_hour) + ":" + 
-                           String(ti->tm_min) + ":" + 
-                           String(ti->tm_sec) + ", " + 
-                           String(reading.country) + ", " + 
-                           String(reading.id) + ", " + 
-                           String(temp, 2) + "°C";
+        String readingStr;
+        
+        // Check if temperature is available (0xFFFF = marker for N/A)
+        if (reading.temp_raw == 0xFFFF) {
+          readingStr = "#" + String(totalReadings) + ": " + 
+                       String(ti->tm_year + 1900) + "-" + 
+                       String(ti->tm_mon + 1) + "-" + 
+                       String(ti->tm_mday) + " " + 
+                       String(ti->tm_hour) + ":" + 
+                       String(ti->tm_min) + ":" + 
+                       String(ti->tm_sec) + ", " + 
+                       String(reading.country) + ", " + 
+                       String(reading.id) + ", N/A";
+        } else {
+          float temp = reading.temp_raw / 100.0f;
+          readingStr = "#" + String(totalReadings) + ": " + 
+                       String(ti->tm_year + 1900) + "-" + 
+                       String(ti->tm_mon + 1) + "-" + 
+                       String(ti->tm_mday) + " " + 
+                       String(ti->tm_hour) + ":" + 
+                       String(ti->tm_min) + ":" + 
+                       String(ti->tm_sec) + ", " + 
+                       String(reading.country) + ", " + 
+                       String(reading.id) + ", " + 
+                       String(temp, 2) + "°C";
+        }
         sendBLEResponse(readingStr);
       }
     }
@@ -923,20 +968,34 @@ void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
   count = validReadings.size();
   Serial.printf("Found %d readings in range.\n", count);
   if (count > 0) {
-    float temp_first = validReadings.front().temp_raw / 100.0f;
     time_t ts_first = validReadings.front().timestamp;
     struct tm* ti_first = gmtime(&ts_first);
-    Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
-      ti_first->tm_year + 1900, ti_first->tm_mon + 1, ti_first->tm_mday,
-      ti_first->tm_hour, ti_first->tm_min, ti_first->tm_sec,
-      validReadings.front().country, validReadings.front().id, temp_first);
-    float temp_last = validReadings.back().temp_raw / 100.0f;
+    if (validReadings.front().temp_raw == 0xFFFF) {
+      Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
+        ti_first->tm_year + 1900, ti_first->tm_mon + 1, ti_first->tm_mday,
+        ti_first->tm_hour, ti_first->tm_min, ti_first->tm_sec,
+        validReadings.front().country, validReadings.front().id);
+    } else {
+      float temp_first = validReadings.front().temp_raw / 100.0f;
+      Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
+        ti_first->tm_year + 1900, ti_first->tm_mon + 1, ti_first->tm_mday,
+        ti_first->tm_hour, ti_first->tm_min, ti_first->tm_sec,
+        validReadings.front().country, validReadings.front().id, temp_first);
+    }
     time_t ts_last = validReadings.back().timestamp;
     struct tm* ti_last = gmtime(&ts_last);
-    Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
-      ti_last->tm_year + 1900, ti_last->tm_mon + 1, ti_last->tm_mday,
-      ti_last->tm_hour, ti_last->tm_min, ti_last->tm_sec,
-      validReadings.back().country, validReadings.back().id, temp_last);
+    if (validReadings.back().temp_raw == 0xFFFF) {
+      Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
+        ti_last->tm_year + 1900, ti_last->tm_mon + 1, ti_last->tm_mday,
+        ti_last->tm_hour, ti_last->tm_min, ti_last->tm_sec,
+        validReadings.back().country, validReadings.back().id);
+    } else {
+      float temp_last = validReadings.back().temp_raw / 100.0f;
+      Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
+        ti_last->tm_year + 1900, ti_last->tm_mon + 1, ti_last->tm_mday,
+        ti_last->tm_hour, ti_last->tm_min, ti_last->tm_sec,
+        validReadings.back().country, validReadings.back().id, temp_last);
+    }
   } else {
     Serial.println("None");
   }
@@ -944,34 +1003,95 @@ void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
   Serial.println("<DASHBOARD_DATA>");
   Serial.println("---BEGIN_READINGS---");
   for (size_t i = 0; i < validReadings.size(); ++i) {
-    float temp = validReadings[i].temp_raw / 100.0f;
     time_t timestamp = validReadings[i].timestamp;
     struct tm* ti = gmtime(&timestamp);
-    Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
-      (int)(i + 1), ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
-      ti->tm_hour, ti->tm_min, ti->tm_sec,
-      validReadings[i].country, validReadings[i].id, temp);
+    if (validReadings[i].temp_raw == 0xFFFF) {
+      Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
+        (int)(i + 1), ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+        ti->tm_hour, ti->tm_min, ti->tm_sec,
+        validReadings[i].country, validReadings[i].id);
+    } else {
+      float temp = validReadings[i].temp_raw / 100.0f;
+      Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
+        (int)(i + 1), ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+        ti->tm_hour, ti->tm_min, ti->tm_sec,
+        validReadings[i].country, validReadings[i].id, temp);
+    }
   }
   Serial.println("---END_READINGS---");
   Serial.println("</DASHBOARD_DATA>");
   Serial.println("[RANGE] === Range Request End ===");
 }
 
-// --- Helper to try reading and storing a tag (unchanged) ---
+// Helper function to check if temperature data is available
+bool isTemperatureAvailable(const Rfid134Reading& tag) {
+  // Temperature availability detection (hybrid approach):
+  // 
+  // 1. If isData == true: Extended data block exists → Always calculate temperature
+  //    (even if reserved1 is 0, it could be a real 23.3°C reading)
+  //
+  // 2. If isData == false BUT reserved1 > 0: Some tags have temperature data
+  //    even without the isData flag set → Calculate temperature
+  //
+  // 3. If isData == false AND reserved1 == 0: Definitely no temperature data → Show N/A
+  //
+  // This handles both standard FDX-B tags and non-standard tags that might
+  // have temperature data without the isData flag properly set.
+  
+  if (tag.isData) {
+    // Extended data block exists → Temperature sensor is available
+    return true;
+  }
+  
+  // No extended data block, but check if reserved1 has any data
+  if (tag.reserved1 > 0) {
+    // Some tags have temperature data even without isData flag
+    // (e.g., tag 999 has reserved1 = 7, which gives ~24.08°C)
+    return true;
+  }
+  
+  // No extended data block AND reserved1 is zero → No temperature data
+  return false;
+}
+
+// --- Helper to try reading and storing a tag ---
 void tryReadAndStoreTag() {
   if (lastTagValid) {
+    // Validate if temperature data is available
+    bool temperatureAvailable = isTemperatureAvailable(lastTag);
+    
+    if (!temperatureAvailable) {
+      Serial.println("[TEMP] Temperature not available (sensor not enabled)");
+    }
+    
     uint8_t firstByte = lastTag.reserved1 & 0xFF;
-    float temperature = 23.3 + (0.112 * firstByte);
+    float temperature;
+    uint16_t temp_raw;
+    
+    if (temperatureAvailable) {
+      temperature = 23.3 + (0.112 * firstByte);
+      temp_raw = (uint16_t)(temperature * 100);
+    } else {
+      // Store special marker value (0xFFFF = 655.35°C when divided by 100)
+      // This indicates "temperature not available"
+      temperature = 0.0;
+      temp_raw = 0xFFFF;
+    }
+    
     RfidReading storedReading;
     storedReading.timestamp = getCurrentTimestamp();
     storedReading.country = lastTag.country;
     storedReading.id = lastTag.id;
-    storedReading.temp_raw = (uint16_t)(temperature * 100);
+    storedReading.temp_raw = temp_raw;
     storedReading.flags = (lastTag.isData ? 1 : 0) | (lastTag.isAnimal ? 2 : 0);
     storedReading.reserved = 0;
     storeReading(storedReading);
     Serial.printf("#%d\n", readingCount);
-    Serial.printf("TAG: %03u %012llu %.2f°C\n", lastTag.country, lastTag.id, temperature);
+    if (temperatureAvailable) {
+      Serial.printf("TAG: %03u %012llu %.2f°C\n", lastTag.country, lastTag.id, temperature);
+    } else {
+      Serial.printf("TAG: %03u %012llu TEMP: N/A\n", lastTag.country, lastTag.id);
+    }
     if (rtcAvailable && storedReading.timestamp > 1000000000) {
       time_t timestamp = storedReading.timestamp;
       struct tm* timeinfo = gmtime(&timestamp);
@@ -1034,10 +1154,17 @@ public:
     
     // Send BLE status update if connected (for immediate feedback)
     if (deviceConnected) {
-      uint8_t firstByte = reading.reserved1 & 0xFF;
-      float temperature = 23.3 + (0.112 * firstByte);
-      String statusUpdate = "New reading: " + String(reading.country) + " " + 
-                           String(reading.id) + " " + String(temperature, 2) + "°C";
+      bool tempAvailable = isTemperatureAvailable(reading);
+      String statusUpdate;
+      if (tempAvailable) {
+        uint8_t firstByte = reading.reserved1 & 0xFF;
+        float temperature = 23.3 + (0.112 * firstByte);
+        statusUpdate = "New reading: " + String(reading.country) + " " + 
+                      String(reading.id) + " " + String(temperature, 2) + "°C";
+      } else {
+        statusUpdate = "New reading: " + String(reading.country) + " " + 
+                      String(reading.id) + " TEMP: N/A";
+      }
       sendBLEStatus(statusUpdate);
     }
   }
@@ -1503,17 +1630,26 @@ void powerOnAndReadTagWindow(unsigned long windowMs) {
       
       // Send the reading data via BLE if in dashboard mode
       if (dashboardModeActive) {
-        uint8_t firstByte = lastTag.reserved1 & 0xFF;
-        float temperature = 23.3 + (0.112 * firstByte);
+        bool tempAvailable = isTemperatureAvailable(lastTag);
         time_t timestamp = getCurrentTimestamp();
         struct tm* ti = gmtime(&timestamp);
         
         char readingStr[128];
-        snprintf(readingStr, sizeof(readingStr), 
-                 "#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C",
-                 readingCount, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
-                 ti->tm_hour, ti->tm_min, ti->tm_sec,
-                 lastTag.country, lastTag.id, temperature);
+        if (tempAvailable) {
+          uint8_t firstByte = lastTag.reserved1 & 0xFF;
+          float temperature = 23.3 + (0.112 * firstByte);
+          snprintf(readingStr, sizeof(readingStr), 
+                   "#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C",
+                   readingCount, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+                   ti->tm_hour, ti->tm_min, ti->tm_sec,
+                   lastTag.country, lastTag.id, temperature);
+        } else {
+          snprintf(readingStr, sizeof(readingStr), 
+                   "#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A",
+                   readingCount, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+                   ti->tm_hour, ti->tm_min, ti->tm_sec,
+                   lastTag.country, lastTag.id);
+        }
         sendBLEResponse(readingStr);
       }
       
