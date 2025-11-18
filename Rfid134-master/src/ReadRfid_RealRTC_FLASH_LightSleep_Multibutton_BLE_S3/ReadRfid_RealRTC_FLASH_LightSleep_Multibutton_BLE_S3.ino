@@ -831,13 +831,22 @@ void printStoredReadings() {
     RfidReading reading;
     file.read((uint8_t*)&reading, READING_SIZE);
     if (reading.timestamp > 1000000000) {
-      float temp = reading.temp_raw / 100.0f;
       time_t timestamp = reading.timestamp;
       struct tm* ti = gmtime(&timestamp);
-      Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
-                    i + 1, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
-                    ti->tm_hour, ti->tm_min, ti->tm_sec,
-                    reading.country, reading.id, temp);
+      
+      // Check if temperature is available (0xFFFF = marker for N/A)
+      if (reading.temp_raw == 0xFFFF) {
+        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
+                      i + 1, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+                      ti->tm_hour, ti->tm_min, ti->tm_sec,
+                      reading.country, reading.id);
+      } else {
+        float temp = reading.temp_raw / 100.0f;
+        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
+                      i + 1, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+                      ti->tm_hour, ti->tm_min, ti->tm_sec,
+                      reading.country, reading.id, temp);
+      }
     }
     i++; yield();
   }
@@ -861,13 +870,22 @@ void printLastReading() {
     RfidReading reading;
     if (file.read((uint8_t*)&reading, READING_SIZE) == READING_SIZE) {
       if (reading.timestamp > 1000000000) {
-        float temp = reading.temp_raw / 100.0f;
         time_t timestamp = reading.timestamp;
         struct tm* ti = gmtime(&timestamp);
-        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
-                      totalReadings, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
-                      ti->tm_hour, ti->tm_min, ti->tm_sec,
-                      reading.country, reading.id, temp);
+        
+        // Check if temperature is available (0xFFFF = marker for N/A)
+        if (reading.temp_raw == 0xFFFF) {
+          Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
+                        totalReadings, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+                        ti->tm_hour, ti->tm_min, ti->tm_sec,
+                        reading.country, reading.id);
+        } else {
+          float temp = reading.temp_raw / 100.0f;
+          Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
+                        totalReadings, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+                        ti->tm_hour, ti->tm_min, ti->tm_sec,
+                        reading.country, reading.id, temp);
+        }
       }
     }
   }
