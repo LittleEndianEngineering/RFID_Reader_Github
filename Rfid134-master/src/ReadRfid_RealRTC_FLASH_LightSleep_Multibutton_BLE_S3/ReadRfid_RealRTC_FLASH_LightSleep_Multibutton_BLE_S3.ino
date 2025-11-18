@@ -256,6 +256,14 @@ class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
       Serial.println("[BLE] Device connected");
+      
+      // Request larger MTU to prevent data truncation
+      // Default MTU is 23 bytes (20 bytes payload), which is too small for our readings (~50-60 bytes)
+      // The Arduino BLE library's setMTU() will handle the MTU exchange with the client
+      // iOS typically negotiates to ~185 bytes automatically, Android can go up to 512 bytes
+      // We request 512 bytes (maximum) and let the client negotiate the actual value
+      BLEDevice::setMTU(512);
+      Serial.println("[BLE] MTU negotiation requested (512 bytes) - client will negotiate actual value");
     };
 
     void onDisconnect(BLEServer* pServer) {
@@ -376,12 +384,37 @@ void stopBLEAdvertising() {
 
 void sendBLEResponse(const String& response) {
   if (deviceConnected && pResponseCharacteristic) {
+    // Check message length to prevent truncation
+    // BLE notifications/indications are limited to MTU - 3 bytes
+    // iOS typically negotiates to ~185 bytes, so payload limit is ~182 bytes
+    // Android can negotiate up to 512 bytes, so payload limit is ~509 bytes
+    // Our readings are ~50-60 bytes, so they should fit, but we check anyway
+    int msgLength = response.length();
+    const int SAFE_MTU_LIMIT = 180;  // Conservative limit (iOS default ~185 - 3 = 182)
+    if (msgLength > SAFE_MTU_LIMIT) {
+      Serial.printf("[BLE] WARNING: Message length (%d bytes) exceeds safe MTU limit (%d bytes), truncation possible\n", msgLength, SAFE_MTU_LIMIT);
+    }
+    
+    // Set the characteristic value first, then notify
+    // This ensures the data is ready before notification is sent
     pResponseCharacteristic->setValue(response.c_str());
+    
+    // Send notification (ESP32 -> iOS/Android)
+    // The PROPERTY_NOTIFY flag ensures this works correctly
     pResponseCharacteristic->notify();
-    Serial.println("[BLE] Sent response: " + response);
-    // Small delay to prevent BLE buffer overflow when sending many readings quickly
-    // This ensures the BLE stack can process each notification before the next one
-    delay(10); // 10ms delay between BLE notifications
+    // Only log every 10th message to reduce serial spam (since we're sending one reading per notification)
+    static int logCounter = 0;
+    if (++logCounter % 10 == 0 || response.indexOf("BEGIN") >= 0 || response.indexOf("END") >= 0 || response.indexOf("Printing") >= 0) {
+      Serial.println("[BLE] Sent response: " + response);
+    }
+    // Delay to prevent BLE notification queue overflow on iOS
+    // iOS has a very limited notification queue (~10-15 notifications)
+    // With batches of 2 readings, we have fewer notifications but each is still safe
+    // 300ms delay gives iOS time to process each batch before the next one is sent
+    // This prevents queue overflow while being faster than single-reading approach
+    delay(300); // 300ms delay between BLE notifications (batched approach reduces total notifications)
+    // Allow BLE stack to process the notification
+    yield();
   }
 }
 
@@ -405,8 +438,20 @@ void processBLECommand(const String& command) {
     sendBLEResponse(response);
   }
   else if (command == "print") {
-    // Send all readings via BLE
-    sendStoredReadingsByBLE();
+    // Send first chunk via BLE (pagination support)
+    // For backward compatibility, "print" sends chunk 0
+    sendStoredReadingsByBLEChunk(0);
+  }
+  else if (command.startsWith("print_chunk ")) {
+    // Process pagination command: "print_chunk N" where N is the chunk index
+    String chunkStr = command.substring(12);
+    chunkStr.trim();
+    int chunkIndex = chunkStr.toInt();
+    if (chunkIndex >= 0) {
+      sendStoredReadingsByBLEChunk(chunkIndex);
+    } else {
+      sendBLEResponse("ERROR: Invalid chunk index");
+    }
   }
   else if (command.startsWith("range ")) {
     // Process range command
@@ -457,8 +502,22 @@ void sendStoredReadingsByBLE() {
     return; 
   }
   
+  // Send readings in small batches (2 readings per notification) to balance reliability and speed
+  // iOS has a very limited notification queue (~10-15 notifications)
+  // Batching reduces the number of notifications while keeping each batch well under MTU limits
+  // Each reading is ~50-60 bytes, so 2 readings = ~100-120 bytes (safe for iOS MTU ~185 bytes)
+  const int BATCH_SIZE = 2;
+  String batchBuffer = "";
+  int batchCount = 0;
   int i = 0;
+  
   while (file.available() >= READING_SIZE) {
+    // Check if device is still connected before sending (prevents sending to disconnected device)
+    if (!deviceConnected) {
+      Serial.println("[BLE] Device disconnected during send, aborting");
+      break;
+    }
+    
     // ESP32-S3: Reset watchdog during long operations
     yield();  // Use yield() for compatibility
     
@@ -493,13 +552,172 @@ void sendStoredReadingsByBLE() {
                      String(reading.id) + ", " + 
                      String(temp, 2) + "°C";
       }
-      sendBLEResponse(readingStr);
+      
+      // Add reading to batch buffer
+      if (batchBuffer.length() > 0) {
+        batchBuffer += "\n"; // Separate readings with newline
+      }
+      batchBuffer += readingStr;
+      batchCount++;
+      
+      // Send batch when it reaches BATCH_SIZE
+      if (batchCount >= BATCH_SIZE) {
+        // Log every 10 batches to reduce serial spam
+        if ((i + 1) % 20 == 0 || i == 0) {
+          Serial.printf("[BLE] Sending batch of %d readings (size: %d bytes, total sent: %d/%d)\n", batchCount, batchBuffer.length(), i + 1, readingCount);
+        }
+        sendBLEResponse(batchBuffer);
+        batchBuffer = ""; // Clear buffer
+        batchCount = 0;
+        // Additional yield after sending batch
+        yield();
+      }
     }
     i++; 
     yield();
   }
+  
+  // Send any remaining readings in the buffer
+  if (batchBuffer.length() > 0) {
+    Serial.printf("[BLE] Sending final batch of %d readings (size: %d bytes)\n", batchCount, batchBuffer.length());
+    sendBLEResponse(batchBuffer);
+  }
   file.close();
+  
   sendBLEResponse("---END_READINGS---");
+}
+
+void sendStoredReadingsByBLEChunk(int chunkIndex) {
+  // Pagination support: Send readings in chunks to avoid iOS notification queue overflow
+  // Chunk size: 15 readings per chunk (fits safely in iOS notification queue)
+  const int CHUNK_SIZE = 15;
+  
+  // Recalculate readingCount from file size to ensure accuracy
+  File countFile = SPIFFS.open(FLASH_FILENAME, "r");
+  int actualCount = 0;
+  if (countFile) {
+    actualCount = countFile.size() / READING_SIZE;
+    countFile.close();
+    readingCount = actualCount; // Update global count
+  }
+  
+  if (readingCount == 0) { 
+    sendBLEResponse("No readings stored.");
+    return; 
+  }
+  
+  // Calculate chunk information
+  int totalChunks = (readingCount + CHUNK_SIZE - 1) / CHUNK_SIZE; // Ceiling division
+  int startIndex = chunkIndex * CHUNK_SIZE;
+  int endIndex = min(startIndex + CHUNK_SIZE, readingCount);
+  bool hasMore = (chunkIndex + 1) < totalChunks;
+  
+  // Validate chunk index
+  if (chunkIndex < 0 || startIndex >= readingCount) {
+    sendBLEResponse("ERROR: Invalid chunk index " + String(chunkIndex));
+    return;
+  }
+  
+  // Send chunk metadata
+  if (chunkIndex == 0) {
+    // First chunk: send BEGIN marker and total count
+    sendBLEResponse("---BEGIN_READINGS---");
+    sendBLEResponse("Printing " + String(readingCount) + " stored readings (chunk " + String(chunkIndex + 1) + "/" + String(totalChunks) + "):");
+  } else {
+    // Subsequent chunks: send chunk info only
+    sendBLEResponse("Chunk " + String(chunkIndex + 1) + "/" + String(totalChunks) + " (readings " + String(startIndex + 1) + "-" + String(endIndex) + "):");
+  }
+  
+  File file = SPIFFS.open(FLASH_FILENAME, "r");
+  if (!file) { 
+    sendBLEResponse("ERROR: Failed to open FLASH file");
+    sendBLEResponse("---END_READINGS---");
+    return; 
+  }
+  
+  // Skip to the start of the requested chunk
+  file.seek(startIndex * READING_SIZE);
+  
+  // Send readings in small batches (2 readings per notification) to balance reliability and speed
+  const int BATCH_SIZE = 2;
+  String batchBuffer = "";
+  int batchCount = 0;
+  int readingsInChunk = 0;
+  
+  for (int i = startIndex; i < endIndex && file.available() >= READING_SIZE; i++) {
+    // Check if device is still connected before sending
+    if (!deviceConnected) {
+      Serial.println("[BLE] Device disconnected during send, aborting");
+      break;
+    }
+    
+    // ESP32-S3: Reset watchdog during long operations
+    yield();
+    
+    RfidReading reading;
+    file.read((uint8_t*)&reading, READING_SIZE);
+    if (reading.timestamp > 1000000000) {
+      time_t timestamp = reading.timestamp;
+      struct tm* ti = gmtime(&timestamp);
+      String readingStr;
+      
+      // Check if temperature is available (0xFFFF = marker for N/A)
+      if (reading.temp_raw == 0xFFFF) {
+        readingStr = "#" + String(i + 1) + ": " + 
+                     String(ti->tm_year + 1900) + "-" + 
+                     String(ti->tm_mon + 1) + "-" + 
+                     String(ti->tm_mday) + " " + 
+                     String(ti->tm_hour) + ":" + 
+                     String(ti->tm_min) + ":" + 
+                     String(ti->tm_sec) + ", " + 
+                     String(reading.country) + ", " + 
+                     String(reading.id) + ", N/A";
+      } else {
+        float temp = reading.temp_raw / 100.0f;
+        readingStr = "#" + String(i + 1) + ": " + 
+                     String(ti->tm_year + 1900) + "-" + 
+                     String(ti->tm_mon + 1) + "-" + 
+                     String(ti->tm_mday) + " " + 
+                     String(ti->tm_hour) + ":" + 
+                     String(ti->tm_min) + ":" + 
+                     String(ti->tm_sec) + ", " + 
+                     String(reading.country) + ", " + 
+                     String(reading.id) + ", " + 
+                     String(temp, 2) + "°C";
+      }
+      
+      // Add reading to batch buffer
+      if (batchBuffer.length() > 0) {
+        batchBuffer += "\n";
+      }
+      batchBuffer += readingStr;
+      batchCount++;
+      readingsInChunk++;
+      
+      // Send batch when it reaches BATCH_SIZE
+      if (batchCount >= BATCH_SIZE) {
+        sendBLEResponse(batchBuffer);
+        batchBuffer = "";
+        batchCount = 0;
+        yield();
+      }
+    }
+    yield();
+  }
+  
+  // Send any remaining readings in the buffer
+  if (batchBuffer.length() > 0) {
+    sendBLEResponse(batchBuffer);
+  }
+  
+  file.close();
+  
+  // Send chunk completion marker
+  if (hasMore) {
+    sendBLEResponse("---CHUNK_COMPLETE---");
+  } else {
+    sendBLEResponse("---END_READINGS---");
+  }
 }
 
 void sendStoredReadingsByRangeBLE(uint32_t startTime, uint32_t endTime) {
@@ -532,7 +750,21 @@ void sendStoredReadingsByRangeBLE(uint32_t startTime, uint32_t endTime) {
   sendBLEResponse("Found " + String(validReadings.size()) + " readings in range.");
   
   sendBLEResponse("---BEGIN_READINGS---");
+  
+  // Send readings in small batches (2 readings per notification) to balance reliability and speed
+  // iOS has a very limited notification queue (~10-15 notifications)
+  // Batching reduces the number of notifications while keeping each batch well under MTU limits
+  const int BATCH_SIZE = 2;
+  String batchBuffer = "";
+  int batchCount = 0;
+  
   for (size_t i = 0; i < validReadings.size(); ++i) {
+    // Check if device is still connected before sending (prevents sending to disconnected device)
+    if (!deviceConnected) {
+      Serial.println("[BLE] Device disconnected during range send, aborting");
+      break;
+    }
+    
     time_t timestamp = validReadings[i].timestamp;
     struct tm* ti = gmtime(&timestamp);
     String readingStr;
@@ -561,7 +793,31 @@ void sendStoredReadingsByRangeBLE(uint32_t startTime, uint32_t endTime) {
                    String(validReadings[i].id) + ", " + 
                    String(temp, 2) + "°C";
     }
-    sendBLEResponse(readingStr);
+    
+    // Add reading to batch buffer
+    if (batchBuffer.length() > 0) {
+      batchBuffer += "\n"; // Separate readings with newline
+    }
+    batchBuffer += readingStr;
+    batchCount++;
+    
+    // Send batch when it reaches BATCH_SIZE
+    if (batchCount >= BATCH_SIZE) {
+      // Log every 10 batches to reduce serial spam
+      if ((i + 1) % 20 == 0 || i == 0) {
+        Serial.printf("[BLE] Sending range batch of %d readings (size: %d bytes, total sent: %d/%d)\n", batchCount, batchBuffer.length(), (int)(i + 1), (int)validReadings.size());
+      }
+      sendBLEResponse(batchBuffer);
+      batchBuffer = ""; // Clear buffer
+      batchCount = 0;
+      yield();
+    }
+  }
+  
+  // Send any remaining readings in the buffer
+  if (batchBuffer.length() > 0) {
+    Serial.printf("[BLE] Sending final range batch of %d readings (size: %d bytes)\n", batchCount, batchBuffer.length());
+    sendBLEResponse(batchBuffer);
   }
   sendBLEResponse("---END_READINGS---");
   sendBLEResponse("=== Range Request End ===");
@@ -769,7 +1025,7 @@ uint32_t getCurrentTimestamp() {
       // I2C device responds quickly, try to read time
       // Use a quick read attempt with timeout protection
       unsigned long readStart = millis();
-      now = rtc.now();
+    now = rtc.now();
       unsigned long readDuration = millis() - readStart;
       
       // Verify the time is reasonable and read was fast
@@ -785,17 +1041,17 @@ uint32_t getCurrentTimestamp() {
     }
     
     if (rtcSuccess) {
-      return now.unixtime(); // Store UTC timestamps directly (RTC is now set to UTC)
-    } else {
+    return now.unixtime(); // Store UTC timestamps directly (RTC is now set to UTC)
+  } else {
       // RTC read failed or timed out - mark as unavailable to prevent future hangs
       rtcAvailable = false;
     }
   }
   
-  // Fallbacks: try internal time (if previously synced), then millis
-  struct tm ti;
-  if (getLocalTime(&ti)) return (uint32_t)mktime(&ti);
-  return millis();
+    // Fallbacks: try internal time (if previously synced), then millis
+    struct tm ti;
+    if (getLocalTime(&ti)) return (uint32_t)mktime(&ti);
+    return millis();
 }
 
 // Flash Functions
@@ -842,10 +1098,10 @@ void printStoredReadings() {
                       reading.country, reading.id);
       } else {
         float temp = reading.temp_raw / 100.0f;
-        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
-                      i + 1, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
-                      ti->tm_hour, ti->tm_min, ti->tm_sec,
-                      reading.country, reading.id, temp);
+      Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
+                    i + 1, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+                    ti->tm_hour, ti->tm_min, ti->tm_sec,
+                    reading.country, reading.id, temp);
       }
     }
     i++; yield();
@@ -995,10 +1251,10 @@ void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
         validReadings.front().country, validReadings.front().id);
     } else {
       float temp_first = validReadings.front().temp_raw / 100.0f;
-      Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
-        ti_first->tm_year + 1900, ti_first->tm_mon + 1, ti_first->tm_mday,
-        ti_first->tm_hour, ti_first->tm_min, ti_first->tm_sec,
-        validReadings.front().country, validReadings.front().id, temp_first);
+    Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
+      ti_first->tm_year + 1900, ti_first->tm_mon + 1, ti_first->tm_mday,
+      ti_first->tm_hour, ti_first->tm_min, ti_first->tm_sec,
+      validReadings.front().country, validReadings.front().id, temp_first);
     }
     time_t ts_last = validReadings.back().timestamp;
     struct tm* ti_last = gmtime(&ts_last);
@@ -1009,10 +1265,10 @@ void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
         validReadings.back().country, validReadings.back().id);
     } else {
       float temp_last = validReadings.back().temp_raw / 100.0f;
-      Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
-        ti_last->tm_year + 1900, ti_last->tm_mon + 1, ti_last->tm_mday,
-        ti_last->tm_hour, ti_last->tm_min, ti_last->tm_sec,
-        validReadings.back().country, validReadings.back().id, temp_last);
+    Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
+      ti_last->tm_year + 1900, ti_last->tm_mon + 1, ti_last->tm_mday,
+      ti_last->tm_hour, ti_last->tm_min, ti_last->tm_sec,
+      validReadings.back().country, validReadings.back().id, temp_last);
     }
   } else {
     Serial.println("None");
@@ -1030,10 +1286,10 @@ void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
         validReadings[i].country, validReadings[i].id);
     } else {
       float temp = validReadings[i].temp_raw / 100.0f;
-      Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
-        (int)(i + 1), ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
-        ti->tm_hour, ti->tm_min, ti->tm_sec,
-        validReadings[i].country, validReadings[i].id, temp);
+    Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
+      (int)(i + 1), ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+      ti->tm_hour, ti->tm_min, ti->tm_sec,
+      validReadings[i].country, validReadings[i].id, temp);
     }
   }
   Serial.println("---END_READINGS---");
@@ -1106,7 +1362,7 @@ void tryReadAndStoreTag() {
     storeReading(storedReading);
     Serial.printf("#%d\n", readingCount);
     if (temperatureAvailable) {
-      Serial.printf("TAG: %03u %012llu %.2f°C\n", lastTag.country, lastTag.id, temperature);
+    Serial.printf("TAG: %03u %012llu %.2f°C\n", lastTag.country, lastTag.id, temperature);
     } else {
       Serial.printf("TAG: %03u %012llu TEMP: N/A\n", lastTag.country, lastTag.id);
     }
@@ -1178,7 +1434,7 @@ public:
         uint8_t firstByte = reading.reserved1 & 0xFF;
         float temperature = 23.3 + (0.112 * firstByte);
         statusUpdate = "New reading: " + String(reading.country) + " " + 
-                      String(reading.id) + " " + String(temperature, 2) + "°C";
+                           String(reading.id) + " " + String(temperature, 2) + "°C";
       } else {
         statusUpdate = "New reading: " + String(reading.country) + " " + 
                       String(reading.id) + " TEMP: N/A";
@@ -1458,7 +1714,7 @@ void setup() {
   delay(300);                       // Allow time for USB to settle
   Serial.begin(115200);             // USB-CDC
   
-// Give macOS time to enumerate CDC and IDE time to reopen port
+  // Give macOS time to enumerate CDC and IDE time to reopen port
   unsigned long t0 = millis();
   while (!Serial && millis() - t0 < 2000) {}  // Wait a bit for connection
 
@@ -1647,7 +1903,7 @@ void powerOnAndReadTagWindow(unsigned long windowMs) {
       tryReadAndStoreTag();
       
       // Send the reading data via BLE if in dashboard mode
-      if (dashboardModeActive) {
+    if (dashboardModeActive) {
         bool tempAvailable = isTemperatureAvailable(lastTag);
         time_t timestamp = getCurrentTimestamp();
         struct tm* ti = gmtime(&timestamp);
@@ -1718,260 +1974,260 @@ void powerOnAndReadTagWindow(unsigned long windowMs) {
 // priority check and regular Serial processing to ensure consistent behavior
 void processSerialCommand(const String& command) {
   // Check for status command to show dashboard mode status
-  if (command == "status") {
-    Serial.printf("[DASHBOARD] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
+    if (command == "status") {
+      Serial.printf("[DASHBOARD] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
     Serial.flush();
-    return;
-  }
+      return;
+    }
   
   // Check for dashboard mode commands
-  if (command == "dashboardmode on") {
-    dashboardModeActive = true;
-    Serial.println("[DASHBOARD] Dashboard Mode: ON - ESP32 will stay awake");
-    Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED ***");
-    Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
+    if (command == "dashboardmode on") {
+      dashboardModeActive = true;
+      Serial.println("[DASHBOARD] Dashboard Mode: ON - ESP32 will stay awake");
+      Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED ***");
+      Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
     setLEDStatus("dashboard_active");  // Red LED for dashboard mode
     startBLEAdvertising();  // Start BLE advertising for mobile apps
-    Serial.flush();
-    return;
-  }
+      Serial.flush();
+      return;
+    }
   
-  if (command == "dashboardmode off") {
-    dashboardModeActive = false;
-    Serial.println("[DASHBOARD] Dashboard Mode: OFF - ESP32 will use light sleep");
-    Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED ***");
-    Serial.println("[DASHBOARD] BLE advertising stopped");
+    if (command == "dashboardmode off") {
+      dashboardModeActive = false;
+      Serial.println("[DASHBOARD] Dashboard Mode: OFF - ESP32 will use light sleep");
+      Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED ***");
+      Serial.println("[DASHBOARD] BLE advertising stopped");
     setLEDStatus("sleeping");  // Blue LED for normal sleep mode
     stopBLEAdvertising();  // Stop BLE advertising
-    Serial.flush();
-    return;
-  }
+      Serial.flush();
+      return;
+    }
   
   // Alternative dashboard commands for serial debugging
-  if (command == "dashboard on") {
-    dashboardModeActive = true;
-    Serial.println("[DASHBOARD] Dashboard Mode: ON - ESP32 will stay awake");
-    Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED (Serial Debug) ***");
-    Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
+    if (command == "dashboard on") {
+      dashboardModeActive = true;
+      Serial.println("[DASHBOARD] Dashboard Mode: ON - ESP32 will stay awake");
+      Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED (Serial Debug) ***");
+      Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
     setLEDStatus("dashboard_active");  // Red LED for dashboard mode
     startBLEAdvertising();  // Start BLE advertising for mobile apps
-    Serial.flush();
-    return;
-  }
+      Serial.flush();
+      return;
+    }
   
-  if (command == "dashboard off") {
-    dashboardModeActive = false;
-    Serial.println("[DASHBOARD] Dashboard Mode: OFF - ESP32 will use light sleep");
-    Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Serial Debug) ***");
-    Serial.println("[DASHBOARD] BLE advertising stopped");
+    if (command == "dashboard off") {
+      dashboardModeActive = false;
+      Serial.println("[DASHBOARD] Dashboard Mode: OFF - ESP32 will use light sleep");
+      Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Serial Debug) ***");
+      Serial.println("[DASHBOARD] BLE advertising stopped");
     setLEDStatus("sleeping");  // Blue LED for normal sleep mode
     stopBLEAdvertising();  // Stop BLE advertising
-    Serial.flush();
-    return;
-  }
+      Serial.flush();
+      return;
+    }
   
   // Simple debug command that responds quickly
-  if (command == "debugsimple") {
-    Serial.println("[DEBUG] ESP32 Status: OK");
-    Serial.printf("[DEBUG] Reading count: %d\n", readingCount);
-    Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
+    if (command == "debugsimple") {
+      Serial.println("[DEBUG] ESP32 Status: OK");
+      Serial.printf("[DEBUG] Reading count: %d\n", readingCount);
+      Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
     Serial.flush();
-    return;
-  }
+      return;
+    }
   
   // Debug command with immediate response
-  if (command == "debug") {
-    Serial.println("[DEBUG] --- Device Debug Info ---");
-    Serial.printf("[DEBUG] Reading count: %d\n", readingCount);
-    Serial.printf("[DEBUG] MAX_READINGS: %d\n", MAX_READINGS);
-    Serial.printf("[DEBUG] READING_SIZE: %d\n", READING_SIZE);
-    Serial.printf("[DEBUG] Available slots: %d\n", MAX_READINGS - readingCount);
-    Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
-    if (rtcAvailable) {
-      now = rtc.now();
-      Serial.printf("[DEBUG] Current time: %04d-%02d-%02d %02d:%02d:%02d\n",
-                    now.year(), now.month(), now.day(),
-                    now.hour(), now.minute(), now.second());
-      Serial.printf("[DEBUG] Unix timestamp: %lu\n", now.unixtime() + (6 * 3600));
-    } else {
-      Serial.println("[DEBUG] RTC not available");
-    }
-    Serial.println("[DEBUG] --- End Debug Info ---");
+    if (command == "debug") {
+      Serial.println("[DEBUG] --- Device Debug Info ---");
+      Serial.printf("[DEBUG] Reading count: %d\n", readingCount);
+      Serial.printf("[DEBUG] MAX_READINGS: %d\n", MAX_READINGS);
+      Serial.printf("[DEBUG] READING_SIZE: %d\n", READING_SIZE);
+      Serial.printf("[DEBUG] Available slots: %d\n", MAX_READINGS - readingCount);
+      Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
+      if (rtcAvailable) {
+        now = rtc.now();
+        Serial.printf("[DEBUG] Current time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                      now.year(), now.month(), now.day(),
+                      now.hour(), now.minute(), now.second());
+        Serial.printf("[DEBUG] Unix timestamp: %lu\n", now.unixtime() + (6 * 3600));
+      } else {
+        Serial.println("[DEBUG] RTC not available");
+      }
+      Serial.println("[DEBUG] --- End Debug Info ---");
     Serial.flush();
-    return;
-  }
+      return;
+    }
   
   // Get command handlers for dashboard
-  if (command == "get ssid") {
-    Serial.println("<GET_SSID_BEGIN>");
-    Serial.println(ssid_str);
-    Serial.println("<GET_SSID_END>");
+    if (command == "get ssid") {
+      Serial.println("<GET_SSID_BEGIN>");
+      Serial.println(ssid_str);
+      Serial.println("<GET_SSID_END>");
     Serial.flush();
-    return;
-  }
-  if (command == "get password") {
-    Serial.println("<GET_PASSWORD_BEGIN>");
-    Serial.println(password_str);
-    Serial.println("<GET_PASSWORD_END>");
+      return;
+    }
+    if (command == "get password") {
+      Serial.println("<GET_PASSWORD_BEGIN>");
+      Serial.println(password_str);
+      Serial.println("<GET_PASSWORD_END>");
     Serial.flush();
-    return;
-  }
-  if (command == "get rfidOnTimeMs") {
-    Serial.println("<GET_RFIDONTIME_BEGIN>");
-    Serial.println(rfidOnTimeMs);
-    Serial.println("<GET_RFIDONTIME_END>");
+      return;
+    }
+    if (command == "get rfidOnTimeMs") {
+      Serial.println("<GET_RFIDONTIME_BEGIN>");
+      Serial.println(rfidOnTimeMs);
+      Serial.println("<GET_RFIDONTIME_END>");
     Serial.flush();
-    return;
-  }
-  if (command == "get periodicIntervalMs") {
-    Serial.println("<GET_PERIODICINTERVAL_BEGIN>");
-    Serial.println(periodicIntervalMs);
-    Serial.println("<GET_PERIODICINTERVAL_END>");
+      return;
+    }
+    if (command == "get periodicIntervalMs") {
+      Serial.println("<GET_PERIODICINTERVAL_BEGIN>");
+      Serial.println(periodicIntervalMs);
+      Serial.println("<GET_PERIODICINTERVAL_END>");
     Serial.flush();
-    return;
-  }
-  if (command == "get longPressMs") {
-    Serial.println("<GET_LONGPRESSMS_BEGIN>");
-    Serial.println(longPressMs);
-    Serial.println("<GET_LONGPRESSMS_END>");
+      return;
+    }
+    if (command == "get longPressMs") {
+      Serial.println("<GET_LONGPRESSMS_BEGIN>");
+      Serial.println(longPressMs);
+      Serial.println("<GET_LONGPRESSMS_END>");
     Serial.flush();
-    return;
-  }
-  if (command.startsWith("set ssid ")) {
-    String value = command.substring(9);
-    ssid_str = value; ssid = ssid_str.c_str(); saveConfigVar("ssid", value); 
-    Serial.println("OK");
+      return;
+    }
+    if (command.startsWith("set ssid ")) {
+      String value = command.substring(9);
+      ssid_str = value; ssid = ssid_str.c_str(); saveConfigVar("ssid", value); 
+      Serial.println("OK");
+      Serial.flush();
+    } else if (command.startsWith("set password ")) {
+      String value = command.substring(13);
+      password_str = value; password = password_str.c_str(); saveConfigVar("password", value); 
+      Serial.println("OK");
+      Serial.flush();
+    } else if (command.startsWith("set rfidOnTimeMs ")) {
+      String value = command.substring(17);
+      rfidOnTimeMs = value.toInt(); saveConfigVar("rfidOnTimeMs", value); 
+      Serial.println("OK");
+      Serial.flush();
+    } else if (command.startsWith("set periodicIntervalMs ")) {
+      String value = command.substring(23);
+      periodicIntervalMs = value.toInt(); saveConfigVar("periodicIntervalMs", value); 
+      Serial.println("OK");
+      Serial.flush();
+    } else if (command.startsWith("set longPressMs ")) {
+      String value = command.substring(16);
+      longPressMs = value.toInt(); saveConfigVar("longPressMs", value); 
+      Serial.println("OK");
+      Serial.flush();
+    } else if (command == "resetconfig") {
+      if (SPIFFS.exists(configFile)) { SPIFFS.remove(configFile); Serial.println("Config reset. Reboot to use hardcoded values."); }
+      else { Serial.println("No config to reset."); }
     Serial.flush();
-  } else if (command.startsWith("set password ")) {
-    String value = command.substring(13);
-    password_str = value; password = password_str.c_str(); saveConfigVar("password", value); 
-    Serial.println("OK");
+    } else if (command == "summary") {
+      printReadingsSummary();
     Serial.flush();
-  } else if (command.startsWith("set rfidOnTimeMs ")) {
-    String value = command.substring(17);
-    rfidOnTimeMs = value.toInt(); saveConfigVar("rfidOnTimeMs", value); 
-    Serial.println("OK");
-    Serial.flush();
-  } else if (command.startsWith("set periodicIntervalMs ")) {
-    String value = command.substring(23);
-    periodicIntervalMs = value.toInt(); saveConfigVar("periodicIntervalMs", value); 
-    Serial.println("OK");
-    Serial.flush();
-  } else if (command.startsWith("set longPressMs ")) {
-    String value = command.substring(16);
-    longPressMs = value.toInt(); saveConfigVar("longPressMs", value); 
-    Serial.println("OK");
-    Serial.flush();
-  } else if (command == "resetconfig") {
-    if (SPIFFS.exists(configFile)) { SPIFFS.remove(configFile); Serial.println("Config reset. Reboot to use hardcoded values."); }
-    else { Serial.println("No config to reset."); }
-    Serial.flush();
-  } else if (command == "summary") {
-    printReadingsSummary();
-    Serial.flush();
-  } else if (command == "print") {
-    printStoredReadings();
+    } else if (command == "print") {
+      printStoredReadings();
     Serial.flush();
   } else if (command == "last") {
     printLastReading();
     Serial.flush();
-  } else if (command == "clear") {
-    SPIFFS.remove(FLASH_FILENAME); readingCount = 0; Serial.println("Cleared");
+    } else if (command == "clear") {
+      SPIFFS.remove(FLASH_FILENAME); readingCount = 0; Serial.println("Cleared");
     Serial.flush();
-  } else if (command.startsWith("range ")) {
+    } else if (command.startsWith("range ")) {
     String rangeCmd = command.substring(6);
     int spaceIndex = rangeCmd.indexOf(' ');
-    if (spaceIndex > 0) {
+      if (spaceIndex > 0) {
       uint32_t startTime = rangeCmd.substring(0, spaceIndex).toInt();
       uint32_t endTime = rangeCmd.substring(spaceIndex + 1).toInt();
-      sendStoredReadingsByRange(startTime, endTime);
-    }
+        sendStoredReadingsByRange(startTime, endTime);
+      }
     Serial.flush();
-  } else if (command == "printconfig") {
-    File file = SPIFFS.open(configFile, "r");
-    if (file) {
-      Serial.println("[CONFIG] --- config.txt ---");
-      while (file.available()) { Serial.write(file.read()); }
-      file.close();
-      Serial.println("[CONFIG] --- end ---");
-    } else {
-      Serial.println("[CONFIG] No config file.");
-    }
+    } else if (command == "printconfig") {
+      File file = SPIFFS.open(configFile, "r");
+      if (file) {
+        Serial.println("[CONFIG] --- config.txt ---");
+        while (file.available()) { Serial.write(file.read()); }
+        file.close();
+        Serial.println("[CONFIG] --- end ---");
+      } else {
+        Serial.println("[CONFIG] No config file.");
+      }
     Serial.flush();
-  } else if (command == "time") {
-    if (rtcAvailable) {
-      now = rtc.now();
-      Serial.printf("Current time: %04d-%02d-%02d %02d:%02d:%02d\n",
-                    now.year(), now.month(), now.day(),
-                    now.hour(), now.minute(), now.second());
-      Serial.printf("Unix timestamp: %lu\n", now.unixtime() + (6 * 3600));
-    } else {
-      Serial.println("RTC not available");
-    }
+    } else if (command == "time") {
+      if (rtcAvailable) {
+        now = rtc.now();
+        Serial.printf("Current time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                      now.year(), now.month(), now.day(),
+                      now.hour(), now.minute(), now.second());
+        Serial.printf("Unix timestamp: %lu\n", now.unixtime() + (6 * 3600));
+      } else {
+        Serial.println("RTC not available");
+      }
     Serial.flush();
-  } else if (command == "dashboardmode") {
+    } else if (command == "dashboardmode") {
     // Empty command - do nothing
-  } else if (command == "sleepstats") {
-    Serial.printf("[STATS] wakes: timer=%u, button=%u (gpio-wake-consumed=%u, timer-consumed=%u)\n",
-                  wake_count_timer, wake_count_button, wake_button_consumed, wake_timer_consumed);
+    } else if (command == "sleepstats") {
+      Serial.printf("[STATS] wakes: timer=%u, button=%u (gpio-wake-consumed=%u, timer-consumed=%u)\n",
+                    wake_count_timer, wake_count_button, wake_button_consumed, wake_timer_consumed);
     Serial.flush();
-  } else if (command == "resetrtc") {
-    Serial.println("[RTC] Resetting RTC to UTC...");
-    Serial.println("[RTC] This will take a moment...");
+    } else if (command == "resetrtc") {
+      Serial.println("[RTC] Resetting RTC to UTC...");
+      Serial.println("[RTC] This will take a moment...");
     Serial.flush();
     
     // Simple approach: just add 6 hours to current RTC time to convert from Costa Rica to UTC
-    if (rtcAvailable) {
-      now = rtc.now();
-      DateTime utcTime = DateTime(now.unixtime() + (6 * 3600)); // Add 6 hours
-      rtc.adjust(utcTime);
-      Serial.println("[RTC] RTC converted from Costa Rica time to UTC");
-      now = rtc.now();
-      Serial.printf("[RTC] New time: %04d-%02d-%02d %02d:%02d:%02d (UTC)\n",
-                    now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
-      Serial.println("[RTC] RTC is now set to UTC - new readings will be stored in UTC");
-    } else {
-      Serial.println("[RTC] RTC not available - cannot reset");
-    }
+      if (rtcAvailable) {
+        now = rtc.now();
+        DateTime utcTime = DateTime(now.unixtime() + (6 * 3600)); // Add 6 hours
+        rtc.adjust(utcTime);
+        Serial.println("[RTC] RTC converted from Costa Rica time to UTC");
+        now = rtc.now();
+        Serial.printf("[RTC] New time: %04d-%02d-%02d %02d:%02d:%02d (UTC)\n",
+                      now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+        Serial.println("[RTC] RTC is now set to UTC - new readings will be stored in UTC");
+      } else {
+        Serial.println("[RTC] RTC not available - cannot reset");
+      }
     Serial.flush();
-  } else if (command == "testuart") {
-    Serial.println("[UART] Testing UART wake-up...");
-    Serial.println("[UART] ESP32 will go to sleep for 10 seconds");
-    Serial.println("[UART] Send any command to wake it up");
+    } else if (command == "testuart") {
+      Serial.println("[UART] Testing UART wake-up...");
+      Serial.println("[UART] ESP32 will go to sleep for 10 seconds");
+      Serial.println("[UART] Send any command to wake it up");
+      Serial.flush();
+      delay(1000);
+      lightSleepUntilNextEvent(10000000); // Sleep for 10 seconds
+      Serial.println("[UART] Woke up from sleep!");
     Serial.flush();
-    delay(1000);
-    lightSleepUntilNextEvent(10000000); // Sleep for 10 seconds
-    Serial.println("[UART] Woke up from sleep!");
+    } else if (command == "testsleep") {
+      Serial.println("[SLEEP] Testing sleep functionality...");
+      Serial.println("[SLEEP] Going to sleep for 5 seconds");
+      Serial.flush();
+      delay(1000);
+      lightSleepUntilNextEvent(5000000); // Sleep for 5 seconds
+      Serial.println("[SLEEP] Woke up from sleep!");
     Serial.flush();
-  } else if (command == "testsleep") {
-    Serial.println("[SLEEP] Testing sleep functionality...");
-    Serial.println("[SLEEP] Going to sleep for 5 seconds");
+    } else if (command == "testuartlong") {
+      Serial.println("[UART] Testing UART wake-up with 30-second sleep...");
+      Serial.println("[UART] ESP32 will go to sleep for 30 seconds");
+      Serial.println("[UART] Send any command to wake it up via UART");
+      Serial.flush();
+      delay(1000);
+      lightSleepUntilNextEvent(30000000); // Sleep for 30 seconds
+      Serial.println("[UART] Woke up from sleep!");
     Serial.flush();
-    delay(1000);
-    lightSleepUntilNextEvent(5000000); // Sleep for 5 seconds
-    Serial.println("[SLEEP] Woke up from sleep!");
+    } else if (command == "buttonmode") {
+      Serial.println("[BUTTON] Multi-Button Mode Status:");
+      Serial.printf("[BUTTON] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
+      Serial.println("[BUTTON] Short press: RFID read");
+      Serial.printf("[BUTTON] Long press (%lums): Toggle Dashboard Mode\n", longPressMs);
+      Serial.printf("[BUTTON] Current button state: %s\n", digitalRead(BUTTON_PIN) == LOW ? "PRESSED" : "RELEASED");
     Serial.flush();
-  } else if (command == "testuartlong") {
-    Serial.println("[UART] Testing UART wake-up with 30-second sleep...");
-    Serial.println("[UART] ESP32 will go to sleep for 30 seconds");
-    Serial.println("[UART] Send any command to wake it up via UART");
-    Serial.flush();
-    delay(1000);
-    lightSleepUntilNextEvent(30000000); // Sleep for 30 seconds
-    Serial.println("[UART] Woke up from sleep!");
-    Serial.flush();
-  } else if (command == "buttonmode") {
-    Serial.println("[BUTTON] Multi-Button Mode Status:");
-    Serial.printf("[BUTTON] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
-    Serial.println("[BUTTON] Short press: RFID read");
-    Serial.printf("[BUTTON] Long press (%lums): Toggle Dashboard Mode\n", longPressMs);
-    Serial.printf("[BUTTON] Current button state: %s\n", digitalRead(BUTTON_PIN) == LOW ? "PRESSED" : "RELEASED");
-    Serial.flush();
-  } else if (command == "testbutton") {
-    Serial.println("[BUTTON] Testing multi-button functionality...");
-    Serial.printf("[BUTTON] Press and hold the button for %lu seconds to toggle dashboard mode\n", longPressMs / 1000);
-    Serial.println("[BUTTON] Short press for RFID read");
-    Serial.println("[BUTTON] Current dashboard mode will be toggled on long press");
+    } else if (command == "testbutton") {
+      Serial.println("[BUTTON] Testing multi-button functionality...");
+      Serial.printf("[BUTTON] Press and hold the button for %lu seconds to toggle dashboard mode\n", longPressMs / 1000);
+      Serial.println("[BUTTON] Short press for RFID read");
+      Serial.println("[BUTTON] Current dashboard mode will be toggled on long press");
     Serial.flush();
   } else {
     // Unknown command - do nothing (or could send error message)
@@ -2001,7 +2257,7 @@ void loop() {
       
       // Immediately respond to any command to prevent sleep during processing
       Serial.println("CMD_RECEIVED");
-      Serial.flush();
+    Serial.flush();
       
       // Process command using the same handler as the main Serial section
       // This ensures consistent behavior whether Dashboard Mode is active or not
@@ -2071,7 +2327,7 @@ void loop() {
     if (buttonCurrentlyPressed) {
       // Button is still pressed - wait for release and measure duration
       while (digitalRead(BUTTON_PIN) == LOW) {
-        delay(10);
+    delay(10);
         // Check for long press feedback while waiting
         unsigned long currentTime = millis();
         unsigned long pressDuration = currentTime - pressStartTime;

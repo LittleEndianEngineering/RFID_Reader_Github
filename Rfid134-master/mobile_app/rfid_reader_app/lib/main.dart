@@ -162,6 +162,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         isConnected = true;
       });
 
+      // Note: iOS doesn't support manual MTU negotiation via requestMtu()
+      // iOS automatically negotiates MTU (typically 185 bytes on iOS)
+      // The ESP32 will request 512 bytes MTU on connection, and iOS will negotiate automatically
+      // We rely on the ESP32's setMTU() call in onConnect() to handle MTU negotiation
+
       // Discover services
       List<BluetoothService> services = await device.discoverServices();
       
@@ -191,6 +196,16 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     }
   }
 
+  // Debug counters for "All Readings" tracking
+  int _printResponseCount = 0;
+  int _totalReadingsReceived = 0;
+  int _lastParsedCount = 0;
+  
+  // Pagination state for chunked reading retrieval
+  int _currentChunkIndex = 0;
+  int _totalChunks = 0;
+  bool _isFetchingChunks = false;
+
   void _handleESP32Response(List<int> value) {
     String response = utf8.decode(value);
     
@@ -198,6 +213,15 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     if (response.isEmpty || response.trim().isEmpty) {
       print("⚠️ Received EMPTY ESP32 response (length: ${value.length}) - possible BLE buffer issue");
       return; // Don't process empty responses
+    }
+    
+    // Track "print" command responses
+    if (response.contains('---BEGIN_READINGS---') || 
+        response.contains('Printing') || 
+        response.contains('---END_READINGS---') ||
+        (response.startsWith('#') && (response.contains('°C') || response.contains('N/A')))) {
+      _printResponseCount++;
+      print("📊 [PRINT DEBUG] Response #$_printResponseCount | Length: ${response.length} bytes | Preview: ${response.length > 100 ? response.substring(0, 100) + '...' : response}");
     }
     
     print("🔍 Received ESP32 response: $response (length: ${response.length}, bytes: ${value.length})");
@@ -268,29 +292,97 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     // Check if this is the start of a new query (clear previous readings)
     // Only clear on ---BEGIN_READINGS--- or Found, NOT on "Printing X stored readings:"
     // because "Printing" comes AFTER ---BEGIN_READINGS--- and would clear already-parsed readings
-    if (response.contains('---BEGIN_READINGS---') || response.contains('Found')) {
+    // IMPORTANT: For pagination, only clear on first chunk (when not fetching chunks)
+    if ((response.contains('---BEGIN_READINGS---') || response.contains('Found')) && !_isFetchingChunks) {
       print("✅ DETECTED NEW QUERY START - clearing previous readings");
       setState(() {
         parsedReadings.clear();
       });
+    } else if (response.contains('---BEGIN_READINGS---') && _isFetchingChunks) {
+      print("✅ DETECTED BEGIN_READINGS during pagination - NOT clearing (appending to existing ${parsedReadings.length} readings)");
     }
     
     // Check if this is the start of a range response or "print" command response
     if (response.contains('---BEGIN_READINGS---') || response.contains('Found')) {
       print("✅ DETECTED RANGE/PRINT RESPONSE START - calling _parseReadings");
+      _lastParsedCount = parsedReadings.length;
       _parseReadings(response);
+      print("📊 [PARSE DEBUG] After BEGIN: ${parsedReadings.length} readings (was $_lastParsedCount)");
+    } else if (response.contains('---CHUNK_COMPLETE---')) {
+      // Chunk completed - automatically request next chunk
+      print("✅ DETECTED CHUNK COMPLETE - requesting next chunk");
+      _lastParsedCount = parsedReadings.length;
+      _parseReadings(response);
+      print("📊 [PARSE DEBUG] After CHUNK_COMPLETE: ${parsedReadings.length} readings (was $_lastParsedCount)");
+      
+      // Request next chunk automatically
+      _currentChunkIndex++;
+      if (_currentChunkIndex < _totalChunks) {
+        print("📥 Requesting next chunk: $_currentChunkIndex/$_totalChunks");
+        Future.delayed(const Duration(milliseconds: 500), () {
+          // Small delay to ensure previous chunk is fully processed
+          _sendCommand('print_chunk $_currentChunkIndex');
+        });
+      } else {
+        print("✅ All chunks received - pagination complete");
+        _isFetchingChunks = false;
+        _currentChunkIndex = 0;
+        _totalChunks = 0;
+      }
     } else if (response.contains('---END_READINGS---')) {
       print("✅ DETECTED RANGE/PRINT RESPONSE END - calling _parseReadings");
+      _lastParsedCount = parsedReadings.length;
       _parseReadings(response);
+      print("📊 [PARSE DEBUG] After END: ${parsedReadings.length} readings (was $_lastParsedCount) | Total responses received: $_printResponseCount");
+      
+      // Pagination complete - reset state
+      _isFetchingChunks = false;
+      _currentChunkIndex = 0;
+      _totalChunks = 0;
+      
+      // Reset counter after completion
+      _printResponseCount = 0;
+      _totalReadingsReceived = 0;
     } else if (response.contains('Printing') && response.contains('stored readings')) {
       // This is the "Printing X stored readings:" line from "print" command
-      // Don't parse this line, but ensure we're ready to parse the readings that follow
+      // Extract the count from the message
+      final countMatch = RegExp(r'Printing (\d+) stored readings').firstMatch(response);
+      if (countMatch != null) {
+        final expectedCount = int.tryParse(countMatch.group(1) ?? '0') ?? 0;
+        print("📊 [PRINT DEBUG] ESP32 reports $expectedCount stored readings | Current parsed: ${parsedReadings.length}");
+      }
+      
+      // Check if this is a paginated response (contains chunk info)
+      final chunkMatch = RegExp(r'chunk (\d+)/(\d+)').firstMatch(response);
+      if (chunkMatch != null) {
+        final currentChunk = int.tryParse(chunkMatch.group(1) ?? '0') ?? 0;
+        final totalChunks = int.tryParse(chunkMatch.group(2) ?? '0') ?? 0;
+        _currentChunkIndex = currentChunk - 1; // Convert to 0-based index
+        _totalChunks = totalChunks;
+        _isFetchingChunks = true;
+        print("📊 [PAGINATION] Detected chunk $currentChunk/$totalChunks | Starting pagination");
+      }
+      
       print("✅ DETECTED PRINT COMMAND RESPONSE - ready to parse readings");
+    } else if (response.contains('Chunk ') && response.contains('/')) {
+      // Subsequent chunk header (not first chunk)
+      final chunkMatch = RegExp(r'Chunk (\d+)/(\d+)').firstMatch(response);
+      if (chunkMatch != null) {
+        final currentChunk = int.tryParse(chunkMatch.group(1) ?? '0') ?? 0;
+        final totalChunks = int.tryParse(chunkMatch.group(2) ?? '0') ?? 0;
+        _currentChunkIndex = currentChunk - 1; // Convert to 0-based index
+        _totalChunks = totalChunks;
+        print("📊 [PAGINATION] Processing chunk $currentChunk/$totalChunks");
+      }
     } else if (response.startsWith('#') && (response.contains('°C') || response.contains('N/A')) && !isReadingRFID) {
       // Individual reading line from "print" or "range" command
-      // Handles both temperature values and "N/A" for tags without temperature
-      print("✅ DETECTED INDIVIDUAL READING - calling _parseReadings (current total: ${parsedReadings.length})");
+      // Count how many readings are in this response
+      final readingCount = RegExp(r'#\d+:').allMatches(response).length;
+      _totalReadingsReceived += readingCount;
+      _lastParsedCount = parsedReadings.length;
+      print("✅ DETECTED INDIVIDUAL READING - calling _parseReadings | Readings in this response: $readingCount | Total received so far: $_totalReadingsReceived | Current parsed: $_lastParsedCount");
       _parseReadings(response);
+      print("📊 [PARSE DEBUG] After parsing: ${parsedReadings.length} readings (added ${parsedReadings.length - _lastParsedCount})");
     } else if (response.startsWith('#') && (response.contains('°C') || response.contains('N/A')) && isReadingRFID) {
       // Individual reading from "Read Now" - already handled above, skip here
       print("⏭️ Skipping individual reading parsing (already handled for Read Now)");
@@ -309,11 +401,24 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       // Clear previous readings when starting a new query
       // NOTE: For 'print' (All Readings), we clear to get fresh data from ESP32
       // The ESP32 stores all readings including those from "Read Now", so they will be included
+      // NOTE: For pagination, only clear on first chunk (print), not on subsequent chunks (print_chunk)
       if (command == 'print' || command.startsWith('range ')) {
         print("🧹 Clearing previous readings for new query: $command");
         setState(() {
           parsedReadings.clear();
         });
+        // Reset debug counters for new query
+        _printResponseCount = 0;
+        _totalReadingsReceived = 0;
+        _lastParsedCount = 0;
+        // Reset pagination state
+        _currentChunkIndex = 0;
+        _totalChunks = 0;
+        _isFetchingChunks = false;
+        print("📊 [PRINT DEBUG] Reset counters for new 'print' query");
+      } else if (command.startsWith('print_chunk ')) {
+        // Pagination: don't clear readings, just append to existing list
+        print("📥 Requesting chunk: $command (will append to existing ${parsedReadings.length} readings)");
       }
       // NOTE: For 'readnow', we don't clear parsedReadings - the new reading will be added
       // and will appear in "All Readings" since it's stored on ESP32
@@ -627,13 +732,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   }
 
   void _parseReadings(String response) {
-    print("🔧 ENTERING _parseReadings with response: $response");
+    final initialCount = parsedReadings.length;
+    print("🔧 ENTERING _parseReadings | Initial count: $initialCount | Response length: ${response.length} chars");
     
     // Handle individual reading responses (format: #X: timestamp, country, tag, temperature)
     // IMPORTANT: Handle concatenated readings (multiple #X: patterns in one response)
     // Also handles "N/A" for temperature when sensor is not enabled
     if (response.contains('#') && (response.contains('°C') || response.contains('N/A'))) {
-      print("🔧 Processing reading(s): '$response'");
+      print("🔧 Processing reading(s): '${response.length > 200 ? response.substring(0, 200) + '...' : response}'");
       
       // Use flexible regex to find ALL readings in the response (handles concatenated readings)
       // Pattern: #(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*((?:[\d.]+°C|N/A))
@@ -641,14 +747,18 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       final flexibleRegex = RegExp(r'#(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*((?:[\d.]+°C|N/A))');
       final allMatches = flexibleRegex.allMatches(response);
       
-      print("🔧 Found ${allMatches.length} reading(s) in response");
+      print("🔧 Found ${allMatches.length} reading(s) in response | Initial parsedReadings: $initialCount");
       
       if (allMatches.isEmpty) {
         print("❌ No readings found in response: '$response'");
         return;
       }
       
-      // Process each match (handles concatenated readings)
+      // Collect all valid readings from this batch before updating UI
+      // This is more efficient and ensures batched readings (with newlines) are handled correctly
+      List<Map<String, dynamic>> newReadings = [];
+      
+      // Process each match (handles concatenated readings and batched readings with newlines)
       for (var match in allMatches) {
         try {
           final readingNum = match.group(1)!;
@@ -726,22 +836,29 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             (existing['dateTime'] as DateTime).difference(utcDateTime).inSeconds.abs() < 1 // Same timestamp (within 1 second)
           );
           
+          // Also check for duplicates within the current batch
+          if (!isDuplicate) {
+            isDuplicate = newReadings.any((newReading) =>
+              newReading['readingNum'] == readingNum &&
+              newReading['country'] == country &&
+              newReading['tag'] == tag &&
+              (newReading['dateTime'] as DateTime).difference(utcDateTime).inSeconds.abs() < 1
+            );
+          }
+          
           if (isDuplicate) {
             print("⚠️ DUPLICATE READING DETECTED - skipping: #$readingNum, $timestamp, $country, $tag");
             continue; // Skip duplicate reading
           }
           
-          // Add to existing parsedReadings (don't clear them)
-          setState(() {
-            parsedReadings.add({
-              'readingNum': readingNum,
-              'timestamp': displayTimestamp, // Display in selected timezone
-              'country': country,
-              'tag': tag,
-              'temperature': temperature, // Can be null for N/A
-              'dateTime': utcDateTime, // Keep UTC for sorting
-            });
-            print("🎯 ADDED reading to parsedReadings. Total: ${parsedReadings.length}");
+          // Add to newReadings list (will be added to parsedReadings in one setState call)
+          newReadings.add({
+            'readingNum': readingNum,
+            'timestamp': displayTimestamp, // Display in selected timezone
+            'country': country,
+            'tag': tag,
+            'temperature': temperature, // Can be null for N/A
+            'dateTime': utcDateTime, // Keep UTC for sorting
           });
         } catch (e) {
           print("❌ Error parsing reading: $e");
@@ -749,27 +866,196 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           continue;
         }
       }
+      
+      // Add all new readings from this batch in one setState call (more efficient)
+      if (newReadings.isNotEmpty) {
+        setState(() {
+          parsedReadings.addAll(newReadings);
+        });
+        print("🎯 ADDED ${newReadings.length} reading(s) from batch to parsedReadings. Total: ${parsedReadings.length} (was $initialCount)");
+      }
       return;
     }
     
     // Handle range responses (like dashboard does)
-    print("🔧 Processing range response with ${response.length} characters");
+    print("🔧 Processing range response with ${response.length} characters | Initial parsedReadings: $initialCount");
     
     // If this is just "---BEGIN_READINGS---", clear existing readings (start of new query)
-    if (response.trim() == '---BEGIN_READINGS---' || (response.contains('---BEGIN_READINGS---') && !response.contains('#'))) {
-      print("✅ Found BEGIN_READINGS marker - clearing existing readings for new query");
+    // IMPORTANT: For pagination, only clear on first chunk (when not fetching chunks)
+    if ((response.trim() == '---BEGIN_READINGS---' || (response.contains('---BEGIN_READINGS---') && !response.contains('#'))) && !_isFetchingChunks) {
+      print("✅ Found BEGIN_READINGS marker - clearing existing readings for new query (was $initialCount)");
       setState(() {
         parsedReadings.clear();
       });
       return; // Don't process further - individual readings will come separately
+    } else if ((response.trim() == '---BEGIN_READINGS---' || (response.contains('---BEGIN_READINGS---') && !response.contains('#'))) && _isFetchingChunks) {
+      print("✅ Found BEGIN_READINGS marker during pagination - NOT clearing (appending to existing $initialCount readings)");
+      return; // Don't process further - individual readings will come separately
+    }
+    
+    // If this is just "---CHUNK_COMPLETE---", don't do anything (readings already parsed, handled in _handleESP32Response)
+    if (response.trim() == '---CHUNK_COMPLETE---' || (response.contains('---CHUNK_COMPLETE---') && !response.contains('#'))) {
+      print("✅ Found CHUNK_COMPLETE marker - chunk complete, keeping existing ${parsedReadings.length} readings (was $initialCount)");
+      return; // Don't process further - chunk already parsed, next chunk will be requested automatically
     }
     
     // If this is just "---END_READINGS---", don't do anything (readings already parsed)
     if (response.trim() == '---END_READINGS---' || (response.contains('---END_READINGS---') && !response.contains('#'))) {
-      print("✅ Found END_READINGS marker - query complete, keeping existing ${parsedReadings.length} readings");
+      print("✅ Found END_READINGS marker - query complete, keeping existing ${parsedReadings.length} readings (was $initialCount)");
       return; // Don't process further - all readings already parsed
     }
     
+    // Check if this response contains readings (batched or individual)
+    // Batched readings from range queries will have multiple #X: patterns separated by newlines
+    if (response.contains('#') && (response.contains('°C') || response.contains('N/A'))) {
+      // Use the same efficient batching approach as individual readings
+      // This handles both single readings and batched readings (with newlines) from range queries
+      print("🔧 Processing batched range readings using efficient regex matching");
+      
+      // Use flexible regex to find ALL readings in the entire response (handles newlines)
+      final flexibleRegex = RegExp(r'#(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*((?:[\d.]+°C|N/A))');
+      final allMatches = flexibleRegex.allMatches(response);
+      
+      print("🔧 Found ${allMatches.length} reading(s) in range response | Initial parsedReadings: $initialCount");
+      
+      if (allMatches.isEmpty) {
+        print("❌ No readings found in range response: '$response'");
+        return;
+      }
+      
+      List<Map<String, dynamic>> newReadings = [];
+      
+      // Process each match (handles batched readings with newlines)
+      for (var match in allMatches) {
+        try {
+          final readingNum = match.group(1)!;
+          final timestamp = match.group(2)!.trim();
+          final country = match.group(3)!;
+          final tag = match.group(4)!;
+          final tempStr = match.group(5)!;
+          
+          // Check if temperature is "N/A" or a numeric value
+          double? temperature;
+          if (tempStr == 'N/A') {
+            temperature = null; // null indicates temperature not available
+            print("⚠️ Temperature not available for reading #$readingNum");
+          } else {
+            // Extract numeric value (remove °C)
+            final tempValue = tempStr.replaceAll('°C', '');
+            temperature = double.tryParse(tempValue);
+            if (temperature == null) {
+              print("⚠️ Could not parse temperature '$tempStr' for reading #$readingNum");
+              temperature = null;
+            }
+          }
+          
+          // Validate timestamp - must be RTC format (YYYY-MM-DD HH:MM:SS), not ms timestamp
+          if (!timestamp.contains('-') || !timestamp.contains(':')) {
+            print("⚠️ Skipping reading #$readingNum: Invalid timestamp format (likely ms timestamp): '$timestamp'");
+            continue; // Skip this reading but continue with others
+          }
+          
+          // Check if timestamp looks like RTC format (YYYY-MM-DD HH:MM:SS)
+          // Allow single-digit hours, minutes, and seconds (they'll be padded later)
+          final rtcPattern = RegExp(r'^\d{4}-\d{1,2}-\d{1,2}\s\d{1,2}:\d{1,2}:\d{1,2}');
+          if (!rtcPattern.hasMatch(timestamp)) {
+            print("⚠️ Skipping reading #$readingNum: Timestamp doesn't match RTC format: '$timestamp'");
+            continue; // Skip this reading but continue with others
+          }
+          
+          if (temperature != null) {
+            print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
+          } else {
+            print("✅ PARSED READING: #$readingNum, $timestamp, N/A");
+          }
+          
+          // Fix timestamp format for DateTime parsing (add leading zeros)
+          String fixedTimestamp = timestamp;
+          if (fixedTimestamp.contains(' ')) {
+            List<String> parts = fixedTimestamp.split(' ');
+            if (parts.length == 2) {
+              String datePart = parts[0];
+              String timePart = parts[1];
+              List<String> timeComponents = timePart.split(':');
+              if (timeComponents.length == 3) {
+                String hour = timeComponents[0].padLeft(2, '0');
+                String minute = timeComponents[1].padLeft(2, '0');
+                String second = timeComponents[2].padLeft(2, '0');
+                fixedTimestamp = '$datePart $hour:$minute:$second';
+              }
+            }
+          }
+          
+          // Convert UTC timestamp to selected timezone for display
+          final displayTimestamp = _convertUtcToTimezone(fixedTimestamp);
+          
+          // Parse UTC DateTime for sorting and chart (keep as UTC internally)
+          final utcDateTime = DateTime.parse(fixedTimestamp.replaceAll(' ', 'T') + 'Z');
+          
+          // Check for duplicates before adding
+          bool isDuplicate = parsedReadings.any((existing) =>
+            existing['readingNum'] == readingNum &&
+            existing['country'] == country &&
+            existing['tag'] == tag &&
+            (existing['dateTime'] as DateTime).difference(utcDateTime).inSeconds.abs() < 1
+          );
+          
+          // Also check for duplicates within the current batch
+          if (!isDuplicate) {
+            isDuplicate = newReadings.any((newReading) =>
+              newReading['readingNum'] == readingNum &&
+              newReading['country'] == country &&
+              newReading['tag'] == tag &&
+              (newReading['dateTime'] as DateTime).difference(utcDateTime).inSeconds.abs() < 1
+            );
+          }
+          
+          if (isDuplicate) {
+            print("⚠️ DUPLICATE READING DETECTED in range response - skipping: #$readingNum, $timestamp, $country, $tag");
+            continue;
+          }
+          
+          newReadings.add({
+            'readingNum': readingNum,
+            'timestamp': displayTimestamp, // Display in selected timezone
+            'country': country,
+            'tag': tag,
+            'temperature': temperature, // Can be null for N/A
+            'dateTime': utcDateTime, // Keep UTC for sorting
+          });
+        } catch (e) {
+          print("❌ Error parsing reading: $e");
+          // Continue with next reading even if this one fails
+          continue;
+        }
+      }
+      
+      // Add all new readings from this batch in one setState call (more efficient)
+      if (newReadings.isNotEmpty) {
+        setState(() {
+          // Filter out duplicates before appending
+          final filteredNewReadings = newReadings.where((newReading) {
+            bool isDuplicate = parsedReadings.any((existing) =>
+              existing['readingNum'] == newReading['readingNum'] &&
+              existing['country'] == newReading['country'] &&
+              existing['tag'] == newReading['tag'] &&
+              (existing['dateTime'] as DateTime).difference(newReading['dateTime'] as DateTime).inSeconds.abs() < 1
+            );
+            if (isDuplicate) {
+              print("⚠️ DUPLICATE READING DETECTED in range batch - skipping: #${newReading['readingNum']}, ${newReading['timestamp']}, ${newReading['country']}, ${newReading['tag']}");
+            }
+            return !isDuplicate;
+          }).toList();
+          
+          final beforeAdd = parsedReadings.length;
+          parsedReadings.addAll(filteredNewReadings);
+          print("📊 [PARSE DEBUG] Added ${filteredNewReadings.length} new readings from range batch (${newReadings.length - filteredNewReadings.length} duplicates skipped) | Total: ${parsedReadings.length} (was $beforeAdd)");
+        });
+      }
+      return; // Exit early since we processed batched readings
+    }
+    
+    // Fallback: Handle range responses line by line (for non-batched or legacy format)
     final lines = response.split('\n');
     bool inBlock = false;
     List<Map<String, dynamic>> newReadings = [];
@@ -892,6 +1178,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         if (response.contains('---BEGIN_READINGS---') && !response.contains('---END_READINGS---')) {
           // This is the start of a new range - replace existing readings
           parsedReadings = newReadings;
+          print("📊 [PARSE DEBUG] Replaced with ${newReadings.length} readings (was $initialCount)");
         } else {
           // This is continuation or end - filter out duplicates before appending
           final filteredNewReadings = newReadings.where((newReading) {
@@ -907,14 +1194,16 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             return !isDuplicate;
           }).toList();
           
+          final beforeAdd = parsedReadings.length;
           parsedReadings.addAll(filteredNewReadings);
+          print("📊 [PARSE DEBUG] Added ${filteredNewReadings.length} new readings (${newReadings.length - filteredNewReadings.length} duplicates skipped) | Total: ${parsedReadings.length} (was $beforeAdd)");
         }
-        print("🎯 UPDATED parsedReadings with ${parsedReadings.length} total readings (added ${newReadings.length} from range response)");
+        print("🎯 UPDATED parsedReadings with ${parsedReadings.length} total readings (added ${newReadings.length} from range response, was $initialCount)");
       });
     } else {
       // No new readings found - don't overwrite existing parsedReadings
       // This prevents "---END_READINGS---" from wiping out already-parsed readings
-      print("⚠️ No new readings found in range response - keeping existing ${parsedReadings.length} readings");
+      print("⚠️ No new readings found in range response - keeping existing ${parsedReadings.length} readings (was $initialCount)");
     }
   }
 
@@ -1042,9 +1331,9 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                   const SizedBox(width: 16),
                   // Title section
                   Expanded(
-                    child: Column(
+        child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         const Text(
                           'Implant RFID Reader',
@@ -1056,7 +1345,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                           ),
                         ),
                         const SizedBox(height: 2),
-                        Text(
+            Text(
                           'Multi-Button Dashboard',
                           style: TextStyle(
                             fontSize: 13,
@@ -1064,9 +1353,9 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                             fontWeight: FontWeight.w400,
                             letterSpacing: 0.2,
                           ),
-                        ),
-                      ],
-                    ),
+            ),
+          ],
+        ),
                   ),
                 ],
               ),
