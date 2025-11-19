@@ -205,6 +205,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   int _currentChunkIndex = 0;
   int _totalChunks = 0;
   bool _isFetchingChunks = false;
+  
+  // Loading state for pagination progress
+  bool _isLoadingReadings = false;
+  int _totalExpectedReadings = 0;
+  int _currentReceivedReadings = 0;
 
   void _handleESP32Response(List<int> value) {
     String response = utf8.decode(value);
@@ -302,6 +307,20 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       print("✅ DETECTED BEGIN_READINGS during pagination - NOT clearing (appending to existing ${parsedReadings.length} readings)");
     }
     
+    // Check for range query response with count ("Found X readings in range.")
+    if (response.contains('Found') && response.contains('readings in range')) {
+      final countMatch = RegExp(r'Found (\d+) readings in range').firstMatch(response);
+      if (countMatch != null) {
+        final expectedCount = int.tryParse(countMatch.group(1) ?? '0') ?? 0;
+        setState(() {
+          _totalExpectedReadings = expectedCount;
+          _currentReceivedReadings = 0;
+          _isLoadingReadings = true; // Start loading state for range query
+        });
+        print("📊 [RANGE DEBUG] ESP32 reports $expectedCount readings in range | Starting loading state");
+      }
+    }
+    
     // Check if this is the start of a range response or "print" command response
     if (response.contains('---BEGIN_READINGS---') || response.contains('Found')) {
       print("✅ DETECTED RANGE/PRINT RESPONSE START - calling _parseReadings");
@@ -314,6 +333,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       _lastParsedCount = parsedReadings.length;
       _parseReadings(response);
       print("📊 [PARSE DEBUG] After CHUNK_COMPLETE: ${parsedReadings.length} readings (was $_lastParsedCount)");
+      
+      // Update progress (readings are already updated in _parseReadings)
+      setState(() {
+        _currentReceivedReadings = parsedReadings.length;
+      });
       
       // Request next chunk automatically
       _currentChunkIndex++;
@@ -335,21 +359,33 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       _parseReadings(response);
       print("📊 [PARSE DEBUG] After END: ${parsedReadings.length} readings (was $_lastParsedCount) | Total responses received: $_printResponseCount");
       
-      // Pagination complete - reset state
-      _isFetchingChunks = false;
-      _currentChunkIndex = 0;
-      _totalChunks = 0;
+      // Query complete (print or range) - end loading state and show results
+      setState(() {
+        _isLoadingReadings = false;
+        _currentReceivedReadings = parsedReadings.length;
+        isLoadingData = false; // Also reset isLoadingData for range queries
+        _isFetchingChunks = false;
+        _currentChunkIndex = 0;
+        _totalChunks = 0;
+      });
       
       // Reset counter after completion
       _printResponseCount = 0;
       _totalReadingsReceived = 0;
+      
+      print("✅ Loading complete: ${parsedReadings.length} readings received (expected: $_totalExpectedReadings)");
     } else if (response.contains('Printing') && response.contains('stored readings')) {
       // This is the "Printing X stored readings:" line from "print" command
       // Extract the count from the message
       final countMatch = RegExp(r'Printing (\d+) stored readings').firstMatch(response);
       if (countMatch != null) {
         final expectedCount = int.tryParse(countMatch.group(1) ?? '0') ?? 0;
-        print("📊 [PRINT DEBUG] ESP32 reports $expectedCount stored readings | Current parsed: ${parsedReadings.length}");
+        setState(() {
+          _totalExpectedReadings = expectedCount;
+          _currentReceivedReadings = 0;
+          _isLoadingReadings = true; // Start loading state
+        });
+        print("📊 [PRINT DEBUG] ESP32 reports $expectedCount stored readings | Starting loading state");
       }
       
       // Check if this is a paginated response (contains chunk info)
@@ -406,6 +442,10 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         print("🧹 Clearing previous readings for new query: $command");
         setState(() {
           parsedReadings.clear();
+          // Reset loading state
+          _isLoadingReadings = false;
+          _totalExpectedReadings = 0;
+          _currentReceivedReadings = 0;
         });
         // Reset debug counters for new query
         _printResponseCount = 0;
@@ -871,6 +911,8 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       if (newReadings.isNotEmpty) {
         setState(() {
           parsedReadings.addAll(newReadings);
+          // Update progress counter for loading indicator
+          _currentReceivedReadings = parsedReadings.length;
         });
         print("🎯 ADDED ${newReadings.length} reading(s) from batch to parsedReadings. Total: ${parsedReadings.length} (was $initialCount)");
       }
@@ -1213,6 +1255,10 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     setState(() {
       isLoadingData = true;
       parsedReadings.clear(); // Clear existing readings before new query
+      // Reset loading state (will be set when "Found X readings in range" is received)
+      _isLoadingReadings = false;
+      _totalExpectedReadings = 0;
+      _currentReceivedReadings = 0;
       print("🧹 Cleared parsedReadings before new range query");
     });
     
@@ -1254,16 +1300,18 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       // Send range command to ESP32
       final command = 'range $startEpoch $endEpoch';
       _sendCommand(command);
+      // Note: isLoadingData will be set to false when ---END_READINGS--- is received
+      // This allows the loading indicator to show during data transfer
     } catch (e) {
       print("❌ Error converting timezone: $e");
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Timezone conversion error: $e')),
       );
+      setState(() {
+        isLoadingData = false;
+        _isLoadingReadings = false; // Reset loading state on error
+      });
     }
-    
-    setState(() {
-      isLoadingData = false;
-    });
   }
 
   @override
@@ -2109,15 +2157,41 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                       ],
                     ),
                     const SizedBox(height: 16),
-                    // Responsive layout: Expand on tablets, use fixed widths with scroll on phones
-                    LayoutBuilder(
-                      builder: (context, constraints) {
-                        final screenWidth = MediaQuery.of(context).size.width;
-                        final isTablet = screenWidth > 600; // Tablet/large screen threshold
-                        
-                        // For tablets, use Expanded widgets to fill available width
-                        // For phones, use fixed widths with horizontal scroll
-                        Widget buildTableContent() {
+                    // Show loading indicator while pagination is in progress
+                    if (_isLoadingReadings)
+                      Padding(
+                        padding: const EdgeInsets.all(32.0),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const CircularProgressIndicator(),
+                            const SizedBox(height: 24),
+                            LinearProgressIndicator(
+                              value: _totalExpectedReadings > 0
+                                  ? _currentReceivedReadings / _totalExpectedReadings
+                                  : 0.0,
+                              minHeight: 8,
+                            ),
+                            const SizedBox(height: 16),
+                            Text(
+                              'Loading readings...\n'
+                              '$_currentReceivedReadings / $_totalExpectedReadings',
+                              textAlign: TextAlign.center,
+                              style: Theme.of(context).textTheme.bodyMedium,
+                            ),
+                          ],
+                        ),
+                      )
+                    else
+                      // Responsive layout: Expand on tablets, use fixed widths with scroll on phones
+                      LayoutBuilder(
+                        builder: (context, constraints) {
+                          final screenWidth = MediaQuery.of(context).size.width;
+                          final isTablet = screenWidth > 600; // Tablet/large screen threshold
+                          
+                          // For tablets, use Expanded widgets to fill available width
+                          // For phones, use fixed widths with horizontal scroll
+                          Widget buildTableContent() {
                           return ConstrainedBox(
                             constraints: const BoxConstraints(maxHeight: 300),
                             child: SingleChildScrollView(
