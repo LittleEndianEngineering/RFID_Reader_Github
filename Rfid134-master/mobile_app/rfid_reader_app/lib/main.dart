@@ -12,6 +12,22 @@ import 'package:flutter/rendering.dart';
 import 'package:gallery_saver/gallery_saver.dart';
 import 'package:timezone/timezone.dart' as tz;
 import 'package:timezone/data/latest_all.dart' as tz_data;
+import 'package:flutter/foundation.dart';
+
+// Static function for CSV generation in isolate
+String _generateCSVContent(List<Map<String, dynamic>> readings) {
+  final csvBuffer = StringBuffer();
+  csvBuffer.writeln('Reading #,Timestamp,Country,Tag ID,Temperature (°C)');
+  
+  for (var reading in readings) {
+    final tempStr = reading['temperature'] != null
+        ? (reading['temperature'] as double).toStringAsFixed(2)
+        : 'N/A';
+    csvBuffer.writeln('${reading['readingNum']},${reading['timestamp']},${reading['country']},${reading['tag']},$tempStr');
+  }
+  
+  return csvBuffer.toString();
+}
 
 void main() {
   // Initialize timezone data
@@ -694,15 +710,27 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       return;
     }
 
+    // Show loading indicator immediately
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Row(
+          children: [
+            SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            SizedBox(width: 12),
+            Text('Generating CSV...'),
+          ],
+        ),
+        duration: Duration(seconds: 2),
+      ),
+    );
+
     try {
-      // Create CSV content
-      String csvContent = 'Reading #,Timestamp,Country,Tag ID,Temperature (°C)\n';
-      for (var reading in parsedReadings) {
-        final tempStr = reading['temperature'] != null
-            ? (reading['temperature'] as double).toStringAsFixed(2)
-            : 'N/A';
-        csvContent += '${reading['readingNum']},${reading['timestamp']},${reading['country']},${reading['tag']},$tempStr\n';
-      }
+      // Generate CSV content in isolate to avoid blocking UI
+      final csvContent = await compute(_generateCSVContent, parsedReadings);
 
       // iOS: Use application documents directory (cache directory isn't shareable)
       final directory = await getApplicationDocumentsDirectory();
@@ -710,12 +738,21 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       final filePath = '${directory.path}/$fileName';
       final file = File(filePath);
       
-      // Write file and ensure it exists
+      // Write file asynchronously
       await file.writeAsString(csvContent);
+      
+      // Small delay to ensure file system has flushed (iOS needs this)
+      await Future.delayed(const Duration(milliseconds: 200));
       
       // Verify file exists and is readable
       if (!await file.exists()) {
         throw Exception('File was not created successfully');
+      }
+      
+      // Verify file is readable by checking its size
+      final fileSize = await file.length();
+      if (fileSize == 0) {
+        throw Exception('File was created but is empty');
       }
 
       // Get screen size for sharePositionOrigin (required on iOS/iPadOS)
@@ -732,15 +769,43 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         40, // Button height
       );
 
-      // Share the file with position for iOS/iPadOS compatibility
-      await Share.shareXFiles(
+      // Share the file without blocking UI - use then/catchError instead of await
+      // This allows the UI to remain responsive while iOS processes the share sheet
+      Share.shareXFiles(
         [XFile(filePath, name: fileName)],
         sharePositionOrigin: shareRect,
-      );
+      ).then((_) {
+        // Success - file is ready to share
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('CSV file ready to share'),
+              duration: Duration(seconds: 1),
+            ),
+          );
+        }
+      }).catchError((error) {
+        // Error sharing - but file was created successfully
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('File created but sharing failed: $error'),
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        }
+      });
       
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('CSV file exported successfully')),
-      );
+      // Show success message immediately after file is written (before share completes)
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('CSV file generated successfully'),
+            duration: Duration(seconds: 1),
+          ),
+        );
+      }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Export failed: $e')),
@@ -2462,6 +2527,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                           // For tablets, use Expanded widgets to fill available width
                           // For phones, use fixed widths with horizontal scroll
                           Widget buildTableContent() {
+                          // Calculate dynamic width for reading number column based on max number of digits
+                          final maxReadingNum = parsedReadings.length;
+                          final numDigits = maxReadingNum.toString().length;
+                          // Base width: 20px per digit, minimum 24px for phones, 40px for tablets
+                          final readingNumWidth = isTablet 
+                              ? (numDigits * 10.0 + 20).clamp(40.0, 80.0)
+                              : (numDigits * 8.0 + 16).clamp(24.0, 60.0);
+                          
                           return ConstrainedBox(
                             constraints: const BoxConstraints(maxHeight: 300),
                             child: SingleChildScrollView(
@@ -2474,7 +2547,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                                     child: Row(
                                       crossAxisAlignment: CrossAxisAlignment.start,
                                       children: [
-                                        SizedBox(width: isTablet ? 40 : 24), // Wider on tablets
+                                        SizedBox(width: readingNumWidth), // Dynamic width based on number of digits
                                         const SizedBox(width: 12),
                                         if (isTablet)
                                           Expanded(
@@ -2523,8 +2596,8 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                                           crossAxisAlignment: CrossAxisAlignment.start,
                                           children: [
                                             Container(
-                                              width: isTablet ? 40 : 24,
-                                              height: isTablet ? 40 : 24,
+                                              width: readingNumWidth,
+                                              height: readingNumWidth,
                                               decoration: BoxDecoration(
                                                 color: Colors.grey[200],
                                                 borderRadius: BorderRadius.circular(4),
