@@ -405,7 +405,7 @@ void sendBLEResponse(const String& response) {
     // Only log every 10th message to reduce serial spam (since we're sending one reading per notification)
     static int logCounter = 0;
     if (++logCounter % 10 == 0 || response.indexOf("BEGIN") >= 0 || response.indexOf("END") >= 0 || response.indexOf("Printing") >= 0) {
-      Serial.println("[BLE] Sent response: " + response);
+    Serial.println("[BLE] Sent response: " + response);
     }
     // Delay to prevent BLE notification queue overflow on iOS
     // iOS has a very limited notification queue (~10-15 notifications)
@@ -454,13 +454,37 @@ void processBLECommand(const String& command) {
     }
   }
   else if (command.startsWith("range ")) {
-    // Process range command
+    // Process range command - send first chunk (chunk 0) for pagination support
     String rangeCmd = command.substring(6);
     int spaceIndex = rangeCmd.indexOf(' ');
     if (spaceIndex > 0) {
       uint32_t startTime = rangeCmd.substring(0, spaceIndex).toInt();
       uint32_t endTime = rangeCmd.substring(spaceIndex + 1).toInt();
-      sendStoredReadingsByRangeBLE(startTime, endTime);
+      sendStoredReadingsByRangeBLEChunk(startTime, endTime, 0);
+    } else {
+      Serial.println("[BLE] ERROR: Invalid range command format");
+      sendBLEResponse("ERROR: Invalid range command format");
+    }
+  }
+  else if (command.startsWith("range_chunk ")) {
+    // Process pagination command for range queries: "range_chunk START END CHUNK" where CHUNK is the chunk index
+    String chunkCmd = command.substring(12);
+    int firstSpace = chunkCmd.indexOf(' ');
+    int secondSpace = chunkCmd.indexOf(' ', firstSpace + 1);
+    if (firstSpace > 0 && secondSpace > 0) {
+      uint32_t startTime = chunkCmd.substring(0, firstSpace).toInt();
+      uint32_t endTime = chunkCmd.substring(firstSpace + 1, secondSpace).toInt();
+      String chunkStr = chunkCmd.substring(secondSpace + 1);
+      chunkStr.trim();
+      int chunkIndex = chunkStr.toInt();
+      if (chunkIndex >= 0) {
+        sendStoredReadingsByRangeBLEChunk(startTime, endTime, chunkIndex);
+      } else {
+        sendBLEResponse("ERROR: Invalid chunk index");
+      }
+    } else {
+      Serial.println("[BLE] ERROR: Invalid range_chunk command format");
+      sendBLEResponse("ERROR: Invalid range_chunk command format");
     }
   }
   else if (command == "last") {
@@ -542,15 +566,15 @@ void sendStoredReadingsByBLE() {
       } else {
         float temp = reading.temp_raw / 100.0f;
         readingStr = "#" + String(i + 1) + ": " + 
-                     String(ti->tm_year + 1900) + "-" + 
-                     String(ti->tm_mon + 1) + "-" + 
-                     String(ti->tm_mday) + " " + 
-                     String(ti->tm_hour) + ":" + 
-                     String(ti->tm_min) + ":" + 
-                     String(ti->tm_sec) + ", " + 
-                     String(reading.country) + ", " + 
-                     String(reading.id) + ", " + 
-                     String(temp, 2) + "°C";
+                         String(ti->tm_year + 1900) + "-" + 
+                         String(ti->tm_mon + 1) + "-" + 
+                         String(ti->tm_mday) + " " + 
+                         String(ti->tm_hour) + ":" + 
+                         String(ti->tm_min) + ":" + 
+                         String(ti->tm_sec) + ", " + 
+                         String(reading.country) + ", " + 
+                         String(reading.id) + ", " + 
+                         String(temp, 2) + "°C";
       }
       
       // Add reading to batch buffer
@@ -720,8 +744,16 @@ void sendStoredReadingsByBLEChunk(int chunkIndex) {
   }
 }
 
+// Legacy function - now calls chunked version with chunk 0
 void sendStoredReadingsByRangeBLE(uint32_t startTime, uint32_t endTime) {
-  int count = 0;
+  sendStoredReadingsByRangeBLEChunk(startTime, endTime, 0);
+}
+
+void sendStoredReadingsByRangeBLEChunk(uint32_t startTime, uint32_t endTime, int chunkIndex) {
+  // Pagination support: Send range readings in chunks to avoid iOS notification queue overflow
+  // Chunk size: 15 readings per chunk (fits safely in iOS notification queue)
+  const int CHUNK_SIZE = 15;
+  
   sendBLEResponse("=== Range Request Start ===");
   
   File file = SPIFFS.open(FLASH_FILENAME, "r");
@@ -732,34 +764,56 @@ void sendStoredReadingsByRangeBLE(uint32_t startTime, uint32_t endTime) {
     return; 
   }
   
+  // First pass: collect all valid readings in range
   std::vector<RfidReading> validReadings;
   int scanned = 0; int matched = 0;
   while (file.available() >= READING_SIZE) {
     RfidReading reading;
     file.read((uint8_t*)&reading, READING_SIZE);
+    // Filter: must be valid timestamp (after year 2001) AND within the specified time range
+    // Note: reading.timestamp is stored as Unix epoch (UTC)
     if (reading.timestamp > 1000000000 &&
         reading.timestamp >= startTime && reading.timestamp <= endTime) {
       validReadings.push_back(reading);
       matched++;
     }
-    count++; scanned++;
+    scanned++;
     yield();
   }
   file.close();
   
-  sendBLEResponse("Found " + String(validReadings.size()) + " readings in range.");
   
+  // Calculate chunk information
+  int totalChunks = (validReadings.size() + CHUNK_SIZE - 1) / CHUNK_SIZE; // Ceiling division
+  int startIndex = chunkIndex * CHUNK_SIZE;
+  int endIndex = min(startIndex + CHUNK_SIZE, (int)validReadings.size());
+  bool hasMore = (chunkIndex + 1) < totalChunks;
+  
+  // Validate chunk index
+  if (chunkIndex < 0 || startIndex >= (int)validReadings.size()) {
+    sendBLEResponse("ERROR: Invalid chunk index " + String(chunkIndex));
+    sendBLEResponse("---END_READINGS---");
+    return;
+  }
+  
+  // Send count and chunk metadata
+  if (chunkIndex == 0) {
+    // First chunk: send count and BEGIN marker
+    sendBLEResponse("Found " + String(validReadings.size()) + " readings in range.");
   sendBLEResponse("---BEGIN_READINGS---");
+    sendBLEResponse("Range readings (chunk " + String(chunkIndex + 1) + "/" + String(totalChunks) + "):");
+  } else {
+    // Subsequent chunks: send chunk info only
+    sendBLEResponse("Chunk " + String(chunkIndex + 1) + "/" + String(totalChunks) + " (readings " + String(startIndex + 1) + "-" + String(endIndex) + "):");
+  }
   
   // Send readings in small batches (2 readings per notification) to balance reliability and speed
-  // iOS has a very limited notification queue (~10-15 notifications)
-  // Batching reduces the number of notifications while keeping each batch well under MTU limits
   const int BATCH_SIZE = 2;
   String batchBuffer = "";
   int batchCount = 0;
   
-  for (size_t i = 0; i < validReadings.size(); ++i) {
-    // Check if device is still connected before sending (prevents sending to disconnected device)
+  for (int i = startIndex; i < endIndex; ++i) {
+    // Check if device is still connected before sending
     if (!deviceConnected) {
       Serial.println("[BLE] Device disconnected during range send, aborting");
       break;
@@ -769,20 +823,25 @@ void sendStoredReadingsByRangeBLE(uint32_t startTime, uint32_t endTime) {
     struct tm* ti = gmtime(&timestamp);
     String readingStr;
     
+    // Calculate global reading number within the filtered list
+    // i is already the index in validReadings (which contains only filtered readings)
+    // So reading number is simply i + 1 (1-indexed for display)
+    int globalReadingNum = i + 1;
+    
     // Check if temperature is available (0xFFFF = marker for N/A)
     if (validReadings[i].temp_raw == 0xFFFF) {
-      readingStr = "#" + String(i + 1) + ": " + 
-                   String(ti->tm_year + 1900) + "-" + 
-                   String(ti->tm_mon + 1) + "-" + 
-                   String(ti->tm_mday) + " " + 
-                   String(ti->tm_hour) + ":" + 
-                   String(ti->tm_min) + ":" + 
-                   String(ti->tm_sec) + ", " + 
-                   String(validReadings[i].country) + ", " + 
+      readingStr = "#" + String(globalReadingNum) + ": " + 
+                       String(ti->tm_year + 1900) + "-" + 
+                       String(ti->tm_mon + 1) + "-" + 
+                       String(ti->tm_mday) + " " + 
+                       String(ti->tm_hour) + ":" + 
+                       String(ti->tm_min) + ":" + 
+                       String(ti->tm_sec) + ", " + 
+                       String(validReadings[i].country) + ", " + 
                    String(validReadings[i].id) + ", N/A";
     } else {
       float temp = validReadings[i].temp_raw / 100.0f;
-      readingStr = "#" + String(i + 1) + ": " + 
+      readingStr = "#" + String(globalReadingNum) + ": " + 
                    String(ti->tm_year + 1900) + "-" + 
                    String(ti->tm_mon + 1) + "-" + 
                    String(ti->tm_mday) + " " + 
@@ -791,24 +850,20 @@ void sendStoredReadingsByRangeBLE(uint32_t startTime, uint32_t endTime) {
                    String(ti->tm_sec) + ", " + 
                    String(validReadings[i].country) + ", " + 
                    String(validReadings[i].id) + ", " + 
-                   String(temp, 2) + "°C";
+                       String(temp, 2) + "°C";
     }
     
     // Add reading to batch buffer
     if (batchBuffer.length() > 0) {
-      batchBuffer += "\n"; // Separate readings with newline
+      batchBuffer += "\n";
     }
     batchBuffer += readingStr;
     batchCount++;
     
     // Send batch when it reaches BATCH_SIZE
     if (batchCount >= BATCH_SIZE) {
-      // Log every 10 batches to reduce serial spam
-      if ((i + 1) % 20 == 0 || i == 0) {
-        Serial.printf("[BLE] Sending range batch of %d readings (size: %d bytes, total sent: %d/%d)\n", batchCount, batchBuffer.length(), (int)(i + 1), (int)validReadings.size());
-      }
       sendBLEResponse(batchBuffer);
-      batchBuffer = ""; // Clear buffer
+      batchBuffer = "";
       batchCount = 0;
       yield();
     }
@@ -816,11 +871,16 @@ void sendStoredReadingsByRangeBLE(uint32_t startTime, uint32_t endTime) {
   
   // Send any remaining readings in the buffer
   if (batchBuffer.length() > 0) {
-    Serial.printf("[BLE] Sending final range batch of %d readings (size: %d bytes)\n", batchCount, batchBuffer.length());
     sendBLEResponse(batchBuffer);
   }
+  
+  // Send chunk completion marker
+  if (hasMore) {
+    sendBLEResponse("---CHUNK_COMPLETE---");
+  } else {
   sendBLEResponse("---END_READINGS---");
   sendBLEResponse("=== Range Request End ===");
+  }
 }
 
 void sendLastReadingByBLE() {
@@ -1201,27 +1261,12 @@ void printReadingsSummary() {
 void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
   int count = 0;
   Serial.println("[RANGE] === Range Request Start ===");
-  if (startTime > 0) {
-    time_t ts = startTime; struct tm* ti = gmtime(&ts);
-    Serial.printf("[RANGE] Start: %04d-%02d-%02d %02d:%02d:%02d (%lu)\n",
-                  ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
-                  ti->tm_hour, ti->tm_min, ti->tm_sec, (unsigned long)startTime);
-  } else {
-    Serial.printf("[RANGE] Start: %lu (non-epoch)\n", (unsigned long)startTime);
-  }
-  if (endTime > 0) {
-    time_t ts2 = endTime; struct tm* ti2 = gmtime(&ts2);
-    Serial.printf("[RANGE] End  : %04d-%02d-%02d %02d:%02d:%02d (%lu)\n",
-                  ti2->tm_year + 1900, ti2->tm_mon + 1, ti2->tm_mday,
-                  ti2->tm_hour, ti2->tm_min, ti2->tm_sec, (unsigned long)endTime);
-  } else {
-    Serial.printf("[RANGE] End  : %lu (non-epoch)\n", (unsigned long)endTime);
-  }
-
   File file = SPIFFS.open(FLASH_FILENAME, "r");
-  if (!file) { Serial.println("[RANGE] ERROR: Failed to open FLASH file"); Serial.println("<DASHBOARD_DATA>\n---BEGIN_READINGS---\n---END_READINGS---\n</DASHBOARD_DATA>"); return; }
-  Serial.printf("[RANGE] File opened. Size=%u bytes, readingCount=%d, recordSize=%d\n",
-                (unsigned)file.size(), readingCount, READING_SIZE);
+  if (!file) { 
+    Serial.println("[RANGE] ERROR: Failed to open FLASH file"); 
+    Serial.println("<DASHBOARD_DATA>\n---BEGIN_READINGS---\n---END_READINGS---\n</DASHBOARD_DATA>"); 
+    return; 
+  }
   std::vector<RfidReading> validReadings;
   int scanned = 0; int matched = 0;
   while (file.available() >= READING_SIZE) {
@@ -1233,9 +1278,6 @@ void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
       matched++;
     }
     count++; scanned++;
-    if ((scanned % 500) == 0) {
-      Serial.printf("[RANGE] Scanned=%d, Matched=%d\n", scanned, matched);
-    }
     yield();
   }
   file.close();

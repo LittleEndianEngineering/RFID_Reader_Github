@@ -93,6 +93,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   String? lastReadResult; // "success" or "no_tag" or null
   Map<String, dynamic>? lastReadData; // The actual reading data if successful
   Timer? _readTimeoutTimer; // Timeout timer for Read Now button
+  Timer? _dataRetrievalTimeoutTimer; // Timeout timer for data retrieval (30 seconds)
 
   // BLE Service and Characteristic UUIDs (matching ESP32 firmware)
   static const String SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
@@ -206,10 +207,17 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   int _totalChunks = 0;
   bool _isFetchingChunks = false;
   
+  // Range query state for pagination
+  int? _currentRangeStartEpoch;
+  int? _currentRangeEndEpoch;
+  bool _isRangeQuery = false;
+  
   // Loading state for pagination progress
   bool _isLoadingReadings = false;
   int _totalExpectedReadings = 0;
   int _currentReceivedReadings = 0;
+  int _lastReceivedCount = 0; // Track last received count for timeout detection
+  bool _waitingForLastReading = false; // Track if we're waiting for "last" command response
 
   void _handleESP32Response(List<int> value) {
     String response = utf8.decode(value);
@@ -255,15 +263,38 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     
     // Check for manual RFID read results
     if (isReadingRFID) {
+      // Check if reading data is in this response (might come with tag detected message)
+      bool hasReadingData = response.startsWith('#') && (response.contains('°C') || response.contains('N/A'));
+      
       if (response.contains('[RFID] Tag detected and stored') || 
           response.contains('Tag detected and stored')) {
         print("✅ RFID TAG DETECTED!");
         _readTimeoutTimer?.cancel(); // Cancel timeout - we got a response
-        setState(() {
-          isReadingRFID = false;
-          lastReadResult = "success";
-        });
-        // The actual reading data will come in the next response
+        
+        // If reading data is in the same response, parse it immediately and show success
+        if (hasReadingData) {
+          print("📊 Reading data found in same response - parsing immediately");
+          _parseReadings(response);
+          if (parsedReadings.isNotEmpty) {
+            setState(() {
+              isReadingRFID = false;
+              lastReadResult = "success";
+              lastReadData = parsedReadings.last;
+              // Clear parsedReadings for manual read (we only want to show the last one)
+              parsedReadings.clear();
+              parsedReadings.add(lastReadData!);
+            });
+            // Clean buffers after successful Read Now operation
+            _cleanupAfterSuccessfulOperation();
+            return; // Exit early - we've handled everything
+          }
+        }
+        
+        // If no reading data yet, DON'T set success flag yet - wait for reading data
+        // Keep isReadingRFID = true so we can catch the reading data in the next response
+        // This prevents showing "RFID Tag Detected!" with "No data available"
+        print("⏳ Waiting for reading data in next response...");
+        // Don't update state yet - wait for reading data
       } else if (response.contains('[RFID] No tag detected during window') ||
                  response.contains('No tag detected during window')) {
         print("❌ NO RFID TAG DETECTED");
@@ -273,8 +304,8 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           lastReadResult = "no_tag";
           lastReadData = null;
         });
-      } else if (response.startsWith('#') && (response.contains('°C') || response.contains('N/A')) && lastReadResult == "success") {
-        // This is the reading data after a successful tag detection
+      } else if (hasReadingData && isReadingRFID) {
+        // This is the reading data after tag detection (could be same or separate response)
         // NOTE: The reading is already stored on ESP32 by powerOnAndReadTagWindow()
         // We parse it here for display only - it will appear in "All Readings" when retrieved
         // Handles both temperature values and "N/A" for tags without temperature
@@ -284,12 +315,16 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         // Extract the reading data from parsedReadings for display
         if (parsedReadings.isNotEmpty) {
           setState(() {
+            isReadingRFID = false;
+            lastReadResult = "success"; // NOW set success - we have the data
             lastReadData = parsedReadings.last;
             // Clear parsedReadings for manual read (we only want to show the last one)
             // The reading is stored on ESP32, so it will appear in "All Readings"
             parsedReadings.clear();
             parsedReadings.add(lastReadData!);
           });
+          // Clean buffers after successful Read Now operation
+          _cleanupAfterSuccessfulOperation();
         }
       }
     }
@@ -299,12 +334,9 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     // because "Printing" comes AFTER ---BEGIN_READINGS--- and would clear already-parsed readings
     // IMPORTANT: For pagination, only clear on first chunk (when not fetching chunks)
     if ((response.contains('---BEGIN_READINGS---') || response.contains('Found')) && !_isFetchingChunks) {
-      print("✅ DETECTED NEW QUERY START - clearing previous readings");
       setState(() {
         parsedReadings.clear();
       });
-    } else if (response.contains('---BEGIN_READINGS---') && _isFetchingChunks) {
-      print("✅ DETECTED BEGIN_READINGS during pagination - NOT clearing (appending to existing ${parsedReadings.length} readings)");
     }
     
     // Check for range query response with count ("Found X readings in range.")
@@ -315,43 +347,94 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         setState(() {
           _totalExpectedReadings = expectedCount;
           _currentReceivedReadings = 0;
+          _lastReceivedCount = 0;
           _isLoadingReadings = true; // Start loading state for range query
+          _isRangeQuery = true; // Mark as range query for pagination
         });
-        print("📊 [RANGE DEBUG] ESP32 reports $expectedCount readings in range | Starting loading state");
+        print("📊 Found $expectedCount readings in range");
+        // Start timeout timer for range query
+        _startDataRetrievalTimeout();
       }
     }
     
     // Check if this is the start of a range response or "print" command response
     if (response.contains('---BEGIN_READINGS---') || response.contains('Found')) {
-      print("✅ DETECTED RANGE/PRINT RESPONSE START - calling _parseReadings");
       _lastParsedCount = parsedReadings.length;
       _parseReadings(response);
-      print("📊 [PARSE DEBUG] After BEGIN: ${parsedReadings.length} readings (was $_lastParsedCount)");
+      
+      // Check for chunk info in range responses (similar to "All Readings")
+      // Handle "Range readings (chunk 1/15):" format
+      if (response.contains('Range readings') || (response.contains('chunk') && _isRangeQuery)) {
+        final chunkMatch = RegExp(r'chunk (\d+)/(\d+)').firstMatch(response);
+        if (chunkMatch != null) {
+          final currentChunk = int.tryParse(chunkMatch.group(1) ?? '0') ?? 0;
+          final totalChunks = int.tryParse(chunkMatch.group(2) ?? '0') ?? 0;
+          _currentChunkIndex = currentChunk - 1; // Convert to 0-based index
+          _totalChunks = totalChunks;
+          _isFetchingChunks = true;
+        }
+      }
+      
+      // Reset timeout when BEGIN_READINGS is received (data transfer has started)
+      // This prevents timeout if there's a delay between "Found" and first reading
+      if (_isLoadingReadings && response.contains('---BEGIN_READINGS---')) {
+        _lastReceivedCount = _currentReceivedReadings;
+        _startDataRetrievalTimeout();
+      }
     } else if (response.contains('---CHUNK_COMPLETE---')) {
       // Chunk completed - automatically request next chunk
-      print("✅ DETECTED CHUNK COMPLETE - requesting next chunk");
       _lastParsedCount = parsedReadings.length;
       _parseReadings(response);
-      print("📊 [PARSE DEBUG] After CHUNK_COMPLETE: ${parsedReadings.length} readings (was $_lastParsedCount)");
       
       // Update progress (readings are already updated in _parseReadings)
       setState(() {
         _currentReceivedReadings = parsedReadings.length;
       });
+      // Reset timeout when new chunk completes (any progress resets the 30-second timer)
+      if (_isLoadingReadings) {
+        _lastReceivedCount = _currentReceivedReadings;
+        _startDataRetrievalTimeout(); // Reset timeout
+      }
       
       // Request next chunk automatically
       _currentChunkIndex++;
-      if (_currentChunkIndex < _totalChunks) {
-        print("📥 Requesting next chunk: $_currentChunkIndex/$_totalChunks");
+      if (_totalChunks > 0 && _currentChunkIndex < _totalChunks) {
         Future.delayed(const Duration(milliseconds: 500), () {
           // Small delay to ensure previous chunk is fully processed
-          _sendCommand('print_chunk $_currentChunkIndex');
+          // Use range_chunk for range queries, print_chunk for "All Readings"
+          if (_isRangeQuery && _currentRangeStartEpoch != null && _currentRangeEndEpoch != null) {
+            _sendCommand('range_chunk $_currentRangeStartEpoch $_currentRangeEndEpoch $_currentChunkIndex');
+          } else {
+            _sendCommand('print_chunk $_currentChunkIndex');
+          }
         });
+      } else if (_totalChunks == 0) {
+        // Chunk info not detected yet - this shouldn't happen, but log it
+        print("⚠️ CHUNK_COMPLETE received but _totalChunks is 0 - chunk info may not have been detected");
+        // Don't abort - wait for more data or timeout will handle it
       } else {
-        print("✅ All chunks received - pagination complete");
+        print("✅ Pagination complete: ${parsedReadings.length} readings received");
         _isFetchingChunks = false;
         _currentChunkIndex = 0;
         _totalChunks = 0;
+        _isRangeQuery = false; // Reset range query flag
+        _currentRangeStartEpoch = null;
+        _currentRangeEndEpoch = null;
+      }
+    } else if (response.contains('Range readings') && response.contains('chunk')) {
+      // Range query chunk header: "Range readings (chunk 1/7):"
+      // This MUST be checked before the final else to catch standalone chunk headers
+      final chunkMatch = RegExp(r'chunk (\d+)/(\d+)').firstMatch(response);
+      if (chunkMatch != null) {
+        final currentChunk = int.tryParse(chunkMatch.group(1) ?? '0') ?? 0;
+        final totalChunks = int.tryParse(chunkMatch.group(2) ?? '0') ?? 0;
+        setState(() {
+          _currentChunkIndex = currentChunk - 1; // Convert to 0-based index
+          _totalChunks = totalChunks;
+          _isFetchingChunks = true;
+          _isRangeQuery = true; // Ensure range query flag is set
+        });
+        print("📊 [RANGE PAGINATION] Detected chunk $currentChunk/$totalChunks | Starting pagination");
       }
     } else if (response.contains('---END_READINGS---')) {
       print("✅ DETECTED RANGE/PRINT RESPONSE END - calling _parseReadings");
@@ -360,6 +443,10 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       print("📊 [PARSE DEBUG] After END: ${parsedReadings.length} readings (was $_lastParsedCount) | Total responses received: $_printResponseCount");
       
       // Query complete (print or range) - end loading state and show results
+      // Cancel timeout timer
+      _dataRetrievalTimeoutTimer?.cancel();
+      _dataRetrievalTimeoutTimer = null;
+      
       setState(() {
         _isLoadingReadings = false;
         _currentReceivedReadings = parsedReadings.length;
@@ -367,6 +454,10 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         _isFetchingChunks = false;
         _currentChunkIndex = 0;
         _totalChunks = 0;
+        _lastReceivedCount = 0;
+        _isRangeQuery = false; // Reset range query flag
+        _currentRangeStartEpoch = null;
+        _currentRangeEndEpoch = null;
       });
       
       // Reset counter after completion
@@ -374,56 +465,75 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       _totalReadingsReceived = 0;
       
       print("✅ Loading complete: ${parsedReadings.length} readings received (expected: $_totalExpectedReadings)");
+      
+      // Clean buffers and caches after successful data retrieval
+      _cleanupAfterSuccessfulOperation();
     } else if (response.contains('Printing') && response.contains('stored readings')) {
-      // This is the "Printing X stored readings:" line from "print" command
-      // Extract the count from the message
-      final countMatch = RegExp(r'Printing (\d+) stored readings').firstMatch(response);
-      if (countMatch != null) {
-        final expectedCount = int.tryParse(countMatch.group(1) ?? '0') ?? 0;
-        setState(() {
-          _totalExpectedReadings = expectedCount;
-          _currentReceivedReadings = 0;
-          _isLoadingReadings = true; // Start loading state
-        });
-        print("📊 [PRINT DEBUG] ESP32 reports $expectedCount stored readings | Starting loading state");
-      }
+        // This is the "Printing X stored readings:" line from "print" command
+        // Extract the count from the message
+        final countMatch = RegExp(r'Printing (\d+) stored readings').firstMatch(response);
+        if (countMatch != null) {
+          final expectedCount = int.tryParse(countMatch.group(1) ?? '0') ?? 0;
+          setState(() {
+            _totalExpectedReadings = expectedCount;
+            _currentReceivedReadings = 0;
+            _lastReceivedCount = 0;
+            _isLoadingReadings = true; // Start loading state - this enables parsing of individual readings
+          });
+          print("📊 [PRINT DEBUG] ESP32 reports $expectedCount stored readings | Starting loading state");
+          // Start timeout timer for print query
+          _startDataRetrievalTimeout();
+        }
       
       // Check if this is a paginated response (contains chunk info)
+      // Handle both "Printing X stored readings (chunk 1/15):" and "Range readings (chunk 1/15):"
       final chunkMatch = RegExp(r'chunk (\d+)/(\d+)').firstMatch(response);
       if (chunkMatch != null) {
         final currentChunk = int.tryParse(chunkMatch.group(1) ?? '0') ?? 0;
         final totalChunks = int.tryParse(chunkMatch.group(2) ?? '0') ?? 0;
         _currentChunkIndex = currentChunk - 1; // Convert to 0-based index
         _totalChunks = totalChunks;
-        _isFetchingChunks = true;
-        print("📊 [PAGINATION] Detected chunk $currentChunk/$totalChunks | Starting pagination");
+          _isFetchingChunks = true;
       }
       
-      print("✅ DETECTED PRINT COMMAND RESPONSE - ready to parse readings");
     } else if (response.contains('Chunk ') && response.contains('/')) {
-      // Subsequent chunk header (not first chunk)
+      // Subsequent chunk header (not first chunk) - for "All Readings" or range subsequent chunks
       final chunkMatch = RegExp(r'Chunk (\d+)/(\d+)').firstMatch(response);
       if (chunkMatch != null) {
         final currentChunk = int.tryParse(chunkMatch.group(1) ?? '0') ?? 0;
         final totalChunks = int.tryParse(chunkMatch.group(2) ?? '0') ?? 0;
         _currentChunkIndex = currentChunk - 1; // Convert to 0-based index
         _totalChunks = totalChunks;
-        print("📊 [PAGINATION] Processing chunk $currentChunk/$totalChunks");
       }
-    } else if (response.startsWith('#') && (response.contains('°C') || response.contains('N/A')) && !isReadingRFID) {
-      // Individual reading line from "print" or "range" command
-      // Count how many readings are in this response
-      final readingCount = RegExp(r'#\d+:').allMatches(response).length;
-      _totalReadingsReceived += readingCount;
-      _lastParsedCount = parsedReadings.length;
-      print("✅ DETECTED INDIVIDUAL READING - calling _parseReadings | Readings in this response: $readingCount | Total received so far: $_totalReadingsReceived | Current parsed: $_lastParsedCount");
-      _parseReadings(response);
-      print("📊 [PARSE DEBUG] After parsing: ${parsedReadings.length} readings (added ${parsedReadings.length - _lastParsedCount})");
-    } else if (response.startsWith('#') && (response.contains('°C') || response.contains('N/A')) && isReadingRFID) {
-      // Individual reading from "Read Now" - already handled above, skip here
-      print("⏭️ Skipping individual reading parsing (already handled for Read Now)");
-    } else {
-      print("❌ Not a reading response - skipping _parseReadings");
+    } else if (response.startsWith('#') && (response.contains('°C') || response.contains('N/A'))) {
+      // This is a reading line - check which context it belongs to
+      if (isReadingRFID) {
+        // Individual reading from "Read Now" - already handled above, skip here
+      } else if (_isLoadingReadings || _waitingForLastReading) {
+        // Individual reading line from "print", "range", or "last" command
+        // Count how many readings are in this response
+        final readingCount = RegExp(r'#\d+:').allMatches(response).length;
+        _totalReadingsReceived += readingCount;
+        _lastParsedCount = parsedReadings.length;
+        
+        // Reset timeout immediately when reading data is detected (before parsing)
+        // This ensures timeout is reset even if parsing takes time or fails
+        if (_isLoadingReadings) {
+          _lastReceivedCount = _currentReceivedReadings;
+          _startDataRetrievalTimeout();
+        }
+        
+        _parseReadings(response);
+        
+        // If this was a "last" command response (single reading, not part of larger query), cleanup
+        if (_waitingForLastReading && !_isLoadingReadings && parsedReadings.length == 1) {
+          _waitingForLastReading = false;
+          _cleanupAfterSuccessfulOperation();
+        }
+      } else {
+        // Reading line received but not in any expected context - this shouldn't happen
+        print("⚠️ Reading line received but not in loading state: _isLoadingReadings=$_isLoadingReadings, _waitingForLastReading=$_waitingForLastReading, isReadingRFID=$isReadingRFID");
+      }
     }
   }
 
@@ -439,13 +549,15 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       // The ESP32 stores all readings including those from "Read Now", so they will be included
       // NOTE: For pagination, only clear on first chunk (print), not on subsequent chunks (print_chunk)
       if (command == 'print' || command.startsWith('range ')) {
-        print("🧹 Clearing previous readings for new query: $command");
         setState(() {
           parsedReadings.clear();
           // Reset loading state
           _isLoadingReadings = false;
           _totalExpectedReadings = 0;
           _currentReceivedReadings = 0;
+          // Clear Read Now result to hide "RFID Tag Detected" block
+          lastReadResult = null;
+          lastReadData = null;
         });
         // Reset debug counters for new query
         _printResponseCount = 0;
@@ -455,10 +567,25 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         _currentChunkIndex = 0;
         _totalChunks = 0;
         _isFetchingChunks = false;
-        print("📊 [PRINT DEBUG] Reset counters for new 'print' query");
+        // Reset last reading flag
+        _waitingForLastReading = false;
+        // Reset range query state ONLY for 'print' command, NOT for 'range' command
+        // (range query state is set in _retrieveFilteredData() and must be preserved)
+        if (command == 'print') {
+          _isRangeQuery = false;
+          _currentRangeStartEpoch = null;
+          _currentRangeEndEpoch = null;
+        }
       } else if (command.startsWith('print_chunk ')) {
         // Pagination: don't clear readings, just append to existing list
-        print("📥 Requesting chunk: $command (will append to existing ${parsedReadings.length} readings)");
+      } else if (command == 'last') {
+        // Track that we're waiting for "last" command response
+        _waitingForLastReading = true;
+        // Clear Read Now result to hide "RFID Tag Detected" block
+        setState(() {
+          lastReadResult = null;
+          lastReadData = null;
+        });
       }
       // NOTE: For 'readnow', we don't clear parsedReadings - the new reading will be added
       // and will appear in "All Readings" since it's stored on ESP32
@@ -521,6 +648,42 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     setState(() {
       rfidReadings.clear();
     });
+  }
+
+  void _cleanupAfterSuccessfulOperation() {
+    // Clean buffers and caches after successful operation to ensure clean state for next execution
+    print("🧹 Cleaning buffers and caches after successful operation");
+    
+    // Clear ESP32 responses buffer (rfidReadings) to prevent accumulation
+    // Keep only the last 50 responses to prevent memory issues while preserving recent history
+    if (rfidReadings.length > 50) {
+      setState(() {
+        rfidReadings.removeRange(0, rfidReadings.length - 50);
+      });
+      print("🧹 Trimmed rfidReadings buffer (kept last 50 responses)");
+    }
+    
+    // Reset debug counters
+    _printResponseCount = 0;
+    _totalReadingsReceived = 0;
+    _lastParsedCount = 0;
+    
+    // Ensure timeout timer is cancelled
+    _dataRetrievalTimeoutTimer?.cancel();
+    _dataRetrievalTimeoutTimer = null;
+    
+    // Reset pagination state (should already be reset, but ensure it)
+    if (!_isLoadingReadings) {
+      _isFetchingChunks = false;
+      _currentChunkIndex = 0;
+      _totalChunks = 0;
+      _lastReceivedCount = 0;
+    }
+    
+    // Reset last reading flag
+    _waitingForLastReading = false;
+    
+    print("✅ Cleanup complete - ready for next operation");
   }
 
   Future<void> _exportToCSV() async {
@@ -773,21 +936,16 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
 
   void _parseReadings(String response) {
     final initialCount = parsedReadings.length;
-    print("🔧 ENTERING _parseReadings | Initial count: $initialCount | Response length: ${response.length} chars");
     
     // Handle individual reading responses (format: #X: timestamp, country, tag, temperature)
     // IMPORTANT: Handle concatenated readings (multiple #X: patterns in one response)
     // Also handles "N/A" for temperature when sensor is not enabled
     if (response.contains('#') && (response.contains('°C') || response.contains('N/A'))) {
-      print("🔧 Processing reading(s): '${response.length > 200 ? response.substring(0, 200) + '...' : response}'");
-      
       // Use flexible regex to find ALL readings in the response (handles concatenated readings)
       // Pattern: #(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*((?:[\d.]+°C|N/A))
       // This matches either a temperature value with °C or "N/A"
       final flexibleRegex = RegExp(r'#(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*((?:[\d.]+°C|N/A))');
       final allMatches = flexibleRegex.allMatches(response);
-      
-      print("🔧 Found ${allMatches.length} reading(s) in response | Initial parsedReadings: $initialCount");
       
       if (allMatches.isEmpty) {
         print("❌ No readings found in response: '$response'");
@@ -914,36 +1072,45 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           // Update progress counter for loading indicator
           _currentReceivedReadings = parsedReadings.length;
         });
-        print("🎯 ADDED ${newReadings.length} reading(s) from batch to parsedReadings. Total: ${parsedReadings.length} (was $initialCount)");
+        // Reset timeout when new data arrives (any new data resets the 30-second timer)
+        if (_isLoadingReadings) {
+          _lastReceivedCount = _currentReceivedReadings;
+          _startDataRetrievalTimeout(); // Reset timeout
+        }
       }
       return;
     }
     
     // Handle range responses (like dashboard does)
-    print("🔧 Processing range response with ${response.length} characters | Initial parsedReadings: $initialCount");
-    
     // If this is just "---BEGIN_READINGS---", clear existing readings (start of new query)
     // IMPORTANT: For pagination, only clear on first chunk (when not fetching chunks)
     if ((response.trim() == '---BEGIN_READINGS---' || (response.contains('---BEGIN_READINGS---') && !response.contains('#'))) && !_isFetchingChunks) {
-      print("✅ Found BEGIN_READINGS marker - clearing existing readings for new query (was $initialCount)");
       setState(() {
         parsedReadings.clear();
       });
+      // Reset timeout when BEGIN_READINGS is received (data transfer has started)
+      // This prevents timeout if there's a delay between "Found" and first reading
+      if (_isLoadingReadings) {
+        _lastReceivedCount = _currentReceivedReadings;
+        _startDataRetrievalTimeout();
+      }
       return; // Don't process further - individual readings will come separately
     } else if ((response.trim() == '---BEGIN_READINGS---' || (response.contains('---BEGIN_READINGS---') && !response.contains('#'))) && _isFetchingChunks) {
-      print("✅ Found BEGIN_READINGS marker during pagination - NOT clearing (appending to existing $initialCount readings)");
+      // Reset timeout during pagination as well
+      if (_isLoadingReadings) {
+        _lastReceivedCount = _currentReceivedReadings;
+        _startDataRetrievalTimeout();
+      }
       return; // Don't process further - individual readings will come separately
     }
     
     // If this is just "---CHUNK_COMPLETE---", don't do anything (readings already parsed, handled in _handleESP32Response)
     if (response.trim() == '---CHUNK_COMPLETE---' || (response.contains('---CHUNK_COMPLETE---') && !response.contains('#'))) {
-      print("✅ Found CHUNK_COMPLETE marker - chunk complete, keeping existing ${parsedReadings.length} readings (was $initialCount)");
       return; // Don't process further - chunk already parsed, next chunk will be requested automatically
     }
     
     // If this is just "---END_READINGS---", don't do anything (readings already parsed)
     if (response.trim() == '---END_READINGS---' || (response.contains('---END_READINGS---') && !response.contains('#'))) {
-      print("✅ Found END_READINGS marker - query complete, keeping existing ${parsedReadings.length} readings (was $initialCount)");
       return; // Don't process further - all readings already parsed
     }
     
@@ -952,13 +1119,9 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     if (response.contains('#') && (response.contains('°C') || response.contains('N/A'))) {
       // Use the same efficient batching approach as individual readings
       // This handles both single readings and batched readings (with newlines) from range queries
-      print("🔧 Processing batched range readings using efficient regex matching");
-      
       // Use flexible regex to find ALL readings in the entire response (handles newlines)
       final flexibleRegex = RegExp(r'#(\d+):\s*([^,]+),\s*(\d+),\s*(\d+),\s*((?:[\d.]+°C|N/A))');
       final allMatches = flexibleRegex.allMatches(response);
-      
-      print("🔧 Found ${allMatches.length} reading(s) in range response | Initial parsedReadings: $initialCount");
       
       if (allMatches.isEmpty) {
         print("❌ No readings found in range response: '$response'");
@@ -1105,16 +1268,13 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     for (String line in lines) {
       if (line.contains('---BEGIN_READINGS---')) {
         inBlock = true;
-        print("✅ Found BEGIN_READINGS marker - entering block");
         continue;
       }
       if (line.contains('---END_READINGS---')) {
         inBlock = false;
-        print("✅ Found END_READINGS marker - exiting block");
         continue;
       }
       if (inBlock && line.trim().isNotEmpty) {
-        print("🔧 Processing line in block: '$line'");
         
         // Handle concatenated readings (multiple #X: patterns in one line)
         // Use flexible regex to find ALL readings in the line
@@ -1249,18 +1409,81 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     }
   }
 
+  void _abortDataRetrieval() {
+    print("🛑 Aborting data retrieval - clearing state and timers");
+    _dataRetrievalTimeoutTimer?.cancel();
+    _dataRetrievalTimeoutTimer = null;
+    
+    // Note: We don't send a cancel command to ESP32 as it will finish sending current chunk
+    // The abort just stops the app from processing further responses
+    
+    setState(() {
+      _isLoadingReadings = false;
+      isLoadingData = false;
+      _totalExpectedReadings = 0;
+      _currentReceivedReadings = 0;
+      _lastReceivedCount = 0;
+      parsedReadings.clear(); // Clear any partial data
+      _isFetchingChunks = false;
+      _currentChunkIndex = 0;
+      _totalChunks = 0;
+    });
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Data retrieval aborted'),
+        backgroundColor: Colors.orange,
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
+  void _startDataRetrievalTimeout() {
+    // Cancel existing timeout if any
+    _dataRetrievalTimeoutTimer?.cancel();
+    
+    // Start 30-second timeout
+    _dataRetrievalTimeoutTimer = Timer(const Duration(seconds: 30), () {
+      if (_isLoadingReadings) {
+        // Check if we've received new data since timeout started
+        final currentCount = _currentReceivedReadings;
+        if (currentCount == _lastReceivedCount && currentCount < _totalExpectedReadings) {
+          print("⏱️ Data retrieval timeout - no new data received in 30 seconds (stuck at $currentCount/$_totalExpectedReadings)");
+          _abortDataRetrieval();
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Data retrieval timeout: No new data received in 30 seconds. Please try again.'),
+              backgroundColor: Colors.red,
+              duration: Duration(seconds: 3),
+            ),
+          );
+        } else {
+          // Data is still coming, update last count and reset timeout
+          print("📊 Timeout check: Data progressing ($currentCount/$_totalExpectedReadings), resetting timeout");
+          _lastReceivedCount = currentCount;
+          _startDataRetrievalTimeout();
+        }
+      }
+    });
+    print("⏱️ Started 30-second timeout timer (current: $_currentReceivedReadings/$_totalExpectedReadings)");
+  }
+
   void _retrieveFilteredData() async {
     if (!isConnected) return;
     
-    setState(() {
-      isLoadingData = true;
-      parsedReadings.clear(); // Clear existing readings before new query
-      // Reset loading state (will be set when "Found X readings in range" is received)
-      _isLoadingReadings = false;
-      _totalExpectedReadings = 0;
-      _currentReceivedReadings = 0;
-      print("🧹 Cleared parsedReadings before new range query");
-    });
+      setState(() {
+        isLoadingData = true;
+        parsedReadings.clear(); // Clear existing readings before new query
+        // Reset loading state (will be set when "Found X readings in range" is received)
+        _isLoadingReadings = false;
+        _totalExpectedReadings = 0;
+        _currentReceivedReadings = 0;
+        _lastReceivedCount = 0;
+        // Reset pagination state
+        _currentChunkIndex = 0;
+        _totalChunks = 0;
+        _isFetchingChunks = false;
+      });
     
     try {
       // Get the selected timezone location
@@ -1297,11 +1520,19 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       print("🕐 Start: ${startLocalDateTime.toString()} (local) -> ${startUtcDateTime.toString()} (UTC) -> $startEpoch");
       print("🕐 End: ${endLocalDateTime.toString()} (local) -> ${endUtcDateTime.toString()} (UTC) -> $endEpoch");
       
-      // Send range command to ESP32
+      // Store range parameters for pagination
+      setState(() {
+        _currentRangeStartEpoch = startEpoch;
+        _currentRangeEndEpoch = endEpoch;
+        _isRangeQuery = true;
+      });
+      
+      // Send range command to ESP32 (will send chunk 0)
       final command = 'range $startEpoch $endEpoch';
       _sendCommand(command);
       // Note: isLoadingData will be set to false when ---END_READINGS--- is received
       // This allows the loading indicator to show during data transfer
+      // Timeout will be started when "Found X readings in range" is received
     } catch (e) {
       print("❌ Error converting timezone: $e");
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1837,20 +2068,35 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                   
                   const SizedBox(height: 16),
                   
-                  // Retrieve Data Button
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton.icon(
-                      onPressed: isLoadingData ? null : _retrieveFilteredData,
-                      icon: isLoadingData 
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.search),
-                      label: Text(isLoadingData ? 'Loading...' : 'Retrieve Data'),
-                    ),
+                  // Retrieve Data Button and Stop Button
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: isLoadingData ? null : _retrieveFilteredData,
+                          icon: isLoadingData 
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.search),
+                          label: Text(isLoadingData ? 'Loading...' : 'Retrieve Data'),
+                        ),
+                      ),
+                      if (_isLoadingReadings) ...[
+                        const SizedBox(width: 8),
+                        ElevatedButton.icon(
+                          onPressed: _abortDataRetrieval,
+                          icon: const Icon(Icons.stop, size: 18),
+                          label: const Text('Stop'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.red,
+                            foregroundColor: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
                 ],
               ),
@@ -1920,11 +2166,17 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                         ),
                       ),
                       ElevatedButton.icon(
-                        onPressed: () => _sendCommand('print'),
-                        icon: const Icon(Icons.list, size: 16),
-                        label: const Text(
-                          'All\nReadings',
-                          style: TextStyle(fontSize: 10),
+                        onPressed: _isLoadingReadings ? null : () => _sendCommand('print'),
+                        icon: _isLoadingReadings
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.list, size: 16),
+                        label: Text(
+                          _isLoadingReadings ? 'Loading...' : 'All\nReadings',
+                          style: const TextStyle(fontSize: 10),
                           textAlign: TextAlign.center,
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,
@@ -1937,6 +2189,22 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                       ),
                     ],
                   ),
+                  // Stop button appears when loading (for All Readings)
+                  if (_isLoadingReadings && !isLoadingData) ...[
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: _abortDataRetrieval,
+                        icon: const Icon(Icons.stop, size: 18),
+                        label: const Text('Stop Loading'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.red,
+                          foregroundColor: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -2143,17 +2411,19 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                           'Filtered Readings (${parsedReadings.length} found):',
                           style: Theme.of(context).textTheme.titleMedium,
                         ),
-                        IconButton(
-                          onPressed: parsedReadings.isNotEmpty ? _exportToCSV : null,
-                          icon: const Icon(Icons.download, size: 20),
-                          tooltip: 'Export CSV',
-                          style: IconButton.styleFrom(
-                            backgroundColor: Colors.green,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.all(8),
-                            minimumSize: const Size(36, 36),
+                        // Only show export button when not loading and data is available
+                        if (!_isLoadingReadings && parsedReadings.isNotEmpty)
+                          IconButton(
+                            onPressed: _exportToCSV,
+                            icon: const Icon(Icons.download, size: 20),
+                            tooltip: 'Export CSV',
+                            style: IconButton.styleFrom(
+                              backgroundColor: Colors.green,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.all(8),
+                              minimumSize: const Size(36, 36),
+                            ),
                           ),
-                        ),
                       ],
                     ),
                     const SizedBox(height: 16),
@@ -2516,7 +2786,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                           style: Theme.of(context).textTheme.titleMedium,
                         ),
                         IconButton(
-                          onPressed: parsedReadings.isNotEmpty ? _saveChartAsImage : null,
+                          onPressed: (!_isLoadingReadings && parsedReadings.isNotEmpty) ? _saveChartAsImage : null,
                           icon: const Icon(Icons.save_alt, size: 20),
                           tooltip: 'Save Image',
                           style: IconButton.styleFrom(
