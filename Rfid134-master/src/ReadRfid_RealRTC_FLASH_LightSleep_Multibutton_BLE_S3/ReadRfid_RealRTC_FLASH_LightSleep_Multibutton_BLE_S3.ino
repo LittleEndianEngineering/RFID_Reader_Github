@@ -240,11 +240,20 @@ void updateLEDStatus() {
   // Handle timed status changes (like reading success flash)
   if (ledFlashDuration > 0 && (millis() - ledStatusStartTime) > ledFlashDuration) {
     // Return to appropriate status based on current system state
+    // CRITICAL: Always check dashboardModeActive to ensure correct LED state
     if (dashboardModeActive) {
-      setLEDStatus("dashboard_active");
+      setLEDStatus("dashboard_active");  // Red LED - Dashboard Mode active
     } else {
-      setLEDStatus("sleeping");
+      setLEDStatus("sleeping");  // Blue LED - Normal sleep mode
     }
+  }
+  
+  // Additional safety check: If Dashboard Mode is active but LED is not red, fix it
+  // This prevents LED from being blue when Dashboard Mode is active
+  if (dashboardModeActive && currentLEDStatus != "dashboard_active" && 
+      currentLEDStatus != "reading_success" && currentLEDStatus != "booting") {
+    // Only fix if not in a temporary state (reading_success flash or booting)
+    setLEDStatus("dashboard_active");
   }
 }
 
@@ -1001,6 +1010,15 @@ void loadConfig() {
   if (s.length() > 0) { periodicIntervalMs = s.toInt(); Serial.printf("[CONFIG] periodicIntervalMs=%lu\n", periodicIntervalMs); }
   s = loadConfigVar("longPressMs");
   if (s.length() > 0) { longPressMs = s.toInt(); Serial.printf("[CONFIG] longPressMs=%lu\n", longPressMs); }
+  // Restore Dashboard Mode state from flash (persists across resets)
+  s = loadConfigVar("dashboardModeActive");
+  if (s.length() > 0 && s == "true") {
+    dashboardModeActive = true;
+    Serial.println("[CONFIG] dashboardModeActive=true (restored from flash)");
+  } else {
+    dashboardModeActive = false;
+    Serial.println("[CONFIG] dashboardModeActive=false (default or not set)");
+  }
 }
 
 // WiFi Functions
@@ -1705,15 +1723,16 @@ void handleMultiButton() {
         // Long press - toggle dashboard mode
         Serial.println("[BUTTON] Long press -> Dashboard mode toggle");
         dashboardModeActive = !dashboardModeActive;
+        saveConfigVar("dashboardModeActive", dashboardModeActive ? "true" : "false");  // Persist to flash
         
         if (dashboardModeActive) {
-          Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED (Button) ***");
+          Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED (Button, Persistent) ***");
           Serial.println("[DASHBOARD] ESP32 will stay awake - no periodic reads");
           Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
           setLEDStatus("dashboard_active");  // Red LED for dashboard mode
           startBLEAdvertising();  // Start BLE advertising for mobile apps
         } else {
-          Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Button) ***");
+          Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Button, Persistent) ***");
           Serial.println("[DASHBOARD] ESP32 will use light sleep - periodic reads enabled");
           Serial.println("[DASHBOARD] BLE advertising stopped");
           setLEDStatus("sleeping");  // Blue LED for normal sleep mode
@@ -1760,6 +1779,26 @@ void setup() {
   unsigned long t0 = millis();
   while (!Serial && millis() - t0 < 2000) {}  // Wait a bit for connection
 
+  // Print reset reason immediately to diagnose connection resets
+  esp_reset_reason_t reset_reason = esp_reset_reason();
+  const char* reset_reason_str = "";
+  switch (reset_reason) {
+    case ESP_RST_POWERON: reset_reason_str = "POWERON"; break;
+    case ESP_RST_EXT: reset_reason_str = "EXT (external pin)"; break;
+    case ESP_RST_SW: reset_reason_str = "SW (software)"; break;
+    case ESP_RST_PANIC: reset_reason_str = "PANIC (exception)"; break;
+    case ESP_RST_INT_WDT: reset_reason_str = "INT_WDT (interrupt watchdog)"; break;
+    case ESP_RST_TASK_WDT: reset_reason_str = "TASK_WDT (task watchdog)"; break;
+    case ESP_RST_WDT: reset_reason_str = "WDT (watchdog)"; break;
+    case ESP_RST_DEEPSLEEP: reset_reason_str = "DEEPSLEEP"; break;
+    case ESP_RST_BROWNOUT: reset_reason_str = "BROWNOUT"; break;
+    case ESP_RST_SDIO: reset_reason_str = "SDIO"; break;
+    case ESP_RST_USB: reset_reason_str = "USB (USB-CDC reset)"; break;
+    default: reset_reason_str = "UNKNOWN"; break;
+  }
+  Serial.printf("[BOOT] Reset reason: %d (%s)\n", (int)reset_reason, reset_reason_str);
+  Serial.flush();
+
   Serial.println("Start");
   Serial.println("[BOOT] ESP32-S3 RFID Reader starting...");
   delay(500);  // Give time to see this message
@@ -1790,6 +1829,22 @@ void setup() {
   Serial.println("[BOOT] Loading configuration...");
   if (configExists()) loadConfig();
   Serial.println("[BOOT] Configuration loaded");
+  
+  // Restore Dashboard Mode if it was active before reset
+  // This prevents connection drop after reset on macOS
+  if (dashboardModeActive) {
+    Serial.println("[BOOT] Restoring Dashboard Mode (was active before reset)");
+    Serial.println("[DASHBOARD] *** DASHBOARD MODE RESTORED (Persistent) ***");
+    Serial.println("[DASHBOARD] ESP32 will stay awake - no periodic reads");
+    Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
+    Serial.println("[DASHBOARD] LED set to RED - Dashboard Mode active");
+    setLEDStatus("dashboard_active");  // Red LED for dashboard mode
+    startBLEAdvertising();  // Start BLE advertising for mobile apps
+    Serial.printf("[DASHBOARD] Verification: dashboardModeActive=%s, LED status=%s\n", 
+                  dashboardModeActive ? "true" : "false", currentLEDStatus.c_str());
+  } else {
+    Serial.println("[BOOT] Dashboard Mode was NOT active before reset (normal sleep mode)");
+  }
 
   Serial.println("[BOOT] Initializing RTC...");
   initRTC();
@@ -1838,8 +1893,12 @@ void setup() {
   Serial.println("[BOOT] Setup complete");
   Serial.println("[BOOT] ESP32-S3 RFID Reader ready - USB connection stable");
   
-  // Set LED to sleeping status AFTER all boot messages are complete
-  setLEDStatus("sleeping");
+  // Set LED status AFTER all boot messages are complete
+  // CRITICAL: Don't override Dashboard Mode LED if it was restored from flash
+  if (!dashboardModeActive) {
+    setLEDStatus("sleeping");  // Blue LED for normal sleep mode
+  }
+  // If Dashboard Mode is active, LED is already set to red in the restoration block above
   
   Serial.println(); // Blank line after boot completion
   Serial.flush();  // Ensure all messages are sent
@@ -2025,8 +2084,9 @@ void processSerialCommand(const String& command) {
   // Check for dashboard mode commands
     if (command == "dashboardmode on") {
       dashboardModeActive = true;
+      saveConfigVar("dashboardModeActive", "true");  // Persist to flash
       Serial.println("[DASHBOARD] Dashboard Mode: ON - ESP32 will stay awake");
-      Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED ***");
+      Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED (Persistent) ***");
       Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
     setLEDStatus("dashboard_active");  // Red LED for dashboard mode
     startBLEAdvertising();  // Start BLE advertising for mobile apps
@@ -2036,8 +2096,9 @@ void processSerialCommand(const String& command) {
   
     if (command == "dashboardmode off") {
       dashboardModeActive = false;
+      saveConfigVar("dashboardModeActive", "false");  // Persist to flash
       Serial.println("[DASHBOARD] Dashboard Mode: OFF - ESP32 will use light sleep");
-      Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED ***");
+      Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Persistent) ***");
       Serial.println("[DASHBOARD] BLE advertising stopped");
     setLEDStatus("sleeping");  // Blue LED for normal sleep mode
     stopBLEAdvertising();  // Stop BLE advertising
@@ -2419,15 +2480,16 @@ void loop() {
       // Long press - toggle dashboard mode
       Serial.println("[BUTTON] GPIO wake -> Long press -> Dashboard mode toggle");
       dashboardModeActive = !dashboardModeActive;
+      saveConfigVar("dashboardModeActive", dashboardModeActive ? "true" : "false");  // Persist to flash
       
       if (dashboardModeActive) {
-        Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED (Button) ***");
+        Serial.println("[DASHBOARD] *** DASHBOARD MODE ACTIVATED (Button, Persistent) ***");
         Serial.println("[DASHBOARD] ESP32 will stay awake - no periodic reads");
         Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
         setLEDStatus("dashboard_active");  // Red LED for dashboard mode
         startBLEAdvertising();  // Start BLE advertising for mobile apps
       } else {
-        Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Button) ***");
+        Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Button, Persistent) ***");
         Serial.println("[DASHBOARD] ESP32 will use light sleep - periodic reads enabled");
         Serial.println("[DASHBOARD] BLE advertising stopped");
         setLEDStatus("sleeping");  // Blue LED for normal sleep mode
