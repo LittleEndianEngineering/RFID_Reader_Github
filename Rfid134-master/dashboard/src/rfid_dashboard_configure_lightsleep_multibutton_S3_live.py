@@ -121,14 +121,18 @@ if 'esp32_periodicInterval' not in st.session_state:
 # Initialize Live View session state
 if 'live_view_enabled' not in st.session_state:
     st.session_state['live_view_enabled'] = False
-if 'live_view_initial_date' not in st.session_state:
-    st.session_state['live_view_initial_date'] = datetime.now().date() - timedelta(days=7)
-if 'live_view_initial_time' not in st.session_state:
-    st.session_state['live_view_initial_time'] = dt_time(0, 0)
+if 'live_view_start_timestamp' not in st.session_state:
+    st.session_state['live_view_start_timestamp'] = None
 if 'last_live_update' not in st.session_state:
     st.session_state['last_live_update'] = 0
 if 'is_auto_refresh' not in st.session_state:
     st.session_state['is_auto_refresh'] = False
+if 'last_successful_update' not in st.session_state:
+    st.session_state['last_successful_update'] = None
+if 'connection_error_count' not in st.session_state:
+    st.session_state['connection_error_count'] = 0
+if 'last_connection_test' not in st.session_state:
+    st.session_state['last_connection_test'] = 0
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -158,6 +162,43 @@ def get_available_ports():
     """Get list of available serial ports"""
     ports = serial.tools.list_ports.comports()
     return [port.device for port in ports]
+
+def close_serial_port_if_open(port_name):
+    """Attempt to close a serial port if it's open at OS level"""
+    """This is useful when page refreshes and port is still open from previous session"""
+    try:
+        log_general_debug(f"[CLEANUP] Attempting to close port {port_name} if it's open...")
+        # Try to open the port with a very short timeout
+        test_ser = None
+        try:
+            test_ser = serial.Serial(port_name, 115200, timeout=0.1)
+            if test_ser.is_open:
+                log_general_debug(f"[CLEANUP] Port {port_name} was open - closing it")
+                test_ser.close()
+                time.sleep(0.3)  # Give OS time to release the port
+                log_general_debug(f"[CLEANUP] Port {port_name} closed successfully")
+                return True
+        except serial.SerialException as e:
+            error_msg = str(e).lower()
+            if "already open" in error_msg or "busy" in error_msg:
+                # Port is already open by another process - we can't close it
+                log_general_debug(f"[CLEANUP] Port {port_name} is already open by another process - cannot close")
+                return False
+            # Port is not open or doesn't exist - that's fine
+            log_general_debug(f"[CLEANUP] Port {port_name} is not open or doesn't exist")
+            return True
+        except Exception as e:
+            log_general_debug(f"[CLEANUP] Error checking port {port_name}: {e}")
+            return False
+        finally:
+            if test_ser and test_ser.is_open:
+                try:
+                    test_ser.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        log_general_debug(f"[CLEANUP] Unexpected error closing port {port_name}: {e}")
+        return False
 
 def connect_to_arduino(port, baud_rate=115200):
     """Establish serial connection to ESP32 device without causing reset"""
@@ -240,9 +281,10 @@ def connect_to_arduino(port, baud_rate=115200):
         error_msg = str(e).lower()
         if "already open" in error_msg or "busy" in error_msg or "access denied" in error_msg:
             st.error(f"⚠️ Port {port} is already in use.")
-            st.info("💡 **Solution:** Close Arduino IDE Serial Monitor, then try connecting again.")
+            st.info("💡 **Solution:** This can happen after a page refresh. Wait a few seconds and try again, or close Arduino IDE Serial Monitor if it's open.")
             log_general_debug(f"[CONNECTION] Port busy error: {e}")
-            log_general_debug(f"[CONNECTION] Port may be in use by Arduino IDE or another application")
+            log_general_debug(f"[CONNECTION] Port may be in use by Arduino IDE, another application, or a previous connection")
+            log_general_debug(f"[CONNECTION] Suggestion: Wait a moment for the port to be released, then retry")
         else:
             st.error(f"Failed to connect: {e}")
             log_general_debug(f"[CONNECTION] Connection error: {e}")
@@ -266,6 +308,30 @@ def is_serial_valid(ser):
         # Don't actually read/write, just check if port is accessible
         return True
     except (ValueError,) + SERIAL_EXCEPTIONS:
+        return False
+
+def test_connection_quick(ser):
+    """Quick connection test - checks if ESP32 responds to a simple command"""
+    if not is_serial_valid(ser):
+        return False
+    try:
+        # Clear any pending data
+        ser.reset_input_buffer()
+        # Send a simple status command
+        ser.write(b"status\n")
+        ser.flush()
+        time.sleep(0.1)  # Short wait for response
+        
+        # Check if we get any response within timeout
+        start_time = time.time()
+        while time.time() - start_time < 1.0:  # 1 second timeout
+            if ser.in_waiting:
+                response = ser.readline().decode(errors='ignore').strip()
+                if response and ("CMD_RECEIVED" in response or "Dashboard Mode" in response or "ACTIVE" in response or "INACTIVE" in response):
+                    return True
+        return False
+    except Exception as e:
+        log_general_debug(f"[DEBUG] Quick connection test failed: {e}")
         return False
 
 def is_port_already_open(port, existing_connection):
@@ -727,6 +793,48 @@ st.markdown("Connect to your ESP32 RFID reader with multi-button support and ret
 tabs = st.tabs(["RFID Reader Dashboard", "Configuration", "User Guide"])
 
 with tabs[0]:
+    # Validate connection state on startup - reset if stale
+    # Note: When page is refreshed (F5), Streamlit creates a completely new session,
+    # so all session state is reset. However, the serial port might still be open
+    # at the OS level from the previous session. We handle this by closing the port
+    # when the user tries to connect (see Connect button handler below).
+    # Note: When browser reconnects after disconnection (screen saver, lock, etc.),
+    # Streamlit session state variables are preserved, but the serial connection object
+    # cannot be preserved across browser disconnections. We need to detect this and mark as disconnected.
+    
+    # Check if we have a connection state but no connection object
+    if st.session_state.connected:
+        if st.session_state.serial_connection is None:
+            # Connection object is missing - this happens when:
+            # 1. Browser disconnects (screen saver, lock) - session state preserved but connection object lost
+            # 2. Page refresh (F5) - new session created, old connection state lost
+            # In both cases, ESP32 is still in dashboard mode (which is desired), but we can't communicate with it
+            log_general_debug("[DEBUG] Connection state exists but serial connection object is None - marking as disconnected")
+            log_general_debug("[DEBUG] NOTE: ESP32 remains in dashboard mode - connection will be restored on reconnect")
+            st.session_state.connected = False
+            st.session_state.connected_port = None
+            st.session_state['connection_error_count'] = 0
+            # Keep Live View state enabled - user can reconnect and it will resume
+        elif not is_serial_valid(st.session_state.serial_connection):
+            # Connection object exists but is invalid - close it properly
+            # Note: We keep dashboard mode ON on ESP32 - just close the serial connection
+            log_general_debug("[DEBUG] Stale connection detected on startup - closing serial connection")
+            log_general_debug("[DEBUG] NOTE: Dashboard mode remains ON on ESP32 - connection will be restored on reconnect")
+            try:
+                # Close the connection - dashboard mode stays active on ESP32
+                st.session_state.serial_connection.close()
+                log_general_debug("[DEBUG] Stale serial connection closed successfully")
+            except Exception as e:
+                log_general_debug(f"[DEBUG] Error closing stale connection: {e}")
+            st.session_state.connected = False
+            st.session_state.connected_port = None
+            st.session_state.serial_connection = None
+            st.session_state['connection_error_count'] = 0
+        else:
+            # Connection is valid - if Live View was enabled, it should resume
+            if st.session_state.get('live_view_enabled', False):
+                log_general_debug("[DEBUG] Live View was enabled - connection validated, should resume auto-refresh")
+    
     st.sidebar.header("🔌 Connection Settings")
     available_ports = get_available_ports()
     if not available_ports:
@@ -836,6 +944,15 @@ with tabs[0]:
                     st.rerun()
                 else:
                     # Truly need to open a new connection
+                    # CRITICAL: Before opening, try to close the port if it's still open from previous session
+                    # This handles the case where page was refreshed and port is still open at OS level
+                    log_general_debug(f"[CONNECT] Preparing to open new connection to {selected_port}")
+                    log_general_debug(f"[CONNECT] Attempting to close port if it's still open from previous session...")
+                    port_closed = close_serial_port_if_open(selected_port)
+                    if port_closed:
+                        log_general_debug(f"[CONNECT] Port {selected_port} was open and has been closed - waiting for OS to release it")
+                        time.sleep(0.5)  # Give OS time to fully release the port
+                    
                     # NOTE: On macOS with ESP32-S3 USB-CDC, opening the port will cause a reset
                     # This is a platform limitation - DTR/RTS toggle during port opening cannot be prevented
                     # The reset happens during serial.Serial() constructor, before we can set DTR/RTS to False
@@ -846,51 +963,88 @@ with tabs[0]:
                     # Show info message about expected reset
                     st.sidebar.info("ℹ️ **Note:** On macOS, opening the port will reset the ESP32. This is expected and normal.")
                     
+                    # Try to connect (single attempt - retries are handled inside connect_to_arduino if needed)
+                    # Note: We don't retry here to avoid multiple ESP32 resets
                     st.session_state.serial_connection = connect_to_arduino(selected_port, baud_rate)
+                    connection_success = (st.session_state.serial_connection is not None)
                     if st.session_state.serial_connection:
                         log_general_debug(f"[CONNECT] Connection object created successfully")
-                        # Wait a bit for ESP32 to finish booting after reset
-                        log_general_debug(f"[CONNECT] Waiting for ESP32 to finish booting after reset...")
-                        time.sleep(2)  # Give ESP32 time to boot
-                        
-                        # CRITICAL: Send "dashboardmode on" immediately after connection
-                        # This ensures Dashboard Mode is active even if flash persistence didn't work
-                        # or if this is the first time connecting
-                        try:
-                            log_general_debug(f"[CONNECT] Sending 'dashboardmode on' to restore Dashboard Mode...")
-                            st.session_state.serial_connection.write(b"dashboardmode on\n")
-                            st.session_state.serial_connection.flush()
-                            time.sleep(0.5)  # Give ESP32 time to process command
-                            log_general_debug(f"[CONNECT] Dashboard Mode activation command sent")
-                        except Exception as e:
-                            log_general_debug(f"[CONNECT] Warning: Could not send dashboardmode on: {e}")
+                        # Wait a bit for ESP32 to finish booting after reset (if reset occurred)
+                        # Note: ESP32 should already be in dashboard mode when connecting
+                        log_general_debug(f"[CONNECT] Waiting for ESP32 to stabilize connection...")
+                        time.sleep(0.5)  # Brief delay for connection to stabilize
                         
                         st.session_state.connected = True
                         st.session_state.connected_port = selected_port  # Store port name (persists across reruns)
-                        st.sidebar.success("✅ Connected! (Dashboard Mode activated)")
+                        st.sidebar.success("✅ Connected!")
                         st.rerun()
                     else:
-                        log_general_debug(f"[CONNECT] Connection object creation failed")
+                        log_general_debug(f"[CONNECT] Connection failed")
                         st.session_state.connected = False
                         st.session_state.connected_port = None
-                        st.sidebar.error("❌ Connection failed!")
+                        # Error message already shown in connect_to_arduino
         
         # Handle Disconnect button
         if disconnect_clicked:
             if st.session_state.serial_connection:
                 try:
-                    st.session_state.serial_connection.close()
-                    log_general_debug(f"[DISCONNECT] Serial port closed successfully")
+                    # Close the serial connection - dashboard mode stays active on ESP32
+                    # This allows reconnecting later without needing to re-enable dashboard mode
+                    if is_serial_valid(st.session_state.serial_connection):
+                        st.session_state.serial_connection.close()
+                        log_general_debug(f"[DISCONNECT] Serial port closed successfully - dashboard mode remains ON on ESP32")
+                    else:
+                        log_general_debug(f"[DISCONNECT] Serial connection was already invalid")
                 except Exception as e:
                     log_general_debug(f"[DISCONNECT] Error closing serial connection: {e}")
             st.session_state.connected = False
             st.session_state.connected_port = None  # Clear port name
             st.session_state.serial_connection = None
-            st.sidebar.info("Disconnected!")
+            st.sidebar.info("Disconnected! (Dashboard mode remains active on ESP32)")
             st.rerun()  # Force rerun to update button display
         
     if st.session_state.connected:
-        st.success("✅ Connected to RFID Reader")
+        # Validate connection on startup and periodically during Live View
+        connection_valid = True
+        if st.session_state.get('live_view_enabled', False):
+            # Test connection every 30 seconds during Live View
+            current_time = time.time()
+            if current_time - st.session_state.get('last_connection_test', 0) > 30:
+                st.session_state['last_connection_test'] = current_time
+                connection_valid = test_connection_quick(st.session_state.serial_connection)
+                if not connection_valid:
+                    st.session_state['connection_error_count'] = st.session_state.get('connection_error_count', 0) + 1
+                    if st.session_state['connection_error_count'] >= 3:
+                        # Connection is dead - mark as disconnected
+                        st.error("⚠️ **Connection Lost:** ESP32 is not responding. Please reconnect.")
+                        st.session_state.connected = False
+                        st.session_state.connected_port = None
+                        try:
+                            if st.session_state.serial_connection:
+                                st.session_state.serial_connection.close()
+                        except Exception:
+                            pass
+                        st.session_state.serial_connection = None
+                        st.session_state['connection_error_count'] = 0
+                        st.rerun()
+                else:
+                    st.session_state['connection_error_count'] = 0
+        
+        if st.session_state.connected:
+            st.success("✅ Connected to RFID Reader")
+            
+            # Show connection status and last update time
+            if st.session_state.get('live_view_enabled', False):
+                col_status1, col_status2 = st.columns(2)
+                with col_status1:
+                    if st.session_state.get('last_successful_update'):
+                        last_update = datetime.fromtimestamp(st.session_state['last_successful_update'])
+                        st.caption(f"🕒 Last update: {last_update.strftime('%H:%M:%S')}")
+                    else:
+                        st.caption("🕒 Last update: Never")
+                with col_status2:
+                    if st.session_state.get('connection_error_count', 0) > 0:
+                        st.warning(f"⚠️ Connection errors: {st.session_state['connection_error_count']}")
         
         # Timezone selection
         st.header("🌍 Display Timezone")
@@ -917,6 +1071,8 @@ with tabs[0]:
         # Read Live View state from session state - checkbox will update this on rerun
         live_view_enabled_for_date_range = st.session_state.get('live_view_enabled', False)
         
+        # When Live View is disabled, ensure date range section is shown
+        # This handles the case where Live View was just disabled
         if not live_view_enabled_for_date_range:
             st.header("📅 Select Date Range")
             col1, col2 = st.columns(2)
@@ -959,8 +1115,12 @@ with tabs[0]:
             # Always show Retrieve Data button right below pickers
             retrieve_clicked = st.button("🔍 Retrieve Data", type="primary")
         else:
-            # Live View is enabled - prepare date range from Initial Date/Time to now
-            start_dt = datetime.combine(st.session_state['live_view_initial_date'], st.session_state['live_view_initial_time'])
+            # Live View is enabled - prepare date range from when checkbox was enabled to now
+            if st.session_state.get('live_view_start_timestamp') is not None:
+                start_dt = st.session_state['live_view_start_timestamp']
+            else:
+                # Fallback: use current time if timestamp not set
+                start_dt = datetime.now()
             end_dt = datetime.now()
             
             # Convert selected timezone to UTC for ESP32 query
@@ -985,12 +1145,20 @@ with tabs[0]:
         should_auto_refresh = False
         live_view_enabled = st.session_state.get('live_view_enabled', False)
         if live_view_enabled and st.session_state.connected:
-            current_time = time.time()
-            time_since_last_update = current_time - st.session_state['last_live_update']
-            if time_since_last_update >= 10.0:  # 10 seconds have passed
-                should_auto_refresh = True
-                st.session_state['is_auto_refresh'] = True
-                st.session_state['last_live_update'] = current_time
+            # Validate connection before attempting auto-refresh
+            if not is_serial_valid(st.session_state.serial_connection):
+                st.error("⚠️ **Connection Lost:** Serial port is no longer valid. Please reconnect.")
+                st.session_state.connected = False
+                st.session_state.connected_port = None
+                st.session_state.serial_connection = None
+                st.rerun()
+            else:
+                current_time = time.time()
+                time_since_last_update = current_time - st.session_state['last_live_update']
+                if time_since_last_update >= 5.0:  # 5 seconds have passed
+                    should_auto_refresh = True
+                    st.session_state['is_auto_refresh'] = True
+                    st.session_state['last_live_update'] = current_time
         
         # Retrieve data (either manual or auto-refresh)
         if retrieve_clicked or should_auto_refresh:
@@ -1028,38 +1196,88 @@ with tabs[0]:
                                     # Sort DataFrame by timestamp to ensure chronological order
                                     df = df.sort_values('Timestamp')
                                 st.session_state['last_df'] = df
+                                st.session_state['last_successful_update'] = time.time()
                             else:
+                                # Parsing failed or no data
+                                if not response.strip():
+                                    st.warning("⚠️ **No Data:** ESP32 returned empty response. Check device connection.")
+                                else:
+                                    st.info("ℹ️ **No Readings Found:** No data in the selected time range.")
                                 # Keep last_df if no new readings (don't clear it)
                                 pass
                         else:
+                            # No response from ESP32
+                            st.error("⚠️ **Connection Error:** ESP32 did not respond. Please check connection and try again.")
                             # Keep last_df if no response (don't clear it)
                             pass
                     st.session_state['new_query'] = False
                 else:
                     # Auto-refresh: fetch data silently
                     command = f"range {start_epoch} {end_epoch}"
-                    response = send_command(st.session_state.serial_connection, command)
-                    st.session_state['last_raw_response'] = response if response is not None else ""
-                    if response:
-                        readings = parse_readings(response)
-                        if readings:
-                            df = pd.DataFrame(readings)
-                            if 'Timestamp' in df.columns:
-                                # Convert timestamps to selected timezone
-                                df['Timestamp'] = df['Timestamp'].apply(
-                                    lambda x: convert_timestamp_to_timezone(x, st.session_state['selected_timezone'])
-                                )
-                                ts_split = df['Timestamp'].apply(lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S'))
-                                df = df.assign(
-                                    Year=ts_split.dt.year,
-                                    Month=ts_split.dt.month,
-                                    Day=ts_split.dt.day,
-                                    Hour=ts_split.dt.hour,
-                                    Minute=ts_split.dt.minute
-                                )
-                                # Sort DataFrame by timestamp to ensure chronological order
-                                df = df.sort_values('Timestamp')
-                            st.session_state['last_df'] = df
+                    try:
+                        response = send_command(st.session_state.serial_connection, command)
+                        st.session_state['last_raw_response'] = response if response is not None else ""
+                        
+                        if not response or response.strip() == "":
+                            # No response - connection might be dead
+                            st.session_state['connection_error_count'] = st.session_state.get('connection_error_count', 0) + 1
+                            if st.session_state['connection_error_count'] >= 3:
+                                st.error("⚠️ **Connection Error:** ESP32 is not responding. Please check connection.")
+                                st.session_state.connected = False
+                                st.session_state.connected_port = None
+                                try:
+                                    if st.session_state.serial_connection:
+                                        st.session_state.serial_connection.close()
+                                except Exception:
+                                    pass
+                                st.session_state.serial_connection = None
+                                st.session_state['connection_error_count'] = 0
+                                st.rerun()
+                        else:
+                            # Reset error count on successful response
+                            st.session_state['connection_error_count'] = 0
+                            readings = parse_readings(response)
+                            
+                            if not readings:
+                                # Parsing failed or no data - log but don't show error (might be no data in range)
+                                log_general_debug(f"[DEBUG] No readings parsed from response. Response length: {len(response)}")
+                                # Keep existing last_df
+                            else:
+                                df = pd.DataFrame(readings)
+                                if 'Timestamp' in df.columns:
+                                    # Convert timestamps to selected timezone
+                                    df['Timestamp'] = df['Timestamp'].apply(
+                                        lambda x: convert_timestamp_to_timezone(x, st.session_state['selected_timezone'])
+                                    )
+                                    ts_split = df['Timestamp'].apply(lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S'))
+                                    df = df.assign(
+                                        Year=ts_split.dt.year,
+                                        Month=ts_split.dt.month,
+                                        Day=ts_split.dt.day,
+                                        Hour=ts_split.dt.hour,
+                                        Minute=ts_split.dt.minute
+                                    )
+                                    # Sort DataFrame by timestamp to ensure chronological order
+                                    df = df.sort_values('Timestamp')
+                                st.session_state['last_df'] = df
+                                st.session_state['last_successful_update'] = time.time()
+                    except Exception as e:
+                        # Connection error during auto-refresh
+                        log_general_debug(f"[DEBUG] Auto-refresh error: {e}")
+                        st.session_state['connection_error_count'] = st.session_state.get('connection_error_count', 0) + 1
+                        if st.session_state['connection_error_count'] >= 3:
+                            st.error(f"⚠️ **Connection Error:** {str(e)}. Please reconnect.")
+                            st.session_state.connected = False
+                            st.session_state.connected_port = None
+                            try:
+                                if st.session_state.serial_connection:
+                                    st.session_state.serial_connection.close()
+                            except Exception:
+                                pass
+                            st.session_state.serial_connection = None
+                            st.session_state['connection_error_count'] = 0
+                            st.rerun()
+                    
                     # Note: If no response or no readings, keep existing last_df
                     st.session_state['is_auto_refresh'] = False
             else:
@@ -1068,6 +1286,8 @@ with tabs[0]:
                     st.session_state['is_auto_refresh'] = False
                     # Reset last_live_update to try again next cycle
                     st.session_state['last_live_update'] = time.time() - 5  # Wait 5 seconds before next attempt
+                    if live_view_enabled:
+                        st.warning("⚠️ **Not Connected:** Please connect to the device to enable Live View updates.")
 
         # Output below the button (only once)
         if 'last_raw_response' in st.session_state:
@@ -1089,36 +1309,45 @@ with tabs[0]:
             "Enable Live View",
             value=st.session_state['live_view_enabled'],
             key="live_view_checkbox",
-            help="Automatically refresh graph every 10 seconds with new readings"
+            help="Automatically refresh graph every 5 seconds with new readings"
         )
         st.session_state['live_view_enabled'] = live_view_enabled
-        # Reset timestamp when Live View is toggled on (to trigger immediate fetch)
+        # Capture timestamp when Live View is enabled (use as starting point)
         if live_view_enabled and not previous_live_view_state:
+            # Store the current timestamp when Live View is first enabled
+            st.session_state['live_view_start_timestamp'] = datetime.now()
+            # Set last_live_update to past time to trigger immediate data fetch
+            st.session_state['last_live_update'] = time.time() - 6.0  # Ensures immediate trigger
+            # Clear existing displayed data to restart graph from Live View start time
+            # This doesn't delete data from device, only clears the display
+            st.session_state['last_df'] = None
+            st.session_state['last_raw_response'] = None
+            st.session_state['last_successful_update'] = None
+        # When Live View is disabled, clear the start timestamp and trigger rerun to show date range
+        elif not live_view_enabled and previous_live_view_state:
+            # Live View was just disabled - clear state and rerun to show date range section
+            st.session_state['live_view_start_timestamp'] = None
             st.session_state['last_live_update'] = 0
-        
-        # Always show Initial Date/Time inputs below the checkbox
-        live_view_initial_date = st.date_input(
-            "Live View Initial Date:",
-            value=st.session_state['live_view_initial_date'],
-            key="live_view_initial_date_input"
-        )
-        live_view_initial_time = st.time_input(
-            "Live View Initial Time:",
-            value=st.session_state['live_view_initial_time'],
-            key="live_view_initial_time_input"
-        )
-        st.session_state['live_view_initial_date'] = live_view_initial_date
-        st.session_state['live_view_initial_time'] = live_view_initial_time
+            st.session_state['is_auto_refresh'] = False
+            st.rerun()  # Rerun to immediately show the date range section
         
         # Show status message based on Live View state
         if live_view_enabled:
-            st.info("🔄 **Live View Active:** Graph will auto-update every 10 seconds from Initial Date/Time to now.")
+            if st.session_state.connected:
+                st.info("🔄 **Live View Active:** Graph will auto-update every 5 seconds from when Live View was enabled to now.")
+            else:
+                # Live View is enabled but connection was lost (possibly due to browser disconnection)
+                st.warning("⚠️ **Live View Enabled but Not Connected:** Please reconnect to the device to resume auto-updates. Live View will continue from where it left off once reconnected.")
         else:
             st.info("💡 Enable Live View to automatically refresh the temperature graph with new readings.")
         
         if st.session_state.get('last_df') is not None:
             st.header("📋 RFID Readings")
-            st.dataframe(st.session_state['last_df'], use_container_width=True)
+            df_display = st.session_state['last_df']
+            if df_display.empty:
+                st.warning("⚠️ **No Data Available:** The data frame is empty. Please retrieve data or check device connection.")
+            else:
+                st.dataframe(df_display, use_container_width=True)
             csv = st.session_state['last_df'].to_csv(index=False)
             st.download_button(
                 label="📥 Download CSV",
@@ -1171,6 +1400,9 @@ with tabs[0]:
                             title=f"Temperature vs Timestamp by Tag ({timezone_display})",
                             labels={"Temperature_C": "Temperature (°C)", "Timestamp": "Timestamp", "Tag": "Tag"}
                         )
+                        
+                        # Add markers (dots) to each reading point
+                        fig.update_traces(mode='lines+markers', marker=dict(size=5, symbol='circle'))
                         
                         # Improve plot configuration for better data visibility
                         fig.update_layout(
@@ -1278,12 +1510,34 @@ with tabs[0]:
     else:
         st.info("🔌 Please connect to your RFID reader using the sidebar.")
     
-    # Auto-rerun for Live View (keep refreshing every 10 seconds)
+    # Auto-rerun for Live View (keep refreshing every 5 seconds)
+    # NOTE: Live View continues working even when tab is inactive or computer is locked.
+    # The Streamlit server keeps running, and auto-refresh continues. WebSocket errors occur
+    # when the browser disconnects (screen saver, lock), but these are handled gracefully.
+    # When browser reconnects, Live View automatically resumes.
     if st.session_state.get('live_view_enabled', False) and st.session_state.connected:
         # Use a small delay and rerun to keep the auto-refresh loop going
-        # This ensures the page checks every ~1 second if 10 seconds have passed
-        time.sleep(0.1)
-        st.rerun()
+        # This ensures the page checks every ~1 second if 5 seconds have passed
+        try:
+            time.sleep(0.1)
+            st.rerun()
+        except Exception as e:
+            # Handle WebSocket disconnection errors gracefully (browser closed, computer locked, etc.)
+            # These errors are expected when browser disconnects and can be safely ignored.
+            # The Streamlit server continues running, so Live View state is preserved.
+            # When browser reconnects, the session state is restored and Live View resumes.
+            error_msg = str(e).lower()
+            if 'websocket' in error_msg or 'stream' in error_msg or 'closed' in error_msg:
+                # Browser disconnected - stop auto-refresh gracefully
+                # Session state will be preserved, and when browser reconnects, Live View will resume
+                log_general_debug(f"[DEBUG] Browser disconnected during Live View auto-refresh (expected): {e}")
+                # Don't raise - just stop the rerun loop
+                # The Streamlit server continues running, so when browser reconnects, Live View resumes
+                pass
+            else:
+                # Unexpected error - log it but don't crash
+                log_general_debug(f"[DEBUG] Unexpected error during Live View auto-refresh: {e}")
+                pass
 
 with tabs[1]:
     st.title("⚙️ Configuration")
