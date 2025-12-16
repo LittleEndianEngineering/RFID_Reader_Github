@@ -108,7 +108,7 @@ unsigned long startTime = 0;
 // =============================================================================
 
 #define BUTTON_PIN 37        // Push button (INPUT_PULLUP): pressed = LOW
-#define RFID_PWR_PIN 40      // RFID power control (active LOW)
+#define RFID_PWR_PIN 36      // RFID power control (active LOW)
 #define RFID_TX_PIN 48       // RFID serial
 
 // I2C Pins for RTC (DS1307) - ESP32-S3 Safe Pins

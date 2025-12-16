@@ -1067,84 +1067,126 @@ with tabs[0]:
         )
         st.session_state['selected_timezone'] = selected_timezone
         
-        # Date Range Section (only show when Live View is disabled)
-        # Read Live View state from session state - checkbox will update this on rerun
-        live_view_enabled_for_date_range = st.session_state.get('live_view_enabled', False)
+        # Date Range Section (always visible, but Retrieve Data button is disabled when Live View is active)
+        # Read Live View state - use checkbox state as source of truth since checkbox is processed later
+        # Also check stop flag - if stop was requested, Live View is definitely disabled
+        # CRITICAL: Read checkbox state directly and check stop flag to determine if Live View is truly enabled
+        checkbox_state_for_date_range = st.session_state.get('live_view_checkbox', False)
+        stop_requested_for_date_range = st.session_state.get('live_view_stop_requested', False)
+        # Live View is enabled only if checkbox is checked AND stop was NOT requested
+        # If stop was requested OR checkbox is unchecked, Live View is disabled and button should be enabled
+        live_view_enabled_for_date_range = checkbox_state_for_date_range and not stop_requested_for_date_range
         
-        # When Live View is disabled, ensure date range section is shown
-        # This handles the case where Live View was just disabled
-        if not live_view_enabled_for_date_range:
-            st.header("📅 Select Date Range")
-            col1, col2 = st.columns(2)
-            with col1:
-                start_date = st.date_input(
-                    "Start Date:",
-                    value=datetime.now().date() - timedelta(days=7)
-                )
-                start_time = st.time_input("Start Time:", value=dt_time(0, 0))
-            with col2:
-                end_date = st.date_input(
-                    "End Date:",
-                    value=datetime.now().date()
-                )
-                end_time = st.time_input("End Time:", value=dt_time(0, 0))
-            start_dt = datetime.combine(start_date, start_time)
-            end_dt = datetime.combine(end_date, end_time)
-            
-            # Convert selected timezone to UTC for ESP32 query
-            # ESP32 stores all readings in UTC, so we need to convert user's local time to UTC
-            import pytz
-            local_tz = pytz.timezone(selected_timezone)
-            # Use localize() to attach timezone info to naive datetime
-            # is_dst=None will raise exception on ambiguous times (better than guessing)
-            try:
-                start_dt_local = local_tz.localize(start_dt, is_dst=None)
-                end_dt_local = local_tz.localize(end_dt, is_dst=None)
-            except pytz.AmbiguousTimeError:
-                # Handle ambiguous time (DST transition) by using the later occurrence
-                start_dt_local = local_tz.localize(start_dt, is_dst=False)
-                end_dt_local = local_tz.localize(end_dt, is_dst=False)
-            except pytz.NonExistentTimeError:
-                # Handle non-existent time (DST transition) by using the next valid time
-                start_dt_local = local_tz.localize(start_dt, is_dst=True)
-                end_dt_local = local_tz.localize(end_dt, is_dst=True)
-            # Convert to UTC epoch timestamps for ESP32
-            start_epoch = int(start_dt_local.astimezone(pytz.UTC).timestamp())
-            end_epoch = int(end_dt_local.astimezone(pytz.UTC).timestamp())
+        # Always show date range section (no longer hidden when Live View is enabled)
+        st.header("📅 Select Date Range")
+        col1, col2 = st.columns(2)
+        with col1:
+            start_date = st.date_input(
+                "Start Date:",
+                value=datetime.now().date() - timedelta(days=7)
+            )
+            start_time = st.time_input("Start Time:", value=dt_time(0, 0))
+        with col2:
+            end_date = st.date_input(
+                "End Date:",
+                value=datetime.now().date()
+            )
+            end_time = st.time_input("End Time:", value=dt_time(0, 0))
+        start_dt = datetime.combine(start_date, start_time)
+        end_dt = datetime.combine(end_date, end_time)
+        
+        # Convert selected timezone to UTC for ESP32 query
+        # ESP32 stores all readings in UTC, so we need to convert user's local time to UTC
+        import pytz
+        local_tz = pytz.timezone(selected_timezone)
+        # Use localize() to attach timezone info to naive datetime
+        # is_dst=None will raise exception on ambiguous times (better than guessing)
+        try:
+            start_dt_local = local_tz.localize(start_dt, is_dst=None)
+            end_dt_local = local_tz.localize(end_dt, is_dst=None)
+        except pytz.AmbiguousTimeError:
+            # Handle ambiguous time (DST transition) by using the later occurrence
+            start_dt_local = local_tz.localize(start_dt, is_dst=False)
+            end_dt_local = local_tz.localize(end_dt, is_dst=False)
+        except pytz.NonExistentTimeError:
+            # Handle non-existent time (DST transition) by using the next valid time
+            start_dt_local = local_tz.localize(start_dt, is_dst=True)
+            end_dt_local = local_tz.localize(end_dt, is_dst=True)
+        # Convert to UTC epoch timestamps for ESP32
+        start_epoch = int(start_dt_local.astimezone(pytz.UTC).timestamp())
+        end_epoch = int(end_dt_local.astimezone(pytz.UTC).timestamp())
 
-            # Always show Retrieve Data button right below pickers
-            retrieve_clicked = st.button("🔍 Retrieve Data", type="primary")
-        else:
+        # Initialize Live View date range variables (used for auto-refresh)
+        # These will be recalculated if Live View is enabled
+        start_epoch_live = None
+        end_epoch_live = None
+        
+        # Check Live View state BEFORE calculating date range
+        # We need to check the checkbox state directly here, not the calculated variable
+        # because the checkbox is processed later in the code
+        live_view_checkbox_state_for_calc = st.session_state.get('live_view_checkbox', False)
+        stop_requested_for_calc = st.session_state.get('live_view_stop_requested', False)
+        live_view_truly_enabled_for_calc = live_view_checkbox_state_for_calc and not stop_requested_for_calc
+        
+        # When Live View is enabled, prepare date range from when checkbox was enabled to now
+        # This is used for auto-refresh, not for manual Retrieve Data button
+        if live_view_truly_enabled_for_calc:
             # Live View is enabled - prepare date range from when checkbox was enabled to now
-            if st.session_state.get('live_view_start_timestamp') is not None:
-                start_dt = st.session_state['live_view_start_timestamp']
+            # Always use the stored start timestamp (set when Live View was enabled)
+            # If not set, use current time as fallback (shouldn't happen, but safety check)
+            live_view_start = st.session_state.get('live_view_start_timestamp')
+            if live_view_start is not None:
+                start_dt_live = live_view_start
             else:
-                # Fallback: use current time if timestamp not set
-                start_dt = datetime.now()
-            end_dt = datetime.now()
+                # Fallback: use current time if timestamp not set (shouldn't happen)
+                start_dt_live = datetime.now()
+                # Store it for consistency
+                st.session_state['live_view_start_timestamp'] = start_dt_live
+            end_dt_live = datetime.now()  # Always use current time as end
             
             # Convert selected timezone to UTC for ESP32 query
             import pytz
             local_tz = pytz.timezone(selected_timezone)
             try:
-                start_dt_local = local_tz.localize(start_dt, is_dst=None)
-                end_dt_local = local_tz.localize(end_dt, is_dst=None)
+                start_dt_local_live = local_tz.localize(start_dt_live, is_dst=None)
+                end_dt_local_live = local_tz.localize(end_dt_live, is_dst=None)
             except pytz.AmbiguousTimeError:
-                start_dt_local = local_tz.localize(start_dt, is_dst=False)
-                end_dt_local = local_tz.localize(end_dt, is_dst=False)
+                start_dt_local_live = local_tz.localize(start_dt_live, is_dst=False)
+                end_dt_local_live = local_tz.localize(end_dt_live, is_dst=False)
             except pytz.NonExistentTimeError:
-                start_dt_local = local_tz.localize(start_dt, is_dst=True)
-                end_dt_local = local_tz.localize(end_dt, is_dst=True)
-            # Convert to UTC epoch timestamps for ESP32
-            start_epoch = int(start_dt_local.astimezone(pytz.UTC).timestamp())
-            end_epoch = int(end_dt_local.astimezone(pytz.UTC).timestamp())
-            
-            retrieve_clicked = False  # No manual retrieve button when Live View is enabled
+                start_dt_local_live = local_tz.localize(start_dt_live, is_dst=True)
+                end_dt_local_live = local_tz.localize(end_dt_live, is_dst=True)
+            # Convert to UTC epoch timestamps for ESP32 (used for Live View auto-refresh)
+            start_epoch_live = int(start_dt_local_live.astimezone(pytz.UTC).timestamp())
+            end_epoch_live = int(end_dt_local_live.astimezone(pytz.UTC).timestamp())
+
+        # Retrieve Data button - disabled when Live View is active
+        retrieve_clicked = st.button(
+            "🔍 Retrieve Data", 
+            type="primary",
+            disabled=live_view_enabled_for_date_range,
+            help="Disabled while Live View is active. Disable Live View to use this button."
+        )
         
         # Auto-refresh logic for Live View
         should_auto_refresh = False
-        live_view_enabled = st.session_state.get('live_view_enabled', False)
-        if live_view_enabled and st.session_state.connected:
+        # Read Live View state - use checkbox state as source of truth since it's updated by user interaction
+        # The checkbox state is the authoritative source, session state might be stale at this point in execution
+        live_view_checkbox_state = st.session_state.get('live_view_checkbox', False)
+        stop_requested_for_refresh = st.session_state.get('live_view_stop_requested', False)
+        live_view_enabled_for_refresh = live_view_checkbox_state and not stop_requested_for_refresh
+        # CRITICAL: Do NOT sync session state here - it's managed by checkbox processing section
+        # The checkbox processing section (later in code) is the authoritative source for state
+        # We only use this calculated value for determining if auto-refresh should run
+        # Setting session state here can cause conflicts with checkbox processing
+        
+        # CRITICAL: Only enable auto-refresh if:
+        # 1. Live View is enabled
+        # 2. Device is connected
+        # 3. Live View date range is calculated (start_epoch_live is set)
+        # This prevents auto-refresh from running before the Live View timestamp is ready
+        # and prevents using picker date range when Live View is first enabled
+        if live_view_enabled_for_refresh and st.session_state.connected and start_epoch_live is not None:
             # Validate connection before attempting auto-refresh
             if not is_serial_valid(st.session_state.serial_connection):
                 st.error("⚠️ **Connection Lost:** Serial port is no longer valid. Please reconnect.")
@@ -1154,14 +1196,25 @@ with tabs[0]:
                 st.rerun()
             else:
                 current_time = time.time()
-                time_since_last_update = current_time - st.session_state['last_live_update']
-                if time_since_last_update >= 5.0:  # 5 seconds have passed
-                    should_auto_refresh = True
-                    st.session_state['is_auto_refresh'] = True
-                    st.session_state['last_live_update'] = current_time
+                last_update = st.session_state.get('last_live_update', 0)
+                time_since_last_update = current_time - last_update
+                # Check if 5 seconds have passed OR if last_update is 0 (first fetch after enabling Live View)
+                if time_since_last_update >= 5.0 or last_update == 0:
+                    # Double-check checkbox state hasn't changed (user might have unchecked during this run)
+                    if st.session_state.get('live_view_checkbox', False):
+                        should_auto_refresh = True
+                        st.session_state['is_auto_refresh'] = True
+                        st.session_state['last_live_update'] = current_time
+                    else:
+                        # Checkbox was unchecked - stop auto-refresh immediately
+                        st.session_state['is_auto_refresh'] = False
+                        st.session_state['live_view_enabled'] = False
+                        st.session_state['last_live_update'] = 0
         
         # Retrieve data (either manual or auto-refresh)
-        if retrieve_clicked or should_auto_refresh:
+        # IMPORTANT: Only allow manual retrieve if Live View is NOT enabled
+        # If Live View is enabled, retrieve_clicked should be False (button is disabled)
+        if (retrieve_clicked and not live_view_enabled_for_date_range) or should_auto_refresh:
             if should_auto_refresh:
                 # Silent auto-refresh - no spinner to avoid page jumps
                 pass
@@ -1171,6 +1224,7 @@ with tabs[0]:
             # Only fetch if connected
             if st.session_state.connected and is_serial_valid(st.session_state.serial_connection):
                 if not should_auto_refresh:
+                    # Manual retrieve - use picker date range
                     with st.spinner("Retrieving data from RFID reader..."):
                         command = f"range {start_epoch} {end_epoch}"
                         response = send_command(st.session_state.serial_connection, command)
@@ -1212,17 +1266,76 @@ with tabs[0]:
                             pass
                     st.session_state['new_query'] = False
                 else:
-                    # Auto-refresh: fetch data silently
-                    command = f"range {start_epoch} {end_epoch}"
-                    try:
-                        response = send_command(st.session_state.serial_connection, command)
-                        st.session_state['last_raw_response'] = response if response is not None else ""
+                    # Auto-refresh: fetch data silently using Live View date range
+                    # CRITICAL: Only proceed if Live View date range is calculated (start_epoch_live is set)
+                    # This prevents using picker date range when Live View is first enabled
+                    if live_view_enabled_for_refresh and start_epoch_live is not None:
+                        # Recalculate end time to current time for each refresh
+                        end_dt_live_now = datetime.now()
+                        import pytz
+                        local_tz = pytz.timezone(selected_timezone)
+                        try:
+                            end_dt_local_live_now = local_tz.localize(end_dt_live_now, is_dst=None)
+                        except pytz.AmbiguousTimeError:
+                            end_dt_local_live_now = local_tz.localize(end_dt_live_now, is_dst=False)
+                        except pytz.NonExistentTimeError:
+                            end_dt_local_live_now = local_tz.localize(end_dt_live_now, is_dst=True)
+                        end_epoch_live_now = int(end_dt_local_live_now.astimezone(pytz.UTC).timestamp())
+                        command = f"range {start_epoch_live} {end_epoch_live_now}"
                         
-                        if not response or response.strip() == "":
-                            # No response - connection might be dead
+                        try:
+                            response = send_command(st.session_state.serial_connection, command)
+                            st.session_state['last_raw_response'] = response if response is not None else ""
+                            
+                            if not response or response.strip() == "":
+                                # No response - connection might be dead
+                                st.session_state['connection_error_count'] = st.session_state.get('connection_error_count', 0) + 1
+                                if st.session_state['connection_error_count'] >= 3:
+                                    st.error("⚠️ **Connection Error:** ESP32 is not responding. Please check connection.")
+                                    st.session_state.connected = False
+                                    st.session_state.connected_port = None
+                                    try:
+                                        if st.session_state.serial_connection:
+                                            st.session_state.serial_connection.close()
+                                    except Exception:
+                                        pass
+                                    st.session_state.serial_connection = None
+                                    st.session_state['connection_error_count'] = 0
+                                    st.rerun()
+                            else:
+                                # Reset error count on successful response
+                                st.session_state['connection_error_count'] = 0
+                                readings = parse_readings(response)
+                                
+                                if not readings:
+                                    # Parsing failed or no data - log but don't show error (might be no data in range)
+                                    log_general_debug(f"[DEBUG] No readings parsed from response. Response length: {len(response)}")
+                                    # Keep existing last_df
+                                else:
+                                    df = pd.DataFrame(readings)
+                                    if 'Timestamp' in df.columns:
+                                        # Convert timestamps to selected timezone
+                                        df['Timestamp'] = df['Timestamp'].apply(
+                                            lambda x: convert_timestamp_to_timezone(x, st.session_state['selected_timezone'])
+                                        )
+                                        ts_split = df['Timestamp'].apply(lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S'))
+                                        df = df.assign(
+                                            Year=ts_split.dt.year,
+                                            Month=ts_split.dt.month,
+                                            Day=ts_split.dt.day,
+                                            Hour=ts_split.dt.hour,
+                                            Minute=ts_split.dt.minute
+                                        )
+                                        # Sort DataFrame by timestamp to ensure chronological order
+                                        df = df.sort_values('Timestamp')
+                                    st.session_state['last_df'] = df
+                                    st.session_state['last_successful_update'] = time.time()
+                        except Exception as e:
+                            # Connection error during auto-refresh
+                            log_general_debug(f"[DEBUG] Auto-refresh error: {e}")
                             st.session_state['connection_error_count'] = st.session_state.get('connection_error_count', 0) + 1
                             if st.session_state['connection_error_count'] >= 3:
-                                st.error("⚠️ **Connection Error:** ESP32 is not responding. Please check connection.")
+                                st.error(f"⚠️ **Connection Error:** {str(e)}. Please reconnect.")
                                 st.session_state.connected = False
                                 st.session_state.connected_port = None
                                 try:
@@ -1233,53 +1346,13 @@ with tabs[0]:
                                 st.session_state.serial_connection = None
                                 st.session_state['connection_error_count'] = 0
                                 st.rerun()
-                        else:
-                            # Reset error count on successful response
-                            st.session_state['connection_error_count'] = 0
-                            readings = parse_readings(response)
-                            
-                            if not readings:
-                                # Parsing failed or no data - log but don't show error (might be no data in range)
-                                log_general_debug(f"[DEBUG] No readings parsed from response. Response length: {len(response)}")
-                                # Keep existing last_df
-                            else:
-                                df = pd.DataFrame(readings)
-                                if 'Timestamp' in df.columns:
-                                    # Convert timestamps to selected timezone
-                                    df['Timestamp'] = df['Timestamp'].apply(
-                                        lambda x: convert_timestamp_to_timezone(x, st.session_state['selected_timezone'])
-                                    )
-                                    ts_split = df['Timestamp'].apply(lambda x: datetime.strptime(x, '%Y-%m-%d %H:%M:%S'))
-                                    df = df.assign(
-                                        Year=ts_split.dt.year,
-                                        Month=ts_split.dt.month,
-                                        Day=ts_split.dt.day,
-                                        Hour=ts_split.dt.hour,
-                                        Minute=ts_split.dt.minute
-                                    )
-                                    # Sort DataFrame by timestamp to ensure chronological order
-                                    df = df.sort_values('Timestamp')
-                                st.session_state['last_df'] = df
-                                st.session_state['last_successful_update'] = time.time()
-                    except Exception as e:
-                        # Connection error during auto-refresh
-                        log_general_debug(f"[DEBUG] Auto-refresh error: {e}")
-                        st.session_state['connection_error_count'] = st.session_state.get('connection_error_count', 0) + 1
-                        if st.session_state['connection_error_count'] >= 3:
-                            st.error(f"⚠️ **Connection Error:** {str(e)}. Please reconnect.")
-                            st.session_state.connected = False
-                            st.session_state.connected_port = None
-                            try:
-                                if st.session_state.serial_connection:
-                                    st.session_state.serial_connection.close()
-                            except Exception:
-                                pass
-                            st.session_state.serial_connection = None
-                            st.session_state['connection_error_count'] = 0
-                            st.rerun()
-                    
-                    # Note: If no response or no readings, keep existing last_df
-                    st.session_state['is_auto_refresh'] = False
+                        
+                        # Note: If no response or no readings, keep existing last_df
+                        st.session_state['is_auto_refresh'] = False
+                    else:
+                        # Live View enabled but date range not ready - skip this refresh
+                        st.session_state['is_auto_refresh'] = False
+                        st.session_state['last_live_update'] = time.time() - 4
             else:
                 # Not connected - keep last graph visible, don't try to fetch
                 if should_auto_refresh:
@@ -1300,39 +1373,72 @@ with tabs[0]:
             st.text("Raw response from Arduino (summary only):")
             st.code(summary)
         
-        # Live View Section (positioned right above the graph)
         st.header("📡 Live View")
         
-        # Checkbox at the top
         previous_live_view_state = st.session_state.get('live_view_enabled', False)
-        live_view_enabled = st.checkbox(
+        
+        if 'live_view_stop_requested' not in st.session_state:
+            st.session_state['live_view_stop_requested'] = False
+        
+        if 'live_view_checkbox_previous' not in st.session_state:
+            st.session_state['live_view_checkbox_previous'] = False
+        
+        live_view_checkbox_value = st.checkbox(
             "Enable Live View",
-            value=st.session_state['live_view_enabled'],
             key="live_view_checkbox",
             help="Automatically refresh graph every 5 seconds with new readings"
         )
-        st.session_state['live_view_enabled'] = live_view_enabled
-        # Capture timestamp when Live View is enabled (use as starting point)
+        
+        stop_requested_check = st.session_state.get('live_view_stop_requested', False)
+        
+        # Detect checkbox state transition (user interaction)
+        checkbox_was_checked = st.session_state.get('live_view_checkbox_previous', False)
+        checkbox_changed = (live_view_checkbox_value != checkbox_was_checked)
+        st.session_state['live_view_checkbox_previous'] = live_view_checkbox_value
+        
+        # Stop flag is authoritative - if set, Live View stays disabled until checkbox transitions to checked
+        if stop_requested_check:
+            if live_view_checkbox_value and checkbox_changed and not checkbox_was_checked:
+                st.session_state['live_view_stop_requested'] = False
+                live_view_enabled = True
+                st.session_state['live_view_enabled'] = True
+            else:
+                live_view_enabled = False
+                st.session_state['live_view_enabled'] = False
+        elif live_view_checkbox_value:
+            live_view_enabled = True
+            st.session_state['live_view_enabled'] = True
+        else:
+            if checkbox_changed:
+                st.session_state['live_view_stop_requested'] = True
+            else:
+                st.session_state['live_view_stop_requested'] = True
+            live_view_enabled = False
+            st.session_state['live_view_enabled'] = False
+        
+        # Capture timestamp when Live View is enabled
         if live_view_enabled and not previous_live_view_state:
-            # Store the current timestamp when Live View is first enabled
-            st.session_state['live_view_start_timestamp'] = datetime.now()
-            # Set last_live_update to past time to trigger immediate data fetch
-            st.session_state['last_live_update'] = time.time() - 6.0  # Ensures immediate trigger
-            # Clear existing displayed data to restart graph from Live View start time
-            # This doesn't delete data from device, only clears the display
+            current_timestamp = datetime.now()
+            st.session_state['live_view_start_timestamp'] = current_timestamp
+            st.session_state['last_live_update'] = 0
             st.session_state['last_df'] = None
             st.session_state['last_raw_response'] = None
             st.session_state['last_successful_update'] = None
-        # When Live View is disabled, clear the start timestamp and trigger rerun to show date range
+            st.session_state['is_auto_refresh'] = False
+            st.rerun()
         elif not live_view_enabled and previous_live_view_state:
-            # Live View was just disabled - clear state and rerun to show date range section
+            st.session_state['live_view_stop_requested'] = True
             st.session_state['live_view_start_timestamp'] = None
             st.session_state['last_live_update'] = 0
             st.session_state['is_auto_refresh'] = False
-            st.rerun()  # Rerun to immediately show the date range section
         
         # Show status message based on Live View state
-        if live_view_enabled:
+        # Use the same logic as the button to determine if Live View is truly enabled
+        live_view_status_checkbox = st.session_state.get('live_view_checkbox', False)
+        live_view_status_stop = st.session_state.get('live_view_stop_requested', False)
+        live_view_status_enabled = live_view_status_checkbox and not live_view_status_stop
+        
+        if live_view_status_enabled:
             if st.session_state.connected:
                 st.info("🔄 **Live View Active:** Graph will auto-update every 5 seconds from when Live View was enabled to now.")
             else:
@@ -1510,34 +1616,43 @@ with tabs[0]:
     else:
         st.info("🔌 Please connect to your RFID reader using the sidebar.")
     
-    # Auto-rerun for Live View (keep refreshing every 5 seconds)
-    # NOTE: Live View continues working even when tab is inactive or computer is locked.
-    # The Streamlit server keeps running, and auto-refresh continues. WebSocket errors occur
-    # when the browser disconnects (screen saver, lock), but these are handled gracefully.
-    # When browser reconnects, Live View automatically resumes.
-    if st.session_state.get('live_view_enabled', False) and st.session_state.connected:
-        # Use a small delay and rerun to keep the auto-refresh loop going
-        # This ensures the page checks every ~1 second if 5 seconds have passed
+    # Auto-rerun for Live View (refreshes every 5 seconds)
+    # Live View continues even when browser disconnects (screen saver, lock, etc.)
+    # WebSocket errors are expected and handled gracefully - Live View state persists
+    session_state_live_view = st.session_state.get('live_view_enabled', False)
+    stop_requested = st.session_state.get('live_view_stop_requested', False)
+    
+    if session_state_live_view and not stop_requested and st.session_state.connected:
         try:
             time.sleep(0.1)
             st.rerun()
         except Exception as e:
-            # Handle WebSocket disconnection errors gracefully (browser closed, computer locked, etc.)
-            # These errors are expected when browser disconnects and can be safely ignored.
-            # The Streamlit server continues running, so Live View state is preserved.
-            # When browser reconnects, the session state is restored and Live View resumes.
+            # Handle WebSocket disconnection errors gracefully (screen saver, lock, browser close)
+            # These errors are expected when browser disconnects and can be safely ignored
+            # The Streamlit server continues running, so Live View state is preserved
+            # When browser reconnects, Live View automatically resumes
+            error_type = type(e).__name__
             error_msg = str(e).lower()
-            if 'websocket' in error_msg or 'stream' in error_msg or 'closed' in error_msg:
-                # Browser disconnected - stop auto-refresh gracefully
-                # Session state will be preserved, and when browser reconnects, Live View will resume
-                log_general_debug(f"[DEBUG] Browser disconnected during Live View auto-refresh (expected): {e}")
-                # Don't raise - just stop the rerun loop
-                # The Streamlit server continues running, so when browser reconnects, Live View resumes
+            error_module = type(e).__module__.lower() if hasattr(type(e), '__module__') else ''
+            
+            # Catch all WebSocket/Stream/Tornado related errors
+            # These occur when browser disconnects (screen saver, lock, etc.)
+            # Background tasks may raise these errors, but they don't affect Live View state
+            if any(keyword in error_type.lower() or keyword in error_msg or keyword in error_module 
+                   for keyword in ['websocket', 'stream', 'closed', 'tornado', 'iostream']):
+                # Browser disconnected - this is expected and normal
+                # Don't raise or log - just stop the rerun loop gracefully
+                # Live View state is preserved in session state
                 pass
             else:
-                # Unexpected error - log it but don't crash
-                log_general_debug(f"[DEBUG] Unexpected error during Live View auto-refresh: {e}")
+                # Unexpected error - silently ignore to prevent dashboard crash
+                # Live View will resume when browser reconnects
                 pass
+    else:
+        if session_state_live_view and not stop_requested:
+            st.session_state['live_view_stop_requested'] = True
+        st.session_state['is_auto_refresh'] = False
+        st.session_state['last_live_update'] = 0
 
 with tabs[1]:
     st.title("⚙️ Configuration")
