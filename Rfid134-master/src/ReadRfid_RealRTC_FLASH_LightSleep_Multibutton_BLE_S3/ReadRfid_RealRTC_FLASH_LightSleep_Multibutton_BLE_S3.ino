@@ -1277,7 +1277,6 @@ void printReadingsSummary() {
 }
 
 void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
-  int count = 0;
   Serial.println("[RANGE] === Range Request Start ===");
   File file = SPIFFS.open(FLASH_FILENAME, "r");
   if (!file) { 
@@ -1285,76 +1284,111 @@ void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
     Serial.println("<DASHBOARD_DATA>\n---BEGIN_READINGS---\n---END_READINGS---\n</DASHBOARD_DATA>"); 
     return; 
   }
-  std::vector<RfidReading> validReadings;
-  int scanned = 0; int matched = 0;
+  
+  // STREAMING APPROACH: Two-pass to avoid stack overflow
+  // Pass 1: Count matches and find first/last (store only 2 readings max)
+  int count = 0;
+  RfidReading firstReading, lastReading;
+  bool firstFound = false;
+  
   while (file.available() >= READING_SIZE) {
     RfidReading reading;
     file.read((uint8_t*)&reading, READING_SIZE);
     if (reading.timestamp > 1000000000 &&
         reading.timestamp >= startTime && reading.timestamp <= endTime) {
-      validReadings.push_back(reading);
-      matched++;
+      if (!firstFound) {
+        firstReading = reading;
+        firstFound = true;
+      }
+      lastReading = reading;  // Always update last as we scan
+      count++;
     }
-    count++; scanned++;
-    yield();
+    yield();  // Prevent watchdog timeout
   }
   file.close();
-  count = validReadings.size();
+  
+  // Print summary (same format as before)
   Serial.printf("Found %d readings in range.\n", count);
   if (count > 0) {
-    time_t ts_first = validReadings.front().timestamp;
+    time_t ts_first = firstReading.timestamp;
     struct tm* ti_first = gmtime(&ts_first);
-    if (validReadings.front().temp_raw == 0xFFFF) {
+    if (firstReading.temp_raw == 0xFFFF) {
       Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
         ti_first->tm_year + 1900, ti_first->tm_mon + 1, ti_first->tm_mday,
         ti_first->tm_hour, ti_first->tm_min, ti_first->tm_sec,
-        validReadings.front().country, validReadings.front().id);
+        firstReading.country, firstReading.id);
     } else {
-      float temp_first = validReadings.front().temp_raw / 100.0f;
-    Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
-      ti_first->tm_year + 1900, ti_first->tm_mon + 1, ti_first->tm_mday,
-      ti_first->tm_hour, ti_first->tm_min, ti_first->tm_sec,
-      validReadings.front().country, validReadings.front().id, temp_first);
+      float temp_first = firstReading.temp_raw / 100.0f;
+      Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
+        ti_first->tm_year + 1900, ti_first->tm_mon + 1, ti_first->tm_mday,
+        ti_first->tm_hour, ti_first->tm_min, ti_first->tm_sec,
+        firstReading.country, firstReading.id, temp_first);
     }
-    time_t ts_last = validReadings.back().timestamp;
+    time_t ts_last = lastReading.timestamp;
     struct tm* ti_last = gmtime(&ts_last);
-    if (validReadings.back().temp_raw == 0xFFFF) {
+    if (lastReading.temp_raw == 0xFFFF) {
       Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
         ti_last->tm_year + 1900, ti_last->tm_mon + 1, ti_last->tm_mday,
         ti_last->tm_hour, ti_last->tm_min, ti_last->tm_sec,
-        validReadings.back().country, validReadings.back().id);
+        lastReading.country, lastReading.id);
     } else {
-      float temp_last = validReadings.back().temp_raw / 100.0f;
-    Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
-      ti_last->tm_year + 1900, ti_last->tm_mon + 1, ti_last->tm_mday,
-      ti_last->tm_hour, ti_last->tm_min, ti_last->tm_sec,
-      validReadings.back().country, validReadings.back().id, temp_last);
+      float temp_last = lastReading.temp_raw / 100.0f;
+      Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
+        ti_last->tm_year + 1900, ti_last->tm_mon + 1, ti_last->tm_mday,
+        ti_last->tm_hour, ti_last->tm_min, ti_last->tm_sec,
+        lastReading.country, lastReading.id, temp_last);
     }
   } else {
     Serial.println("None");
   }
 
+  // Pass 2: Stream all matching readings directly (no vector storage)
   Serial.println("<DASHBOARD_DATA>");
   Serial.println("---BEGIN_READINGS---");
-  for (size_t i = 0; i < validReadings.size(); ++i) {
-    time_t timestamp = validReadings[i].timestamp;
-    struct tm* ti = gmtime(&timestamp);
-    if (validReadings[i].temp_raw == 0xFFFF) {
-      Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
-        (int)(i + 1), ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
-        ti->tm_hour, ti->tm_min, ti->tm_sec,
-        validReadings[i].country, validReadings[i].id);
-    } else {
-      float temp = validReadings[i].temp_raw / 100.0f;
-    Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
-      (int)(i + 1), ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
-      ti->tm_hour, ti->tm_min, ti->tm_sec,
-      validReadings[i].country, validReadings[i].id, temp);
-    }
+  
+  file = SPIFFS.open(FLASH_FILENAME, "r");
+  if (!file) {
+    Serial.println("---END_READINGS---");
+    Serial.println("</DASHBOARD_DATA>");
+    Serial.println("[RANGE] === Range Request End ===");
+    return;
   }
+  
+  int readingNum = 0;
+  while (file.available() >= READING_SIZE) {
+    RfidReading reading;
+    file.read((uint8_t*)&reading, READING_SIZE);
+    if (reading.timestamp > 1000000000 &&
+        reading.timestamp >= startTime && reading.timestamp <= endTime) {
+      readingNum++;
+      time_t timestamp = reading.timestamp;
+      struct tm* ti = gmtime(&timestamp);
+      if (reading.temp_raw == 0xFFFF) {
+        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
+          readingNum, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+          ti->tm_hour, ti->tm_min, ti->tm_sec,
+          reading.country, reading.id);
+      } else {
+        float temp = reading.temp_raw / 100.0f;
+        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
+          readingNum, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+          ti->tm_hour, ti->tm_min, ti->tm_sec,
+          reading.country, reading.id, temp);
+      }
+      // Yield periodically to prevent watchdog timeout and allow serial transmission
+      if (readingNum % 50 == 0) {
+        yield();
+        Serial.flush();  // Ensure data is sent before continuing
+      }
+    }
+    yield();  // Yield on every iteration to prevent blocking
+  }
+  file.close();
+  
   Serial.println("---END_READINGS---");
   Serial.println("</DASHBOARD_DATA>");
   Serial.println("[RANGE] === Range Request End ===");
+  Serial.flush();  // Ensure final data is sent
 }
 
 // Helper function to check if temperature data is available

@@ -1604,15 +1604,6 @@ with tabs[0]:
                 st.error("❌ ESP32 not responding")
         
         st.divider()
-        
-        st.subheader("🔘 Multi-Button Control")
-        
-        # Button Mode Button
-        if st.button("🔘 Button Mode", use_container_width=True):
-            response = send_command(st.session_state.serial_connection, "buttonmode")
-            if response:
-                st.text("Multi-Button Status:")
-                st.code(response)
     else:
         st.info("🔌 Please connect to your RFID reader using the sidebar.")
     
