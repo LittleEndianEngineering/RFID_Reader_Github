@@ -11,3 +11,9 @@ typedef struct RfidReading {
   uint8_t  flags;
   uint8_t  reserved;
 } RfidReading;
+
+// RfidReading::flags bit layout.
+static const uint8_t FLAG_IS_DATA  = 0x01;
+static const uint8_t FLAG_IS_ANIMAL = 0x02;
+static const uint8_t FLAG_ANT1 = 0x04;
+static const uint8_t FLAG_ANT2 = 0x08;

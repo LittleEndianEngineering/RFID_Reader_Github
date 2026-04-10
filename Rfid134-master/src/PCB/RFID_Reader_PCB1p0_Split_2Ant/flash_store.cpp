@@ -7,6 +7,13 @@
 
 static const char* FLASH_TMP_FILENAME = "/readings.tmp";
 
+static const char* antennaFromFlags(uint8_t flags) {
+  if (flags & FLAG_ANT2) return "ANT2";
+  // Default to ANT1 for backward compatibility with old stored records
+  // that predate antenna metadata.
+  return "ANT1";
+}
+
 // Drop exactly one oldest reading by compacting records [1..end] into a temp file.
 static bool dropOldestReadingFIFO() {
   File inFile = SPIFFS.open(FLASH_FILENAME, "r");
@@ -154,16 +161,16 @@ void printStoredReadings() {
       
       // Check if temperature is available (0xFFFF = marker for N/A)
       if (reading.temp_raw == 0xFFFF) {
-        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
+        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A, %s\n",
                       i + 1, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
                       ti->tm_hour, ti->tm_min, ti->tm_sec,
-                      reading.country, reading.id);
+                      reading.country, reading.id, antennaFromFlags(reading.flags));
       } else {
         float temp = reading.temp_raw / 100.0f;
-        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
+        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C, %s\n",
                       i + 1, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
                       ti->tm_hour, ti->tm_min, ti->tm_sec,
-                      reading.country, reading.id, temp);
+                      reading.country, reading.id, temp, antennaFromFlags(reading.flags));
       }
     }
     i++; yield();
@@ -193,16 +200,16 @@ void printLastReading() {
         
         // Check if temperature is available (0xFFFF = marker for N/A)
         if (reading.temp_raw == 0xFFFF) {
-          Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
+          Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A, %s\n",
                         totalReadings, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
                         ti->tm_hour, ti->tm_min, ti->tm_sec,
-                        reading.country, reading.id);
+                        reading.country, reading.id, antennaFromFlags(reading.flags));
         } else {
           float temp = reading.temp_raw / 100.0f;
-          Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
+          Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C, %s\n",
                         totalReadings, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
                         ti->tm_hour, ti->tm_min, ti->tm_sec,
-                        reading.country, reading.id, temp);
+                        reading.country, reading.id, temp, antennaFromFlags(reading.flags));
         }
       }
     }
@@ -297,30 +304,30 @@ void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
     time_t ts_first = firstReading.timestamp;
     struct tm* ti_first = gmtime(&ts_first);
     if (firstReading.temp_raw == 0xFFFF) {
-      Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
+      Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A, %s\n",
         ti_first->tm_year + 1900, ti_first->tm_mon + 1, ti_first->tm_mday,
         ti_first->tm_hour, ti_first->tm_min, ti_first->tm_sec,
-        firstReading.country, firstReading.id);
+        firstReading.country, firstReading.id, antennaFromFlags(firstReading.flags));
     } else {
       float temp_first = firstReading.temp_raw / 100.0f;
-      Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
+      Serial.printf("First: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC, %s\n",
         ti_first->tm_year + 1900, ti_first->tm_mon + 1, ti_first->tm_mday,
         ti_first->tm_hour, ti_first->tm_min, ti_first->tm_sec,
-        firstReading.country, firstReading.id, temp_first);
+        firstReading.country, firstReading.id, temp_first, antennaFromFlags(firstReading.flags));
     }
     time_t ts_last = lastReading.timestamp;
     struct tm* ti_last = gmtime(&ts_last);
     if (lastReading.temp_raw == 0xFFFF) {
-      Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
+      Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A, %s\n",
         ti_last->tm_year + 1900, ti_last->tm_mon + 1, ti_last->tm_mday,
         ti_last->tm_hour, ti_last->tm_min, ti_last->tm_sec,
-        lastReading.country, lastReading.id);
+        lastReading.country, lastReading.id, antennaFromFlags(lastReading.flags));
     } else {
       float temp_last = lastReading.temp_raw / 100.0f;
-      Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC\n",
+      Serial.printf("Last: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2fC, %s\n",
         ti_last->tm_year + 1900, ti_last->tm_mon + 1, ti_last->tm_mday,
         ti_last->tm_hour, ti_last->tm_min, ti_last->tm_sec,
-        lastReading.country, lastReading.id, temp_last);
+        lastReading.country, lastReading.id, temp_last, antennaFromFlags(lastReading.flags));
     }
   } else {
     Serial.println("None");
@@ -348,16 +355,16 @@ void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
       time_t timestamp = reading.timestamp;
       struct tm* ti = gmtime(&timestamp);
       if (reading.temp_raw == 0xFFFF) {
-        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A\n",
+        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A, %s\n",
           readingNum, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
           ti->tm_hour, ti->tm_min, ti->tm_sec,
-          reading.country, reading.id);
+          reading.country, reading.id, antennaFromFlags(reading.flags));
       } else {
         float temp = reading.temp_raw / 100.0f;
-        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C\n",
+        Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C, %s\n",
           readingNum, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
           ti->tm_hour, ti->tm_min, ti->tm_sec,
-          reading.country, reading.id, temp);
+          reading.country, reading.id, temp, antennaFromFlags(reading.flags));
       }
       // Yield periodically to prevent watchdog timeout and allow serial transmission
       if (readingNum % 50 == 0) {

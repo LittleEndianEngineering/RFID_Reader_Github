@@ -93,8 +93,7 @@ void setup() {
     Serial.println("[DASHBOARD] *** DASHBOARD MODE RESTORED (Persistent) ***");
     Serial.println("[DASHBOARD] ESP32 will stay awake - no periodic reads");
     Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
-    Serial.println("[DASHBOARD] LED set to RED - Dashboard Mode active");
-    setLEDStatus("dashboard_active");  // Red LED for dashboard mode
+    Serial.println("[DASHBOARD] LED update deferred until boot completes");
     startBLEAdvertising();  // Start BLE advertising for mobile apps
     Serial.printf("[DASHBOARD] Verification: dashboardModeActive=%s, LED status=%s\n", 
                   dashboardModeActive ? "true" : "false", currentLEDStatus.c_str());
@@ -120,7 +119,9 @@ void setup() {
   pinMode(RFID_PWR_PIN, OUTPUT); // Initialize RFID Module
   // ANT1 default path: ANT_SEL pin in HiZ (input, no drive)
   pinMode(ANT_SEL_PIN, INPUT);
+  initSocSensor();
   Serial.println("[BOOT] RFID initialized");
+  printBatterySoc("Boot init");
 
   Serial.println("[BOOT] Checking stored readings...");
   // concise summary instead of dumping all readings
@@ -153,17 +154,16 @@ void setup() {
   Serial.println("[BOOT] Setup complete");
   Serial.println("[BOOT] ESP32-S3 RFID Reader ready - USB connection stable");
   
-  // Set LED status AFTER all boot messages are complete
-  // CRITICAL: Don't override Dashboard Mode LED if it was restored from flash
-  if (!dashboardModeActive) {
-    if (idleModeActive) {
-      setLEDStatus("idle");  // Yellow LED for idle mode
-      Serial.printf("[IDLE] Active at boot (%s)\n", idleReasonToString(latestIdleReason));
-    } else {
-      setLEDStatus("sleeping");  // Blue LED for normal sleep mode
-    }
+  // Set LED status AFTER all boot messages are complete.
+  // Priority: idle > dashboard > sleeping.
+  if (idleModeActive) {
+    setLEDStatus("idle");  // Yellow LED for idle mode
+    Serial.printf("[IDLE] Active at boot (%s)\n", idleReasonToString(latestIdleReason));
+  } else if (dashboardModeActive) {
+    setLEDStatus("dashboard_active");  // Red LED for dashboard mode
+  } else {
+    setLEDStatus("sleeping");  // Blue LED for normal sleep mode
   }
-  // If Dashboard Mode is active, LED is already set to red in the restoration block above
   
   Serial.println(); // Blank line after boot completion
   Serial.flush();  // Ensure all messages are sent
@@ -180,14 +180,10 @@ void loop() {
   if (idleModeActive != prevIdleModeActive || latestIdleReason != prevIdleReason) {
     if (idleModeActive) {
       Serial.printf("[IDLE] ENTER (%s)\n", idleReasonToString(latestIdleReason));
-      if (!dashboardModeActive) {
-        setLEDStatus("idle");
-      }
+      setLEDStatus("idle");
     } else {
       Serial.println("[IDLE] EXIT");
-      if (!dashboardModeActive) {
-        setLEDStatus("sleeping");
-      }
+      setLEDStatus(dashboardModeActive ? "dashboard_active" : "sleeping");
     }
     prevIdleModeActive = idleModeActive;
     prevIdleReason = latestIdleReason;
@@ -344,7 +340,7 @@ void loop() {
         if (idleModeActive) {
           Serial.printf("[DASHBOARD] Idle reason: %s\n", idleReasonToString(latestIdleReason));
         }
-        setLEDStatus("dashboard_active");  // Red LED for dashboard mode
+        setLEDStatus(idleModeActive ? "idle" : "dashboard_active");
         startBLEAdvertising();  // Start BLE advertising for mobile apps
       } else {
         Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Button, Persistent) ***");

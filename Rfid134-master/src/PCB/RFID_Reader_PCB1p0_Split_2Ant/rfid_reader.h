@@ -4,7 +4,7 @@
 #include <Rfid134.h>
 
 bool isTemperatureAvailable(const Rfid134Reading& tag);
-void tryReadAndStoreTag();
+void tryReadAndStoreTag(uint8_t antennaId);
 void powerCycleRFIDModule();
 void powerOnAndReadTagWindow(unsigned long windowMs);
 

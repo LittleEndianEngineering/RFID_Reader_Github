@@ -17,3 +17,6 @@
 #define LED_RED_PIN 5        // Red anode pin
 #define LED_GREEN_PIN 6      // Green anode pin
 #define LED_BLUE_PIN 4       // Blue anode pin
+
+// SoC Reading
+#define SOC_PIN 7

@@ -1,4 +1,5 @@
 #include "globals.h"
+#include "pins.h"
 
 // WiFi Configuration (can be updated via serial commands)
 //String ssid_str = "opauly";
@@ -87,6 +88,55 @@ volatile bool timerWakePending = false;
 uint32_t wake_button_consumed = 0;
 uint32_t wake_timer_consumed = 0;
 bool lastButtonState = HIGH;
+
+// SoC configuration for linear mapping.
+// Hardware divider: R1 (battery->ADC) = 220k, R2 (ADC->GND) = 220k
+const float BATTERY_MIN_VOLTAGE = 3.52f;
+const float BATTERY_MAX_VOLTAGE = 4.15f;
+const float SOC_DIVIDER_R1_OHMS = 220000.0f;
+const float SOC_DIVIDER_R2_OHMS = 220000.0f;
+
+void initSocSensor() {
+  analogReadResolution(12);
+  analogSetPinAttenuation(SOC_PIN, ADC_11db); // Up to ~3.1V at ADC pin
+}
+
+bool readBatterySoc(float& batteryVoltage, float& socPercent, uint16_t& rawAdc, uint32_t& pinMilliVolts) {
+  rawAdc = (uint16_t)analogRead(SOC_PIN);
+  pinMilliVolts = analogReadMilliVolts(SOC_PIN);
+
+  float pinVoltage = ((float)pinMilliVolts) / 1000.0f;
+  float dividerGain = (SOC_DIVIDER_R1_OHMS + SOC_DIVIDER_R2_OHMS) / SOC_DIVIDER_R2_OHMS;
+  batteryVoltage = pinVoltage * dividerGain;
+
+  float denom = BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE;
+  if (denom <= 0.0f) {
+    socPercent = 0.0f;
+    return false;
+  }
+
+  socPercent = ((batteryVoltage - BATTERY_MIN_VOLTAGE) / denom) * 100.0f;
+  if (socPercent < 0.0f) socPercent = 0.0f;
+  if (socPercent > 100.0f) socPercent = 100.0f;
+  return true;
+}
+
+void printBatterySoc(const char* context) {
+  float batteryVoltage = 0.0f;
+  float socPercent = 0.0f;
+  uint16_t rawAdc = 0;
+  uint32_t pinMilliVolts = 0;
+
+  bool ok = readBatterySoc(batteryVoltage, socPercent, rawAdc, pinMilliVolts);
+  if (!ok) {
+    Serial.printf("[SOC] %s: invalid configuration (max <= min)\n", context);
+    return;
+  }
+
+  Serial.printf("[SOC] %s: raw=%u, pin=%lumV, battery=%.3fV, soc=%.1f%% (min=%.2fV max=%.2fV)\n",
+                context, rawAdc, (unsigned long)pinMilliVolts, batteryVoltage, socPercent,
+                BATTERY_MIN_VOLTAGE, BATTERY_MAX_VOLTAGE);
+}
 
 bool isSocBelowThreshold() {
   return socLowTestOverride;

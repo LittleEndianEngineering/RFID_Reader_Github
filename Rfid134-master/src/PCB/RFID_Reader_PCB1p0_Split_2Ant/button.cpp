@@ -56,7 +56,7 @@ void handleMultiButton() {
           if (idleModeActive) {
             Serial.printf("[DASHBOARD] Idle reason: %s\n", idleReasonToString(latestIdleReason));
           }
-          setLEDStatus("dashboard_active");  // Red LED for dashboard mode
+          setLEDStatus(idleModeActive ? "idle" : "dashboard_active");
           startBLEAdvertising();  // Start BLE advertising for mobile apps
         } else {
           Serial.println("[DASHBOARD] *** DASHBOARD MODE DEACTIVATED (Button, Persistent) ***");
