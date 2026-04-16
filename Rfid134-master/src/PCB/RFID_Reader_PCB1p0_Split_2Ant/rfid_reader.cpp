@@ -39,7 +39,7 @@ bool isTemperatureAvailable(const Rfid134Reading& tag) {
 }
 
 // --- Helper to try reading and storing a tag ---
-void tryReadAndStoreTag() {
+void tryReadAndStoreTag(uint8_t antennaId) {
   if (lastTagValid) {
     // Validate if temperature data is available
     bool temperatureAvailable = isTemperatureAvailable(lastTag);
@@ -64,10 +64,16 @@ void tryReadAndStoreTag() {
     
     RfidReading storedReading;
     storedReading.timestamp = getCurrentTimestamp();
+    if (storedReading.timestamp < 1000000000UL) {
+      Serial.println("[RTC] Timestamp unavailable - reading not stored (idle mode enforced)");
+      return;
+    }
     storedReading.country = lastTag.country;
     storedReading.id = lastTag.id;
     storedReading.temp_raw = temp_raw;
-    storedReading.flags = (lastTag.isData ? 1 : 0) | (lastTag.isAnimal ? 2 : 0);
+    storedReading.flags = (lastTag.isData ? FLAG_IS_DATA : 0) |
+                          (lastTag.isAnimal ? FLAG_IS_ANIMAL : 0) |
+                          ((antennaId == 2) ? FLAG_ANT2 : FLAG_ANT1);
     storedReading.reserved = 0;
     storeReading(storedReading);
     Serial.printf("#%d\n", readingCount);
@@ -76,14 +82,12 @@ void tryReadAndStoreTag() {
     } else {
       Serial.printf("TAG: %03u %012llu TEMP: N/A\n", lastTag.country, lastTag.id);
     }
-    if (rtcAvailable && storedReading.timestamp > 1000000000) {
+    if (storedReading.timestamp > 1000000000UL) {
       time_t timestamp = storedReading.timestamp;
       struct tm* timeinfo = gmtime(&timestamp);
       Serial.printf("Time: %04d-%02d-%02d %02d:%02d:%02d\n",
                     timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
                     timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
-    } else {
-      Serial.printf("Time: %lu ms\n", storedReading.timestamp);
     }
     Serial.println();
   }
@@ -166,7 +170,7 @@ static void selectAntenna2() {
   digitalWrite(ANT_SEL_PIN, LOW);
 }
 
-static void runSingleAntennaReadWindow(unsigned long windowMs, const char* antennaLabel) {
+static void runSingleAntennaReadWindow(unsigned long windowMs, const char* antennaLabel, uint8_t antennaId) {
   Serial.printf("[RFID][%s] Powering ON for %lu ms\n", antennaLabel, windowMs);
   if (dashboardModeActive) sendBLEResponse(String("[RFID][") + antennaLabel + "] Powering ON for " + String(windowMs) + " ms");
   digitalWrite(RFID_PWR_PIN, HIGH); // Power ON (active HIGH)
@@ -221,28 +225,45 @@ static void runSingleAntennaReadWindow(unsigned long windowMs, const char* anten
       if (dashboardModeActive) sendBLEResponse(String("[RFID][") + antennaLabel + "] Tag detected and stored");
 
       // Keep storage flow unchanged: each detected tag is stored with its own timestamp/index.
-      tryReadAndStoreTag();
+      tryReadAndStoreTag(antennaId);
 
       if (dashboardModeActive) {
         bool tempAvailable = isTemperatureAvailable(lastTag);
-        time_t timestamp = getCurrentTimestamp();
-        struct tm* ti = gmtime(&timestamp);
+        uint32_t readingTimestamp = getCurrentTimestamp();
+        bool hasValidTimestamp = (readingTimestamp > 1000000000UL);
+        struct tm* ti = nullptr;
+        if (hasValidTimestamp) {
+          time_t timestamp = readingTimestamp;
+          ti = gmtime(&timestamp);
+        }
 
         char readingStr[128];
         if (tempAvailable) {
           uint8_t firstByte = lastTag.reserved1 & 0xFF;
           float temperature = 23.3 + (0.112 * firstByte);
-          snprintf(readingStr, sizeof(readingStr),
-                   "#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C",
-                   readingCount, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
-                   ti->tm_hour, ti->tm_min, ti->tm_sec,
-                   lastTag.country, lastTag.id, temperature);
+          if (hasValidTimestamp && ti != nullptr) {
+            snprintf(readingStr, sizeof(readingStr),
+                     "#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C",
+                     readingCount, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+                     ti->tm_hour, ti->tm_min, ti->tm_sec,
+                     lastTag.country, lastTag.id, temperature);
+          } else {
+            snprintf(readingStr, sizeof(readingStr),
+                     "#%d: NO_RTC_TIME, %u, %llu, %.2f°C",
+                     readingCount, lastTag.country, lastTag.id, temperature);
+          }
         } else {
-          snprintf(readingStr, sizeof(readingStr),
-                   "#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A",
-                   readingCount, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
-                   ti->tm_hour, ti->tm_min, ti->tm_sec,
-                   lastTag.country, lastTag.id);
+          if (hasValidTimestamp && ti != nullptr) {
+            snprintf(readingStr, sizeof(readingStr),
+                     "#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A",
+                     readingCount, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+                     ti->tm_hour, ti->tm_min, ti->tm_sec,
+                     lastTag.country, lastTag.id);
+          } else {
+            snprintf(readingStr, sizeof(readingStr),
+                     "#%d: NO_RTC_TIME, %u, %llu, N/A",
+                     readingCount, lastTag.country, lastTag.id);
+          }
         }
         sendBLEResponse(readingStr);
       }
@@ -312,17 +333,20 @@ void powerOnAndReadTagWindow(unsigned long windowMs) {
 
   // ANT1: HiZ select (default path)
   selectAntenna1();
-  runSingleAntennaReadWindow(windowMs, "ANT1");
+  runSingleAntennaReadWindow(windowMs, "ANT1", 1);
 
   // Hardware-required cool-down between ANT1 and ANT2 read windows.
   delay(ANTENNA_SWITCH_DELAY_MS);
 
   // ANT2: drive selection low and run the same read algorithm.
   selectAntenna2();
-  runSingleAntennaReadWindow(windowMs, "ANT2");
+  runSingleAntennaReadWindow(windowMs, "ANT2", 2);
 
   // Return antenna select to ANT1 default HiZ state.
   selectAntenna1();
+
+  // Measure battery state once per complete read effort (both antennas).
+  printBatterySoc("Read effort complete");
 
   // Don't immediately reset LED status - let updateLEDStatus() handle timing.
 }

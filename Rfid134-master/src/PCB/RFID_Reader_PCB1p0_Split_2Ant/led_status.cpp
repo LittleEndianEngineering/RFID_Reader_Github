@@ -44,24 +44,22 @@ void updateLEDStatus() {
   // Handle timed status changes (like reading success flash)
   if (ledFlashDuration > 0 && (millis() - ledStatusStartTime) > ledFlashDuration) {
     // Return to appropriate status based on current system state
-    // CRITICAL: Always check dashboardModeActive to ensure correct LED state
-    if (dashboardModeActive) {
-      setLEDStatus("dashboard_active");  // Red LED - Dashboard Mode active
-    } else if (idleModeActive) {
+    // Priority: idle > dashboard > sleeping.
+    if (idleModeActive) {
       setLEDStatus("idle");  // Yellow LED - Idle mode active
+    } else if (dashboardModeActive) {
+      setLEDStatus("dashboard_active");  // Red LED - Dashboard Mode active
     } else {
       setLEDStatus("sleeping");  // Blue LED - Normal sleep mode
     }
   }
   
-  // Additional safety check: If Dashboard Mode is active but LED is not red, fix it
-  // This prevents LED from being blue when Dashboard Mode is active
-  if (dashboardModeActive && currentLEDStatus != "dashboard_active" && 
+  // Additional safety check to ensure steady-state LED priority.
+  if (idleModeActive && currentLEDStatus != "idle" &&
       currentLEDStatus != "reading_success" && currentLEDStatus != "booting") {
-    // Only fix if not in a temporary state (reading_success flash or booting)
-    setLEDStatus("dashboard_active");
-  } else if (!dashboardModeActive && idleModeActive && currentLEDStatus != "idle" &&
-             currentLEDStatus != "reading_success" && currentLEDStatus != "booting") {
     setLEDStatus("idle");
+  } else if (!idleModeActive && dashboardModeActive && currentLEDStatus != "dashboard_active" && 
+             currentLEDStatus != "reading_success" && currentLEDStatus != "booting") {
+    setLEDStatus("dashboard_active");
   }
 }

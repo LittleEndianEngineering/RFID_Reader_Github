@@ -110,3 +110,12 @@ extern bool lastButtonState;
 bool isSocBelowThreshold();
 void evaluateIdleState();
 const char* idleReasonToString(IdleReason reason);
+
+// SoC helpers
+extern const float BATTERY_MIN_VOLTAGE;
+extern const float BATTERY_MAX_VOLTAGE;
+extern const float SOC_DIVIDER_R1_OHMS;
+extern const float SOC_DIVIDER_R2_OHMS;
+void initSocSensor();
+bool readBatterySoc(float& batteryVoltage, float& socPercent, uint16_t& rawAdc, uint32_t& pinMilliVolts);
+void printBatterySoc(const char* context);

@@ -6,9 +6,10 @@
 
 #include "globals.h"
 #include "pins.h"
+#include "led_status.h"
 
 // WiFi Functions
-static void connectWiFi() {
+static bool connectWiFi() {
   Serial.print("[WIFI] Using SSID: '"); Serial.print(ssid);
   Serial.print("' Password: '"); Serial.print(password); Serial.println("'");
   Serial.print("[WIFI] Connecting");
@@ -20,12 +21,21 @@ static void connectWiFi() {
   
   WiFi.begin(ssid, password);
   int attempts = 0;
+  bool blinkOn = false;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     delay(500); Serial.print(".");
+    blinkOn = !blinkOn;
+    setLEDColor(blinkOn ? 1 : 0, blinkOn ? 1 : 0, blinkOn ? 1 : 0); // white blink during network wait
     attempts++;
   }
-  if (WiFi.status() == WL_CONNECTED) Serial.println(" OK");
-  else Serial.println(" FAIL");
+  setLEDStatus("booting"); // restore steady boot status after network wait
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" OK");
+    return true;
+  } else {
+    Serial.println(" FAIL");
+    return false;
+  }
 }
 
 // RTC Functions - Using DS1307
@@ -39,8 +49,10 @@ void initRTC() {
   
   if (!rtc.begin()) {
     Serial.println("[RTC] FAIL - RTC not detected or I2C error");
-    Serial.println("[RTC] Continuing without RTC (using millis() fallback)");
+    Serial.println("[RTC] No timestamp fallback is allowed; entering idle mode");
     rtcAvailable = false;
+    rtcIdleLatch = true;
+    evaluateIdleState();
     // ESP32-S3: Reset I2C bus to prevent interference with USB-CDC
     Wire.end();
     return;
@@ -48,25 +60,36 @@ void initRTC() {
 
   if (!rtc.isrunning()) {
     Serial.println("[RTC] Stopped -> setting from NTP...");
-    connectWiFi();
+    bool wifiConnected = connectWiFi();
+    if (!wifiConnected) {
+      Serial.println("[RTC] WiFi unavailable - skipping NTP and entering idle mode");
+      rtcAvailable = false;
+      rtcIdleLatch = true;
+      evaluateIdleState();
+      return;
+    }
     configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // Set to UTC (0 offset)
     int retry = 0;
-    while (!getLocalTime(&timeinfo) && retry < 10) { 
-      delay(1000); 
+    while (!getLocalTime(&timeinfo) && retry < 3) {
+      delay(500);
       retry++;
       Serial.flush();  // Ensure serial output continues during NTP wait
     }
-    if (retry < 10) {
+    if (retry < 3) {
       rtc.adjust(DateTime(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                           timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec));
       Serial.println("[RTC] Time set from NTP (UTC)");
     } else {
-      Serial.println("[RTC] NTP failed - continuing without RTC sync");
+      Serial.println("[RTC] NTP failed - no timestamp fallback is allowed; entering idle mode");
       rtcAvailable = false;
+      rtcIdleLatch = true;
+      evaluateIdleState();
       return;
     }
   }
   rtcAvailable = true;
+  rtcIdleLatch = false;
+  evaluateIdleState();
   now = rtc.now();
   Serial.printf("[RTC] OK %04d-%02d-%02d %02d:%02d:%02d\n",
                 now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
@@ -75,8 +98,7 @@ void initRTC() {
 
 uint32_t getCurrentTimestamp() {
   if (rtcAvailable) {
-    // Add timeout protection: if RTC I2C hangs, fall back to millis
-    // This prevents watchdog resets when RTC is not properly powered
+    // Add timeout protection so RTC I2C failures do not hang the loop.
     unsigned long startTime = millis();
     bool rtcSuccess = false;
     
@@ -96,24 +118,24 @@ uint32_t getCurrentTimestamp() {
       if (readDuration < 50 && now.year() >= 2020 && now.year() <= 2100) {
         rtcSuccess = true;
       } else {
-        // RTC read took too long or returned invalid time
-        Serial.printf("[RTC] Read slow/invalid (took %lu ms, year %d) - using fallback\n", readDuration, now.year());
+        Serial.printf("[RTC] Read slow/invalid (took %lu ms, year %d) - entering idle mode\n", readDuration, now.year());
       }
     } else {
-      // I2C device didn't respond or took too long
-      Serial.printf("[RTC] I2C error/timeout (error: %d, took %lu ms) - using fallback\n", error, millis() - startTime);
+      Serial.printf("[RTC] I2C error/timeout (error: %d, took %lu ms) - entering idle mode\n", error, millis() - startTime);
     }
     
     if (rtcSuccess) {
       return now.unixtime(); // Store UTC timestamps directly (RTC is now set to UTC)
     } else {
-      // RTC read failed or timed out - mark as unavailable to prevent future hangs
+      // RTC read failed or timed out - lock into idle mode until RTC is restored.
       rtcAvailable = false;
+      rtcIdleLatch = true;
+      evaluateIdleState();
+      return 0;
     }
   }
-  
-  // Fallbacks: try internal time (if previously synced), then millis
-  struct tm ti;
-  if (getLocalTime(&ti)) return (uint32_t)mktime(&ti);
-  return millis();
+
+  rtcIdleLatch = true;
+  evaluateIdleState();
+  return 0;
 }

@@ -37,7 +37,7 @@ void processSerialCommand(const String& command) {
     if (idleModeActive) {
       Serial.printf("[DASHBOARD] Idle reason: %s\n", idleReasonToString(latestIdleReason));
     }
-    setLEDStatus("dashboard_active");  // Red LED for dashboard mode
+    setLEDStatus(idleModeActive ? "idle" : "dashboard_active");
     startBLEAdvertising();  // Start BLE advertising for mobile apps
     Serial.flush();
     return;
@@ -64,7 +64,7 @@ void processSerialCommand(const String& command) {
     if (idleModeActive) {
       Serial.printf("[DASHBOARD] Idle reason: %s\n", idleReasonToString(latestIdleReason));
     }
-    setLEDStatus("dashboard_active");  // Red LED for dashboard mode
+    setLEDStatus(idleModeActive ? "idle" : "dashboard_active");
     startBLEAdvertising();  // Start BLE advertising for mobile apps
     Serial.flush();
     return;
@@ -88,6 +88,16 @@ void processSerialCommand(const String& command) {
     Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
     Serial.printf("[DEBUG] Idle mode: %s\n", idleModeActive ? "ACTIVE" : "INACTIVE");
     Serial.printf("[DEBUG] Idle reason: %s\n", idleReasonToString(latestIdleReason));
+    float batteryVoltage = 0.0f;
+    float socPercent = 0.0f;
+    uint16_t rawAdc = 0;
+    uint32_t pinMilliVolts = 0;
+    if (readBatterySoc(batteryVoltage, socPercent, rawAdc, pinMilliVolts)) {
+      Serial.printf("[SOC] Latest: raw=%u, pin=%lumV, battery=%.3fV, soc=%.1f%%\n",
+                    rawAdc, (unsigned long)pinMilliVolts, batteryVoltage, socPercent);
+    } else {
+      Serial.println("[SOC] Latest: N/A");
+    }
     Serial.flush();
     return;
   }
@@ -110,6 +120,16 @@ void processSerialCommand(const String& command) {
       Serial.printf("[DEBUG] Unix timestamp: %lu\n", now.unixtime() + (6 * 3600));
     } else {
       Serial.println("[DEBUG] RTC not available");
+    }
+    float batteryVoltage = 0.0f;
+    float socPercent = 0.0f;
+    uint16_t rawAdc = 0;
+    uint32_t pinMilliVolts = 0;
+    if (readBatterySoc(batteryVoltage, socPercent, rawAdc, pinMilliVolts)) {
+      Serial.printf("[SOC] Latest: raw=%u, pin=%lumV, battery=%.3fV, soc=%.1f%%\n",
+                    rawAdc, (unsigned long)pinMilliVolts, batteryVoltage, socPercent);
+    } else {
+      Serial.println("[SOC] Latest: N/A");
     }
     Serial.println("[DEBUG] --- End Debug Info ---");
     Serial.flush();
