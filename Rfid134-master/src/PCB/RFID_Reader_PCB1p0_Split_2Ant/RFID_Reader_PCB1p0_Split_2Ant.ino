@@ -202,6 +202,7 @@ void loop() {
     
     // Skip empty commands
     if (command.length() > 0) {
+      Serial.printf("[SERDBG] LOOP_RX_FASTPATH t=%lu cmd='%s'\n", millis(), command.c_str());
       // Mark host as active for sleep gating
       lastCommandTime = millis();
       
@@ -268,6 +269,7 @@ void loop() {
   // ----- Handle GPIO wake as a virtual press (covers short/early releases) -----
   if (buttonWakePending) {
     buttonWakePending = false;
+    Serial.printf("[BTNDBG] GPIO_WAKE_START t=%lu btn_state=%d\n", millis(), digitalRead(BUTTON_PIN) == LOW ? 1 : 0);
 
     // GPIO wake-up means button was pressed while sleeping
     // Check current button state first - if already released, it was a quick press
@@ -321,7 +323,9 @@ void loop() {
           Serial.printf("[IDLE] GPIO wake short press ignored - manual read blocked (%s)\n", idleReasonToString(latestIdleReason));
         } else {
           Serial.println("[BUTTON] GPIO wake -> Short press -> RFID read");
+          Serial.printf("[BTNDBG] GPIO_WAKE_SHORT_READ_START t=%lu duration=%lu\n", millis(), totalDuration);
           powerOnAndReadTagWindow(rfidOnTimeMs);
+          Serial.printf("[BTNDBG] GPIO_WAKE_SHORT_READ_END t=%lu\n", millis());
           lastPeriodicRead = millis();
         }
       } else {
@@ -349,6 +353,8 @@ void loop() {
         setLEDStatus(idleModeActive ? "idle" : "sleeping");
         stopBLEAdvertising();  // Stop BLE advertising
       }
+      Serial.printf("[BTNDBG] GPIO_WAKE_LONG_TOGGLE t=%lu new_state=%d duration=%lu\n",
+                    millis(), dashboardModeActive ? 1 : 0, totalDuration);
     }
     
     // Reset all button state flags
@@ -520,6 +526,7 @@ void loop() {
     }
     
     // mark host as active for sleep gating
+    Serial.printf("[SERDBG] LOOP_RX_NORMAL t=%lu cmd='%s'\n", millis(), command.c_str());
     lastCommandTime = millis();
     
     // Immediately respond to any command to prevent sleep during processing

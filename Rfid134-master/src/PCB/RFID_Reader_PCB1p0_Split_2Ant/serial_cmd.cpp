@@ -19,6 +19,7 @@ static void printIdleStatus() {
 // Centralized function to process Serial commands - used by both Dashboard Mode
 // priority check and regular Serial processing to ensure consistent behavior
 void processSerialCommand(const String& command) {
+  Serial.printf("[SERDBG] CMD_START t=%lu len=%u cmd='%s'\n", millis(), command.length(), command.c_str());
   // Check for status command to show dashboard mode status
   if (command == "status") {
     Serial.printf("[DASHBOARD] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
@@ -330,4 +331,5 @@ void processSerialCommand(const String& command) {
     // Unknown command - do nothing (or could send error message)
     Serial.flush();
   }
+  Serial.printf("[SERDBG] CMD_END t=%lu cmd='%s'\n", millis(), command.c_str());
 }
