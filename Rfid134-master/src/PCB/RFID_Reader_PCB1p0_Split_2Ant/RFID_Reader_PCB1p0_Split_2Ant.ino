@@ -95,7 +95,7 @@ void setup() {
     Serial.println("[DASHBOARD] BLE advertising started for mobile app connectivity");
     Serial.println("[DASHBOARD] LED update deferred until boot completes");
     startBLEAdvertising();  // Start BLE advertising for mobile apps
-    Serial.printf("[DASHBOARD] Verification: dashboardModeActive=%s, LED status=%s\n", 
+    Serial.printf("[DASHBOARD] Verification: dashboardModeActive=%s, LED status=%s\n",
                   dashboardModeActive ? "true" : "false", currentLEDStatus.c_str());
   } else {
     Serial.println("[BOOT] Dashboard Mode was NOT active before reset (normal sleep mode)");
@@ -165,7 +165,7 @@ void setup() {
     setLEDStatus("sleeping");  // Blue LED for normal sleep mode
   }
   
-  Serial.println(); // Blank line after boot completion
+  if (verbose) Serial.println(); // Blank line after boot completion
   Serial.flush();  // Ensure all messages are sent
 }
 
@@ -179,10 +179,10 @@ void loop() {
   evaluateIdleState();
   if (idleModeActive != prevIdleModeActive || latestIdleReason != prevIdleReason) {
     if (idleModeActive) {
-      Serial.printf("[IDLE] ENTER (%s)\n", idleReasonToString(latestIdleReason));
+      VERBOSE_PRINTF("[IDLE] ENTER (%s)\n", idleReasonToString(latestIdleReason));
       setLEDStatus("idle");
     } else {
-      Serial.println("[IDLE] EXIT");
+      VERBOSE_PRINTLN("[IDLE] EXIT");
       setLEDStatus(dashboardModeActive ? "dashboard_active" : "sleeping");
     }
     prevIdleModeActive = idleModeActive;
@@ -202,7 +202,7 @@ void loop() {
     
     // Skip empty commands
     if (command.length() > 0) {
-      Serial.printf("[SERDBG] LOOP_RX_FASTPATH t=%lu cmd='%s'\n", millis(), command.c_str());
+      VERBOSE_PRINTF("[SERDBG] LOOP_RX_FASTPATH t=%lu cmd='%s'\n", millis(), command.c_str());
       // Mark host as active for sleep gating
       lastCommandTime = millis();
       
@@ -223,18 +223,18 @@ void loop() {
   // ----- Handle UART wake-up first (highest priority) -----
   if (uartWakePending) {
     uartWakePending = false;
-    Serial.println("[UART] Wake-up detected - staying awake for command processing");
-    Serial.println("[UART] *** UART WAKE-UP WORKING ***");
+    VERBOSE_PRINTLN("[UART] Wake-up detected - staying awake for command processing");
+    VERBOSE_PRINTLN("[UART] *** UART WAKE-UP WORKING ***");
     
     // UART wake-up occurred - process command but don't change Dashboard Mode
     // Dashboard Mode is controlled ONLY by the multi-button (long press)
     
     // Mark host as active to prevent immediate re-sleep
     lastCommandTime = millis();
-    Serial.printf("[UART] lastCommandTime set to: %lu\n", lastCommandTime);
+    VERBOSE_PRINTF("[UART] lastCommandTime set to: %lu\n", lastCommandTime);
     
     // Wait longer for command to arrive (dashboard needs more time to send)
-    Serial.println("[UART] Waiting for command...");
+    VERBOSE_PRINTLN("[UART] Waiting for command...");
     delay(1000); // Increased delay to give dashboard more time
     
     // Process any pending serial commands immediately (like button does with RFID)
@@ -257,7 +257,7 @@ void loop() {
       }
     } else {
       // No immediate command available, but stay awake for a bit to allow command to arrive
-      Serial.println("[UART] No immediate command - staying awake for command arrival");
+      VERBOSE_PRINTLN("[UART] No immediate command - staying awake for command arrival");
       // The lastCommandTime is already set, so we'll stay awake
     }
     
@@ -269,7 +269,7 @@ void loop() {
   // ----- Handle GPIO wake as a virtual press (covers short/early releases) -----
   if (buttonWakePending) {
     buttonWakePending = false;
-    Serial.printf("[BTNDBG] GPIO_WAKE_START t=%lu btn_state=%d\n", millis(), digitalRead(BUTTON_PIN) == LOW ? 1 : 0);
+    VERBOSE_PRINTF("[BTNDBG] GPIO_WAKE_START t=%lu btn_state=%d\n", millis(), digitalRead(BUTTON_PIN) == LOW ? 1 : 0);
 
     // GPIO wake-up means button was pressed while sleeping
     // Check current button state first - if already released, it was a quick press
@@ -293,15 +293,15 @@ void loop() {
         // Detect long press completion
         if (pressDuration >= longPressMs && !longPressDetected) {
           longPressDetected = true;
-          Serial.println("[BUTTON] *** LONG PRESS DETECTED ***");
-          Serial.println("[BUTTON] Release button to toggle dashboard mode");
+          VERBOSE_PRINTLN("[BUTTON] *** LONG PRESS DETECTED ***");
+          VERBOSE_PRINTLN("[BUTTON] Release button to toggle dashboard mode");
         }
       }
     } else {
       // Button already released - it was a quick press that woke us up
       // Give it a minimum duration to ensure it's treated as a valid press
       // This handles the case where button was pressed and released before we could measure
-      Serial.println("[BUTTON] GPIO wake -> Quick press detected (already released)");
+      VERBOSE_PRINTLN("[BUTTON] GPIO wake -> Quick press detected (already released)");
       delay(50); // Small delay to ensure button state is stable
     }
     
@@ -320,16 +320,16 @@ void loop() {
       
       if (totalDuration >= minPressTime) {
         if (idleModeActive) {
-          Serial.printf("[IDLE] GPIO wake short press ignored - manual read blocked (%s)\n", idleReasonToString(latestIdleReason));
+          VERBOSE_PRINTF("[IDLE] GPIO wake short press ignored - manual read blocked (%s)\n", idleReasonToString(latestIdleReason));
         } else {
-          Serial.println("[BUTTON] GPIO wake -> Short press -> RFID read");
-          Serial.printf("[BTNDBG] GPIO_WAKE_SHORT_READ_START t=%lu duration=%lu\n", millis(), totalDuration);
+          VERBOSE_PRINTLN("[BUTTON] GPIO wake -> Short press -> RFID read");
+          VERBOSE_PRINTF("[BTNDBG] GPIO_WAKE_SHORT_READ_START t=%lu duration=%lu\n", millis(), totalDuration);
           powerOnAndReadTagWindow(rfidOnTimeMs);
-          Serial.printf("[BTNDBG] GPIO_WAKE_SHORT_READ_END t=%lu\n", millis());
+          VERBOSE_PRINTF("[BTNDBG] GPIO_WAKE_SHORT_READ_END t=%lu\n", millis());
           lastPeriodicRead = millis();
         }
       } else {
-        Serial.printf("[BUTTON] GPIO wake -> Press too short (%lu ms < %lu ms), ignoring\n", totalDuration, minPressTime);
+        VERBOSE_PRINTF("[BUTTON] GPIO wake -> Press too short (%lu ms < %lu ms), ignoring\n", totalDuration, minPressTime);
       }
     } else {
       // Long press - toggle dashboard mode
@@ -353,8 +353,8 @@ void loop() {
         setLEDStatus(idleModeActive ? "idle" : "sleeping");
         stopBLEAdvertising();  // Stop BLE advertising
       }
-      Serial.printf("[BTNDBG] GPIO_WAKE_LONG_TOGGLE t=%lu new_state=%d duration=%lu\n",
-                    millis(), dashboardModeActive ? 1 : 0, totalDuration);
+      VERBOSE_PRINTF("[BTNDBG] GPIO_WAKE_LONG_TOGGLE t=%lu new_state=%d duration=%lu\n",
+                     millis(), dashboardModeActive ? 1 : 0, totalDuration);
     }
     
     // Reset all button state flags
@@ -374,19 +374,19 @@ void loop() {
 
     // Check if UART wake-up is also pending - if so, prioritize UART
     if (uartWakePending) {
-      Serial.println("[PERIODIC] Timer wake deferred - UART wake-up has priority");
+      VERBOSE_PRINTLN("[PERIODIC] Timer wake deferred - UART wake-up has priority");
       return; // Let UART wake-up handle the processing
     }
 
     // Skip periodic reads when Dashboard Mode is active to maintain responsiveness
     if (dashboardModeActive) {
-      Serial.println("[PERIODIC] Skipped (Dashboard Mode active)");
+      VERBOSE_PRINTLN("[PERIODIC] Skipped (Dashboard Mode active)");
       lastPeriodicRead = millis(); // Reset timer to prevent immediate retry
       return; // Don't go to sleep, stay awake for dashboard
     }
 
     if (idleModeActive) {
-      Serial.printf("[IDLE] Periodic read blocked (%s)\n", idleReasonToString(latestIdleReason));
+      VERBOSE_PRINTF("[IDLE] Periodic read blocked (%s)\n", idleReasonToString(latestIdleReason));
       lastPeriodicRead = millis();
       if (!Serial.available() && !dashboardModeActive) {
         lightSleepUntilNextEvent((uint64_t)IDLE_SOC_POLL_INTERVAL_MS * 1000ULL);
@@ -394,12 +394,12 @@ void loop() {
       return;
     }
 
-    Serial.println("[PERIODIC] Timer wake -> trigger RFID read");
+    VERBOSE_PRINTLN("[PERIODIC] Timer wake -> trigger RFID read");
     lastPeriodicRead = millis();           // anchor schedule to now
     powerOnAndReadTagWindow(rfidOnTimeMs);
     wake_timer_consumed++;
-    Serial.printf("[PERIODIC] RFID read completed, LED status: %s\n", currentLEDStatus.c_str());
-    Serial.println(); // Blank line for spacing
+    VERBOSE_PRINTF("[PERIODIC] RFID read completed, LED status: %s\n", currentLEDStatus.c_str());
+    if (verbose) Serial.println(); // Blank line for spacing
 
     // Give LED status time to update before going to sleep
     if (currentLEDStatus == "reading_success") {
@@ -450,17 +450,17 @@ void loop() {
   if (periodicDue) {
     // Skip periodic reads when Dashboard Mode is active to maintain responsiveness
     if (dashboardModeActive) {
-      Serial.println("[PERIODIC] Timer slot -> skipped (Dashboard Mode active)");
+      VERBOSE_PRINTLN("[PERIODIC] Timer slot -> skipped (Dashboard Mode active)");
       lastPeriodicRead = nowMs; // Reset timer to prevent immediate retry
     } else if (idleModeActive) {
-      Serial.printf("[IDLE] Fallback periodic read blocked (%s)\n", idleReasonToString(latestIdleReason));
+      VERBOSE_PRINTF("[IDLE] Fallback periodic read blocked (%s)\n", idleReasonToString(latestIdleReason));
       lastPeriodicRead = nowMs;
     } else {
-      Serial.println("[PERIODIC] Timer slot -> trigger RFID read");
+      VERBOSE_PRINTLN("[PERIODIC] Timer slot -> trigger RFID read");
       lastPeriodicRead = nowMs;
       powerOnAndReadTagWindow(rfidOnTimeMs);
-      Serial.printf("[PERIODIC] Fallback RFID read completed, LED status: %s\n", currentLEDStatus.c_str());
-      Serial.println(); // Blank line for spacing
+      VERBOSE_PRINTF("[PERIODIC] Fallback RFID read completed, LED status: %s\n", currentLEDStatus.c_str());
+      if (verbose) Serial.println(); // Blank line for spacing
     }
   }
 
@@ -509,7 +509,7 @@ void loop() {
   // Clear UART wake-up flag after processing timeout
   if (uartWakePending && (millis() - uartWakeTime) > UART_WAKE_PROCESSING_MS) {
     uartWakePending = false;
-    Serial.println("[UART] Wake-up processing timeout - clearing flag");
+    VERBOSE_PRINTLN("[UART] Wake-up processing timeout - clearing flag");
   }
 
   // --- Serial config commands (for non-Dashboard Mode or fallback) ---
@@ -526,7 +526,7 @@ void loop() {
     }
     
     // mark host as active for sleep gating
-    Serial.printf("[SERDBG] LOOP_RX_NORMAL t=%lu cmd='%s'\n", millis(), command.c_str());
+    VERBOSE_PRINTF("[SERDBG] LOOP_RX_NORMAL t=%lu cmd='%s'\n", millis(), command.c_str());
     lastCommandTime = millis();
     
     // Immediately respond to any command to prevent sleep during processing

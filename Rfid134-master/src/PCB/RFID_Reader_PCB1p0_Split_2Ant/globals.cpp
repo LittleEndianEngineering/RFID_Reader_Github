@@ -21,6 +21,7 @@ int readingCount = 0;
 unsigned long startTime = 0;
 
 // Reading configuration
+bool verbose = false;
 const unsigned long debounceDelay = 200; // ms
 unsigned long rfidOnTimeMs = 5 * 1000;   // configurable
 unsigned long lastPeriodicRead = 0;

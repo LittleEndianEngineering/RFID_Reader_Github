@@ -141,8 +141,8 @@ void storeReading(const RfidReading& reading) {
   }
 
   // Extra blank line before the stored-reading line
-  Serial.println();
-  Serial.printf("[FS] Stored reading #%d\n", readingCount);
+  if (verbose) Serial.println();
+  VERBOSE_PRINTF("[FS] Stored reading #%d\n", readingCount);
 }
 
 void printStoredReadings() {
@@ -268,7 +268,7 @@ void printReadingsSummary() {
 }
 
 void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
-  Serial.println("[RANGE] === Range Request Start ===");
+  VERBOSE_PRINTLN("[RANGE] === Range Request Start ===");
   File file = SPIFFS.open(FLASH_FILENAME, "r");
   if (!file) { 
     Serial.println("[RANGE] ERROR: Failed to open FLASH file"); 
@@ -341,7 +341,7 @@ void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
   if (!file) {
     Serial.println("---END_READINGS---");
     Serial.println("</DASHBOARD_DATA>");
-    Serial.println("[RANGE] === Range Request End ===");
+    VERBOSE_PRINTLN("[RANGE] === Range Request End ===");
     return;
   }
   
@@ -378,6 +378,6 @@ void sendStoredReadingsByRange(uint32_t startTime, uint32_t endTime) {
   
   Serial.println("---END_READINGS---");
   Serial.println("</DASHBOARD_DATA>");
-  Serial.println("[RANGE] === Range Request End ===");
+  VERBOSE_PRINTLN("[RANGE] === Range Request End ===");
   Serial.flush();  // Ensure final data is sent
 }

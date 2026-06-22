@@ -4,7 +4,7 @@
 #include "pins.h"
 
 void setLEDColor(int red, int green, int blue) {
-  Serial.printf("[LEDDBG] COLOR t=%lu R=%d G=%d B=%d\n", millis(), red, green, blue);
+  VERBOSE_PRINTF("[LEDDBG] COLOR t=%lu R=%d G=%d B=%d\n", millis(), red, green, blue);
   digitalWrite(LED_RED_PIN, red);
   digitalWrite(LED_GREEN_PIN, green);
   digitalWrite(LED_BLUE_PIN, blue);
@@ -14,9 +14,9 @@ void setLEDStatus(String status) {
   String previousStatus = currentLEDStatus;
   currentLEDStatus = status;
   ledStatusStartTime = millis();
-  Serial.printf("[LEDDBG] STATUS t=%lu from=%s to=%s idle=%d dashboard=%d flash_ms=%lu\n",
-                ledStatusStartTime, previousStatus.c_str(), status.c_str(),
-                idleModeActive ? 1 : 0, dashboardModeActive ? 1 : 0, (unsigned long)ledFlashDuration);
+  VERBOSE_PRINTF("[LEDDBG] STATUS t=%lu from=%s to=%s idle=%d dashboard=%d flash_ms=%lu\n",
+                 ledStatusStartTime, previousStatus.c_str(), status.c_str(),
+                 idleModeActive ? 1 : 0, dashboardModeActive ? 1 : 0, (unsigned long)ledFlashDuration);
   
   if (status == "booting") {
     setLEDColor(1, 1, 1);      // White - booting phase
@@ -48,8 +48,8 @@ void setLEDStatus(String status) {
 void updateLEDStatus() {
   // Handle timed status changes (like reading success flash)
   if (ledFlashDuration > 0 && (millis() - ledStatusStartTime) > ledFlashDuration) {
-    Serial.printf("[LEDDBG] FLASH_EXPIRE t=%lu status=%s elapsed=%lu\n",
-                  millis(), currentLEDStatus.c_str(), millis() - ledStatusStartTime);
+    VERBOSE_PRINTF("[LEDDBG] FLASH_EXPIRE t=%lu status=%s elapsed=%lu\n",
+                   millis(), currentLEDStatus.c_str(), millis() - ledStatusStartTime);
     // Return to appropriate status based on current system state
     // Priority: idle > dashboard > sleeping.
     if (idleModeActive) {

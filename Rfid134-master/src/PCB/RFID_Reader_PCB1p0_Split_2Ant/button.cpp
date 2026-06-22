@@ -17,7 +17,7 @@ void handleMultiButton() {
   // Button press detection (HIGH to LOW transition)
   if (lastButtonState == HIGH && currentButtonState == LOW) {
     // Button just pressed
-    Serial.printf("[BTNDBG] PRESS_EDGE t=%lu dashboard=%d idle=%d\n", currentTime, dashboardModeActive ? 1 : 0, idleModeActive ? 1 : 0);
+    VERBOSE_PRINTF("[BTNDBG] PRESS_EDGE t=%lu dashboard=%d idle=%d\n", currentTime, dashboardModeActive ? 1 : 0, idleModeActive ? 1 : 0);
     buttonPressed = true;
     buttonPressStart = currentTime;
     longPressDetected = false;
@@ -34,22 +34,22 @@ void handleMultiButton() {
         // Short press - trigger RFID read
         // Use different debounce thresholds for different states
         unsigned long minPressTime = dashboardModeActive ? 50 : 100; // 50ms when awake, 100ms when sleeping
-        Serial.printf("[BTNDBG] RELEASE_SHORT t=%lu duration=%lu min=%lu dashboard=%d idle=%d\n",
-                      currentTime, pressDuration, minPressTime, dashboardModeActive ? 1 : 0, idleModeActive ? 1 : 0);
+        VERBOSE_PRINTF("[BTNDBG] RELEASE_SHORT t=%lu duration=%lu min=%lu dashboard=%d idle=%d\n",
+                       currentTime, pressDuration, minPressTime, dashboardModeActive ? 1 : 0, idleModeActive ? 1 : 0);
         
         if (pressDuration > minPressTime) {
           if (idleModeActive) {
-            Serial.printf("[IDLE] Short press ignored - manual read blocked (%s)\n", idleReasonToString(latestIdleReason));
+            VERBOSE_PRINTF("[IDLE] Short press ignored - manual read blocked (%s)\n", idleReasonToString(latestIdleReason));
           } else {
-            Serial.println("[BUTTON] Short press -> RFID read");
+            VERBOSE_PRINTLN("[BUTTON] Short press -> RFID read");
             powerOnAndReadTagWindow(rfidOnTimeMs);
             lastPeriodicRead = millis(); // Reset periodic timer
-            Serial.printf("[BTNDBG] MANUAL_READ_DONE t=%lu\n", millis());
+            VERBOSE_PRINTF("[BTNDBG] MANUAL_READ_DONE t=%lu\n", millis());
           }
         }
       } else {
         // Long press - toggle dashboard mode
-        Serial.printf("[BTNDBG] RELEASE_LONG t=%lu duration=%lu threshold=%lu\n", currentTime, pressDuration, longPressMs);
+        VERBOSE_PRINTF("[BTNDBG] RELEASE_LONG t=%lu duration=%lu threshold=%lu\n", currentTime, pressDuration, longPressMs);
         Serial.println("[BUTTON] Long press -> Dashboard mode toggle");
         dashboardModeActive = !dashboardModeActive;
         saveConfigVar("dashboardModeActive", dashboardModeActive ? "true" : "false");  // Persist to flash
@@ -70,7 +70,7 @@ void handleMultiButton() {
           setLEDStatus(idleModeActive ? "idle" : "sleeping");
           stopBLEAdvertising();  // Stop BLE advertising
         }
-        Serial.printf("[BTNDBG] DASHBOARD_TOGGLED t=%lu new_state=%d\n", millis(), dashboardModeActive ? 1 : 0);
+        VERBOSE_PRINTF("[BTNDBG] DASHBOARD_TOGGLED t=%lu new_state=%d\n", millis(), dashboardModeActive ? 1 : 0);
       }
       
       // Reset all button state flags
@@ -93,8 +93,8 @@ void handleMultiButton() {
     // Detect long press completion
     if (pressDuration >= longPressMs && !longPressDetected) {
       longPressDetected = true;
-      Serial.println("[BUTTON] *** LONG PRESS DETECTED ***");
-      Serial.println("[BUTTON] Release button to toggle dashboard mode");
+      VERBOSE_PRINTLN("[BUTTON] *** LONG PRESS DETECTED ***");
+      VERBOSE_PRINTLN("[BUTTON] Release button to toggle dashboard mode");
     }
   }
   

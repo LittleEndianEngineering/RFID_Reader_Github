@@ -29,12 +29,12 @@ class MyServerCallbacks: public BLEServerCallbacks {
       // iOS typically negotiates to ~185 bytes automatically, Android can go up to 512 bytes
       // We request 512 bytes (maximum) and let the client negotiate the actual value
       BLEDevice::setMTU(512);
-      Serial.println("[BLE] MTU negotiation requested (512 bytes) - client will negotiate actual value");
+      VERBOSE_PRINTLN("[BLE] MTU negotiation requested (512 bytes) - client will negotiate actual value");
     };
 
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
-      Serial.println("[BLE] Device disconnected");
+      VERBOSE_PRINTLN("[BLE] Device disconnected");
       
       // Restart advertising if Dashboard Mode is still active
       // This allows reconnection without restarting the ESP32
@@ -51,7 +51,7 @@ class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
       String rxValue = pCharacteristic->getValue().c_str();
       
       if (rxValue.length() > 0) {
-        Serial.println("[BLE] Received command: " + rxValue);
+        VERBOSE_PRINTLN("[BLE] Received command: " + rxValue);
         
         // Process the command (same as serial commands)
         String command = rxValue;
@@ -73,7 +73,7 @@ class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
 void initBLE() {
   if (bleInitialized) return;
   
-  Serial.println("[BLE] Initializing BLE...");
+  VERBOSE_PRINTLN("[BLE] Initializing BLE...");
   
   BLEDevice::init("RFID Reader");
   pServer = BLEDevice::createServer();
@@ -106,7 +106,7 @@ void initBLE() {
 
   pService->start();
   bleInitialized = true;
-  Serial.println("[BLE] BLE service initialized");
+  VERBOSE_PRINTLN("[BLE] BLE service initialized");
 }
 
 void startBLEAdvertising() {
@@ -122,7 +122,7 @@ void startBLEAdvertising() {
     pAdvertising->setMaxPreferred(0x12);
     BLEDevice::startAdvertising();
     bleAdvertising = true;
-    Serial.println("[BLE] BLE advertising started");
+    VERBOSE_PRINTLN("[BLE] BLE advertising started");
   }
 }
 
@@ -130,7 +130,7 @@ void stopBLEAdvertising() {
   if (bleAdvertising) {
     BLEDevice::stopAdvertising();
     bleAdvertising = false;
-    Serial.println("[BLE] BLE advertising stopped");
+    VERBOSE_PRINTLN("[BLE] BLE advertising stopped");
   }
   
   // ESP32-S3: Completely deinitialize BLE when not in Dashboard Mode
@@ -144,7 +144,7 @@ void stopBLEAdvertising() {
     pResponseCharacteristic = nullptr;
     pStatusCharacteristic = nullptr;
     deviceConnected = false;
-    Serial.println("[BLE] BLE deinitialized to prevent USB-CDC interference");
+    VERBOSE_PRINTLN("[BLE] BLE deinitialized to prevent USB-CDC interference");
   }
 }
 
@@ -158,7 +158,7 @@ void sendBLEResponse(const String& response) {
     int msgLength = response.length();
     const int SAFE_MTU_LIMIT = 180;  // Conservative limit (iOS default ~185 - 3 = 182)
     if (msgLength > SAFE_MTU_LIMIT) {
-      Serial.printf("[BLE] WARNING: Message length (%d bytes) exceeds safe MTU limit (%d bytes), truncation possible\n", msgLength, SAFE_MTU_LIMIT);
+      VERBOSE_PRINTF("[BLE] WARNING: Message length (%d bytes) exceeds safe MTU limit (%d bytes), truncation possible\n", msgLength, SAFE_MTU_LIMIT);
     }
     
     // Set the characteristic value first, then notify
@@ -171,7 +171,7 @@ void sendBLEResponse(const String& response) {
     // Only log every 10th message to reduce serial spam (since we're sending one reading per notification)
     static int logCounter = 0;
     if (++logCounter % 10 == 0 || response.indexOf("BEGIN") >= 0 || response.indexOf("END") >= 0 || response.indexOf("Printing") >= 0) {
-      Serial.println("[BLE] Sent response: " + response);
+      VERBOSE_PRINTLN("[BLE] Sent response: " + response);
     }
     // Delay to prevent BLE notification queue overflow on iOS
     // iOS has a very limited notification queue (~10-15 notifications)
@@ -188,7 +188,7 @@ void sendBLEStatus(const String& status) {
   if (deviceConnected && pStatusCharacteristic) {
     pStatusCharacteristic->setValue(status.c_str());
     pStatusCharacteristic->notify();
-    Serial.println("[BLE] Sent status: " + status);
+    VERBOSE_PRINTLN("[BLE] Sent status: " + status);
   }
 }
 
@@ -232,7 +232,7 @@ void processBLECommand(const String& command) {
       uint32_t endTime = rangeCmd.substring(spaceIndex + 1).toInt();
       sendStoredReadingsByRangeBLEChunk(startTime, endTime, 0);
     } else {
-      Serial.println("[BLE] ERROR: Invalid range command format");
+      VERBOSE_PRINTLN("[BLE] ERROR: Invalid range command format");
       sendBLEResponse("ERROR: Invalid range command format");
     }
   }
@@ -253,7 +253,7 @@ void processBLECommand(const String& command) {
         sendBLEResponse("ERROR: Invalid chunk index");
       }
     } else {
-      Serial.println("[BLE] ERROR: Invalid range_chunk command format");
+      VERBOSE_PRINTLN("[BLE] ERROR: Invalid range_chunk command format");
       sendBLEResponse("ERROR: Invalid range_chunk command format");
     }
   }
@@ -312,7 +312,7 @@ void sendStoredReadingsByBLE() {
   while (file.available() >= READING_SIZE) {
     // Check if device is still connected before sending (prevents sending to disconnected device)
     if (!deviceConnected) {
-      Serial.println("[BLE] Device disconnected during send, aborting");
+      VERBOSE_PRINTLN("[BLE] Device disconnected during send, aborting");
       break;
     }
     
@@ -362,7 +362,7 @@ void sendStoredReadingsByBLE() {
       if (batchCount >= BATCH_SIZE) {
         // Log every 10 batches to reduce serial spam
         if ((i + 1) % 20 == 0 || i == 0) {
-          Serial.printf("[BLE] Sending batch of %d readings (size: %d bytes, total sent: %d/%d)\n", batchCount, batchBuffer.length(), i + 1, readingCount);
+          VERBOSE_PRINTF("[BLE] Sending batch of %d readings (size: %d bytes, total sent: %d/%d)\n", batchCount, batchBuffer.length(), i + 1, readingCount);
         }
         sendBLEResponse(batchBuffer);
         batchBuffer = ""; // Clear buffer
@@ -377,7 +377,7 @@ void sendStoredReadingsByBLE() {
   
   // Send any remaining readings in the buffer
   if (batchBuffer.length() > 0) {
-    Serial.printf("[BLE] Sending final batch of %d readings (size: %d bytes)\n", batchCount, batchBuffer.length());
+    VERBOSE_PRINTF("[BLE] Sending final batch of %d readings (size: %d bytes)\n", batchCount, batchBuffer.length());
     sendBLEResponse(batchBuffer);
   }
   file.close();
@@ -445,7 +445,7 @@ void sendStoredReadingsByBLEChunk(int chunkIndex) {
   for (int i = startIndex; i < endIndex && file.available() >= READING_SIZE; i++) {
     // Check if device is still connected before sending
     if (!deviceConnected) {
-      Serial.println("[BLE] Device disconnected during send, aborting");
+      VERBOSE_PRINTLN("[BLE] Device disconnected during send, aborting");
       break;
     }
     
@@ -589,7 +589,7 @@ void sendStoredReadingsByRangeBLEChunk(uint32_t startTime, uint32_t endTime, int
   for (int i = startIndex; i < endIndex; ++i) {
     // Check if device is still connected before sending
     if (!deviceConnected) {
-      Serial.println("[BLE] Device disconnected during range send, aborting");
+      VERBOSE_PRINTLN("[BLE] Device disconnected during range send, aborting");
       break;
     }
     

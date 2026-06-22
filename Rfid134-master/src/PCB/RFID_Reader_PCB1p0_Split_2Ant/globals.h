@@ -32,6 +32,7 @@ extern int readingCount;
 extern unsigned long startTime;
 
 // Reading configuration
+extern bool verbose;
 extern const unsigned long debounceDelay; // ms
 extern unsigned long rfidOnTimeMs;        // configurable
 extern unsigned long lastPeriodicRead;
@@ -119,3 +120,7 @@ extern const float SOC_DIVIDER_R2_OHMS;
 void initSocSensor();
 bool readBatterySoc(float& batteryVoltage, float& socPercent, uint16_t& rawAdc, uint32_t& pinMilliVolts);
 void printBatterySoc(const char* context);
+
+#define VERBOSE_PRINT(...) do { if (verbose) Serial.print(__VA_ARGS__); } while (0)
+#define VERBOSE_PRINTLN(...) do { if (verbose) Serial.println(__VA_ARGS__); } while (0)
+#define VERBOSE_PRINTF(...) do { if (verbose) Serial.printf(__VA_ARGS__); } while (0)

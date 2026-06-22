@@ -54,13 +54,13 @@ bool isTemperatureAvailable(const Rfid134Reading& tag) {
 // --- Helper to try reading and storing a tag ---
 void tryReadAndStoreTag(uint8_t antennaId) {
   if (lastTagValid) {
-    Serial.printf("[READDBG] STORE_ATTEMPT t=%lu ant=%u tag=%03u %012llu\n",
-                  millis(), antennaId, lastTag.country, lastTag.id);
+    VERBOSE_PRINTF("[READDBG] STORE_ATTEMPT t=%lu ant=%u tag=%03u %012llu\n",
+                   millis(), antennaId, lastTag.country, lastTag.id);
     // Validate if temperature data is available
     bool temperatureAvailable = isTemperatureAvailable(lastTag);
     
     if (!temperatureAvailable) {
-      Serial.println("[TEMP] Temperature not available (sensor not enabled)");
+      VERBOSE_PRINTLN("[TEMP] Temperature not available (sensor not enabled)");
     }
     
     uint8_t firstByte = lastTag.reserved1 & 0xFF;
@@ -91,22 +91,29 @@ void tryReadAndStoreTag(uint8_t antennaId) {
                           ((antennaId == 2) ? FLAG_ANT2 : FLAG_ANT1);
     storedReading.reserved = 0;
     storeReading(storedReading);
-    Serial.printf("[READDBG] STORE_OK t=%lu ant=%u count=%u ts=%lu\n",
-                  millis(), antennaId, readingCount, (unsigned long)storedReading.timestamp);
-    Serial.printf("#%d\n", readingCount);
+    VERBOSE_PRINTF("[READDBG] STORE_OK t=%lu ant=%u count=%u ts=%lu\n",
+                   millis(), antennaId, readingCount, (unsigned long)storedReading.timestamp);
     if (temperatureAvailable) {
-      Serial.printf("TAG: %03u %012llu %.2f°C\n", lastTag.country, lastTag.id, temperature);
+      Serial.printf("[RFID_RESULT] stored=true ant=ANT%u reading=%d tag=%03u %012llu temp=%.2f°C\n",
+                    antennaId, readingCount, lastTag.country, lastTag.id, temperature);
     } else {
-      Serial.printf("TAG: %03u %012llu TEMP: N/A\n", lastTag.country, lastTag.id);
+      Serial.printf("[RFID_RESULT] stored=true ant=ANT%u reading=%d tag=%03u %012llu temp=N/A\n",
+                    antennaId, readingCount, lastTag.country, lastTag.id);
+    }
+    VERBOSE_PRINTF("#%d\n", readingCount);
+    if (temperatureAvailable) {
+      VERBOSE_PRINTF("TAG: %03u %012llu %.2f°C\n", lastTag.country, lastTag.id, temperature);
+    } else {
+      VERBOSE_PRINTF("TAG: %03u %012llu TEMP: N/A\n", lastTag.country, lastTag.id);
     }
     if (storedReading.timestamp > 1000000000UL) {
       time_t timestamp = storedReading.timestamp;
       struct tm* timeinfo = gmtime(&timestamp);
-      Serial.printf("Time: %04d-%02d-%02d %02d:%02d:%02d\n",
-                    timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
-                    timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+      VERBOSE_PRINTF("Time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                     timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+                     timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
     }
-    Serial.println();
+    if (verbose) Serial.println();
 
     // Per-antenna success feedback: brief green flash, then return to steady state.
     setLEDStatus("reading_success");
@@ -162,8 +169,8 @@ void RfidNotify::OnPacketRead(const Rfid134Reading& reading) {
   // to prevent duplicate storage
   lastTag = reading;
   lastTagValid = true;
-  Serial.printf("[READDBG] PACKET_RX t=%lu tag=%03u %012llu isData=%d ant_pending=%d\n",
-                millis(), reading.country, reading.id, reading.isData ? 1 : 0, selectedAntennaId);
+  VERBOSE_PRINTF("[READDBG] PACKET_RX t=%lu tag=%03u %012llu isData=%d ant_pending=%d\n",
+                 millis(), reading.country, reading.id, reading.isData ? 1 : 0, selectedAntennaId);
   
   // Don't print tag info here - it will be printed in tryReadAndStoreTag()
   // to avoid duplicate prints
@@ -214,13 +221,13 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
   Serial.printf("[READDBG] WINDOW_START t=%lu ant=%u label=%s window_ms=%lu recovery=%d\n",
                 millis(), antennaId, antennaLabel, windowMs, isRecoveryWindow ? 1 : 0);
   if (drainedBytes > 0) {
-    Serial.printf("[READDBG] RX_DRAIN t=%lu ant=%u bytes=%u\n", millis(), antennaId, drainedBytes);
+    VERBOSE_PRINTF("[READDBG] RX_DRAIN t=%lu ant=%u bytes=%u\n", millis(), antennaId, drainedBytes);
   }
-  Serial.printf("[RFID][%s] Powering ON for %lu ms\n", antennaLabel, windowMs);
+  VERBOSE_PRINTF("[RFID][%s] Powering ON for %lu ms\n", antennaLabel, windowMs);
   if (dashboardModeActive) sendBLEResponse(String("[RFID][") + antennaLabel + "] Powering ON for " + String(windowMs) + " ms");
   digitalWrite(RFID_PWR_PIN, HIGH); // Power ON (active HIGH)
   delay(500); // Give RFID module time to initialize
-  Serial.printf("[RFID][%s] RFID module powered on, starting read window...\n", antennaLabel);
+  VERBOSE_PRINTF("[RFID][%s] RFID module powered on, starting read window...\n", antennaLabel);
   if (dashboardModeActive) sendBLEResponse(String("[RFID][") + antennaLabel + "] RFID module powered on, starting read window...");
   // Anchor for error eligibility/retries in this antenna cycle, including
   // stabilization/recovery-kick phase before timed polling starts.
@@ -228,17 +235,17 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
 
   // Give each antenna a short parser/radio settle sequence before the timed
   // window starts. Any packet captured here is preserved and stored below.
-  Serial.printf("[READDBG] ANT%u_STABILIZE_START t=%lu\n", antennaId, millis());
+  VERBOSE_PRINTF("[READDBG] ANT%u_STABILIZE_START t=%lu\n", antennaId, millis());
   for (int i = 0; i < 6; i++) {
     rfid.loop();
     delay(20);
   }
-  Serial.printf("[READDBG] ANT%u_STABILIZE_END t=%lu\n", antennaId, millis());
+  VERBOSE_PRINTF("[READDBG] ANT%u_STABILIZE_END t=%lu\n", antennaId, millis());
 
   // Recovery windows can become "silent" after module reinit; do a short
   // explicit warm-up sequence to re-prime parser/UART state before timed loop.
   if (isRecoveryWindow) {
-    Serial.printf("[READDBG] RECOVERY_KICK_START t=%lu ant=%u\n", millis(), antennaId);
+    VERBOSE_PRINTF("[READDBG] RECOVERY_KICK_START t=%lu ant=%u\n", millis(), antennaId);
     for (int i = 0; i < 8; i++) {
       rfid.loop();
       delay(25);
@@ -246,7 +253,7 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
         break;
       }
     }
-    Serial.printf("[READDBG] RECOVERY_KICK_END t=%lu ant=%u tag_ready=%d\n", millis(), antennaId, lastTagValid ? 1 : 0);
+    VERBOSE_PRINTF("[READDBG] RECOVERY_KICK_END t=%lu ant=%u tag_ready=%d\n", millis(), antennaId, lastTagValid ? 1 : 0);
   }
 
   unsigned long start = millis();
@@ -271,8 +278,8 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
   if (lastTagValid) {
     packetSeen = true;
     tagStored = true;
-    Serial.printf("[READDBG] TAG_ACCEPT t=%lu ant=%u elapsed=%lu\n", millis(), antennaId, millis() - start);
-    Serial.printf("[RFID][%s] Tag detected and stored\n", antennaLabel);
+    VERBOSE_PRINTF("[READDBG] TAG_ACCEPT t=%lu ant=%u elapsed=%lu\n", millis(), antennaId, millis() - start);
+    VERBOSE_PRINTF("[RFID][%s] Tag detected and stored\n", antennaLabel);
     if (dashboardModeActive) sendBLEResponse(String("[RFID][") + antennaLabel + "] Tag detected and stored");
     tryReadAndStoreTag(antennaId);
     lastTagValid = false;
@@ -316,14 +323,14 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
       lastHandledErrorMs = lastRfidErrorAtMs;
       while (error130RetryCount < 3 && !tagStored && (millis() - start) < maxReadTime) {
         error130RetryCount++;
-        Serial.printf("[READDBG] E130_RETRY t=%lu ant=%u retry=%u/3\n", millis(), antennaId, error130RetryCount);
+        VERBOSE_PRINTF("[READDBG] E130_RETRY t=%lu ant=%u retry=%u/3\n", millis(), antennaId, error130RetryCount);
         unsigned int retryDrainBytes = 0;
         while (Serial1.available()) {
           Serial1.read();
           retryDrainBytes++;
         }
         if (retryDrainBytes > 0) {
-          Serial.printf("[READDBG] E130_RETRY_DRAIN t=%lu ant=%u bytes=%u\n", millis(), antennaId, retryDrainBytes);
+          VERBOSE_PRINTF("[READDBG] E130_RETRY_DRAIN t=%lu ant=%u bytes=%u\n", millis(), antennaId, retryDrainBytes);
         }
         lastTagValid = false;
         rfid.begin();
@@ -332,8 +339,8 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
         if (lastTagValid) {
           packetSeen = true;
           tagStored = true;
-          Serial.printf("[READDBG] TAG_ACCEPT t=%lu ant=%u elapsed=%lu\n", millis(), antennaId, millis() - start);
-          Serial.printf("[RFID][%s] Tag detected and stored\n", antennaLabel);
+          VERBOSE_PRINTF("[READDBG] TAG_ACCEPT t=%lu ant=%u elapsed=%lu\n", millis(), antennaId, millis() - start);
+          VERBOSE_PRINTF("[RFID][%s] Tag detected and stored\n", antennaLabel);
           if (dashboardModeActive) sendBLEResponse(String("[RFID][") + antennaLabel + "] Tag detected and stored");
           tryReadAndStoreTag(antennaId);
           lastTagValid = false;
@@ -343,7 +350,7 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
       }
       error130BurstDone = true;
       if (!tagStored) {
-        Serial.printf("[READDBG] E130_RETRY_LIMIT t=%lu ant=%u retries=%u\n", millis(), antennaId, error130RetryCount);
+        VERBOSE_PRINTF("[READDBG] E130_RETRY_LIMIT t=%lu ant=%u retries=%u\n", millis(), antennaId, error130RetryCount);
         exitReason = "error130_retry_limit";
         break;
       }
@@ -363,8 +370,8 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
     if (lastTagValid) {
       packetSeen = true;
       tagStored = true;
-      Serial.printf("[READDBG] TAG_ACCEPT t=%lu ant=%u elapsed=%lu\n", millis(), antennaId, millis() - start);
-      Serial.printf("[RFID][%s] Tag detected and stored\n", antennaLabel);
+      VERBOSE_PRINTF("[READDBG] TAG_ACCEPT t=%lu ant=%u elapsed=%lu\n", millis(), antennaId, millis() - start);
+      VERBOSE_PRINTF("[RFID][%s] Tag detected and stored\n", antennaLabel);
       if (dashboardModeActive) sendBLEResponse(String("[RFID][") + antennaLabel + "] Tag detected and stored");
 
       // Keep storage flow unchanged: each detected tag is stored with its own timestamp/index.
@@ -429,7 +436,7 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
   Serial.printf("[READDBG] WINDOW_END t=%lu ant=%u stored=%d hang=%d packet_seen=%d elapsed=%lu reason=%s e130_retries=%u loop_err_total=%u loop_err_consec=%u\n",
                 millis(), antennaId, tagStored ? 1 : 0, rfidHangDetected ? 1 : 0, packetSeen ? 1 : 0, millis() - start, exitReason,
                 error130RetryCount, rfidErrorCount, rfidConsecutiveErrors);
-  Serial.printf("[RFID][%s] Power OFF\n", antennaLabel);
+  VERBOSE_PRINTF("[RFID][%s] Power OFF\n", antennaLabel);
   if (dashboardModeActive) sendBLEResponse(String("[RFID][") + antennaLabel + "] Power OFF");
 
   if (rfidHangDetected) {
@@ -439,7 +446,7 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
       sendBLEResponse(String("[RFID][") + antennaLabel + "] No tag detected during window");
     }
   } else if (!tagStored) {
-    Serial.printf("[RFID][%s] No tag detected during window\n", antennaLabel);
+    VERBOSE_PRINTF("[RFID][%s] No tag detected during window\n", antennaLabel);
     if (dashboardModeActive) sendBLEResponse(String("[RFID][") + antennaLabel + "] No tag detected during window");
   }
 
@@ -450,7 +457,7 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
 
 // Power cycle RFID module for recovery
 void powerCycleRFIDModule() {
-  Serial.println("[RFID] Power cycling module for recovery...");
+  VERBOSE_PRINTLN("[RFID] Power cycling module for recovery...");
   if (dashboardModeActive) sendBLEResponse("[RFID] Power cycling module for recovery...");
   
   // Power OFF
@@ -469,16 +476,16 @@ void powerCycleRFIDModule() {
   delay(200);
   
   rfidConsecutiveErrors = 0; // Reset error count after power cycle
-  Serial.println("[RFID] Power cycle complete, module reinitialized");
+  VERBOSE_PRINTLN("[RFID] Power cycle complete, module reinitialized");
   if (dashboardModeActive) sendBLEResponse("[RFID] Power cycle complete");
 }
 
 void powerOnAndReadTagWindow(unsigned long windowMs) {
-  Serial.printf("[READDBG] READ_EFFORT_START t=%lu window_ms=%lu dashboard=%d idle=%d\n",
-                millis(), windowMs, dashboardModeActive ? 1 : 0, idleModeActive ? 1 : 0);
+  VERBOSE_PRINTF("[READDBG] READ_EFFORT_START t=%lu window_ms=%lu dashboard=%d idle=%d\n",
+                 millis(), windowMs, dashboardModeActive ? 1 : 0, idleModeActive ? 1 : 0);
   // Check if RFID module needs recovery
   if (rfidConsecutiveErrors >= MAX_RFID_ERRORS) {
-    Serial.printf("[RFID] Too many errors (%u), power cycling module...\n", rfidConsecutiveErrors);
+    VERBOSE_PRINTF("[RFID] Too many errors (%u), power cycling module...\n", rfidConsecutiveErrors);
     if (dashboardModeActive) {
       sendBLEResponse("[RFID] Module error detected, attempting recovery...");
     }
@@ -495,7 +502,7 @@ void powerOnAndReadTagWindow(unsigned long windowMs) {
   }
 
   if (!ant1.packetSeen && ant1.sawError130) {
-    Serial.println("[READDBG] ANT1 had Error130 with no packet - power cycling and retrying ANT1 once");
+    VERBOSE_PRINTLN("[READDBG] ANT1 had Error130 with no packet - power cycling and retrying ANT1 once");
     powerCycleRFIDModule();
     nextWindowIsRecovery = true;
     selectAntenna1();
@@ -516,7 +523,7 @@ void powerOnAndReadTagWindow(unsigned long windowMs) {
   }
 
   if (!ant2.packetSeen && ant2.sawError130) {
-    Serial.println("[READDBG] ANT2 had Error130 with no packet - power cycling and retrying ANT2 once");
+    VERBOSE_PRINTLN("[READDBG] ANT2 had Error130 with no packet - power cycling and retrying ANT2 once");
     powerCycleRFIDModule();
     nextWindowIsRecovery = true;
     selectAntenna2();
@@ -531,10 +538,10 @@ void powerOnAndReadTagWindow(unsigned long windowMs) {
 
   // Measure battery state once per complete read effort (both antennas).
   printBatterySoc("Read effort complete");
-  Serial.printf("[READDBG] READ_EFFORT_END t=%lu count=%u led=%s\n",
-                millis(), readingCount, currentLEDStatus.c_str());
-  Serial.printf("[READDBG] READ_EFFORT_RESULT t=%lu result=%s\n",
-                millis(), readSucceeded ? "success" : "failed");
+  VERBOSE_PRINTF("[READDBG] READ_EFFORT_END t=%lu count=%u led=%s\n",
+                 millis(), readingCount, currentLEDStatus.c_str());
+  VERBOSE_PRINTF("[READDBG] READ_EFFORT_RESULT t=%lu result=%s\n",
+                 millis(), readSucceeded ? "success" : "failed");
 
   // Don't immediately reset LED status - let updateLEDStatus() handle timing.
 }

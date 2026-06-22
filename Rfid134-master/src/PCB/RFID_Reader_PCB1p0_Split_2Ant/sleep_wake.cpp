@@ -77,12 +77,12 @@ void configureWakeSources(uint64_t sleep_us, bool enableButtonWake, bool enableU
     
     esp_err_t uart_result = esp_sleep_enable_uart_wakeup(UART_NUM_0);
     if (uart_result == ESP_OK) {
-      Serial.println("[LIGHTSLEEP] UART wake-up enabled for dashboard commands");
+      VERBOSE_PRINTLN("[LIGHTSLEEP] UART wake-up enabled for dashboard commands");
     } else {
       Serial.printf("[LIGHTSLEEP] UART wake-up FAILED: %d\n", uart_result);
     }
   } else {
-    Serial.println("[LIGHTSLEEP] UART wake-up disabled");
+    VERBOSE_PRINTLN("[LIGHTSLEEP] UART wake-up disabled");
   }
 }
 
@@ -107,7 +107,7 @@ void lightSleepUntilNextEvent(uint64_t sleep_us) {
   
   // If remaining == 0, don't go to sleep; handle pending flags first
   if (sleep_us == 0) {
-    Serial.println("[LIGHTSLEEP] Skip sleep (remaining=0 ms)");
+    VERBOSE_PRINTLN("[LIGHTSLEEP] Skip sleep (remaining=0 ms)");
     return;
   }
 
@@ -128,7 +128,7 @@ void lightSleepUntilNextEvent(uint64_t sleep_us) {
   // Print BEFORE going to sleep (essential for dashboard)
   Serial.printf("[LIGHTSLEEP] Entering light sleep for ~%llu ms\n",
                 (unsigned long long)(sleep_us / 1000ULL));
-  Serial.println("[LIGHTSLEEP] About to enter sleep...");
+  VERBOSE_PRINTLN("[LIGHTSLEEP] About to enter sleep...");
   Serial.flush(); // Ensure message is sent before drain
   serialDrain(100); // reliably flush console before clocks stop
   
@@ -150,7 +150,7 @@ void lightSleepUntilNextEvent(uint64_t sleep_us) {
   }
   
   // AFTER wake, print the cause and set flags if needed (essential for dashboard)
-  Serial.println("[LIGHTSLEEP] Woke up from sleep!");
+  VERBOSE_PRINTLN("[LIGHTSLEEP] Woke up from sleep!");
   Serial.flush(); // Ensure message is sent
   
   // Small delay to ensure USB-CDC processed the first message
@@ -164,7 +164,7 @@ void lightSleepUntilNextEvent(uint64_t sleep_us) {
   else if (cause == ESP_SLEEP_WAKEUP_UART) causeName = "UART";
   else causeName = "Other";
   
-  Serial.printf("[LIGHTSLEEP] Wake-up cause: %d (%s)\n", (int)cause, causeName);
+  VERBOSE_PRINTF("[LIGHTSLEEP] Wake-up cause: %d (%s)\n", (int)cause, causeName);
   Serial.flush(); // Ensure message is sent
   
   delay(10);  // Small delay between messages
