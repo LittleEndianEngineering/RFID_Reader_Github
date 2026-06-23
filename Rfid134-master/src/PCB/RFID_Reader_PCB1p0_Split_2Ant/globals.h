@@ -97,6 +97,10 @@ extern String configFile;
 extern String currentLEDStatus;
 extern unsigned long ledStatusStartTime;
 extern unsigned long ledFlashDuration;
+extern const unsigned long ledHeartbeatIntervalMs;
+extern const unsigned long ledHeartbeatOnMs;
+extern bool ledHeartbeatOn;
+extern unsigned long ledHeartbeatPhaseStartTime;
 
 // Light-sleep diagnostics & wake fixes
 extern uint32_t wake_count_timer;

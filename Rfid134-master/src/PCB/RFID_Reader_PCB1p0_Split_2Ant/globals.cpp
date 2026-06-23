@@ -80,6 +80,10 @@ String configFile = "/config.txt";
 String currentLEDStatus = "off";
 unsigned long ledStatusStartTime = 0;
 unsigned long ledFlashDuration = 0;
+const unsigned long ledHeartbeatIntervalMs = 20000; // off time between heartbeat blinks
+const unsigned long ledHeartbeatOnMs = 1000;        // on time for each heartbeat blink
+bool ledHeartbeatOn = false;
+unsigned long ledHeartbeatPhaseStartTime = 0;
 
 // Light-sleep diagnostics & wake fixes
 uint32_t wake_count_timer = 0;
