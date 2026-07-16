@@ -92,12 +92,10 @@ void configureWakeSources(uint64_t sleep_us, bool enableButtonWake, bool enableU
 
 // Enter light sleep until either the timer expires or button/UART wakes
 void lightSleepUntilNextEvent(uint64_t sleep_us) {
-  // If dashboard mode is active, do not sleep - stay awake
-  if (dashboardModeActive) {
+  // Dashboard access is a service override: stay awake even if idle mode is active.
+  if (dashboardAccessAllowed()) {
     return;
   }
-
-  // USB check removed - ESP32-S3 USB stability improvements are sufficient
 
   // If serial data is available, do not sleep
   if (Serial.available()) {
@@ -206,7 +204,7 @@ void lightSleepUntilNextEvent(uint64_t sleep_us) {
   if (Serial.available()) {
     // Mark host as active to prevent immediate re-sleep
     lastCommandTime = millis();
-    // NOTE: Dashboard Mode is controlled ONLY by the multi-button (long press)
-    // Serial commands do NOT affect Dashboard Mode
+    // UART wake-up services pending serial commands without implicitly changing
+    // Dashboard Mode. Dashboard Mode changes only by explicit command or button.
   }
 }

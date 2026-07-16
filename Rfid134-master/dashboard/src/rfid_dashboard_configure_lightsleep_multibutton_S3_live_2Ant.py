@@ -6,14 +6,17 @@ PROPRIETARY SOFTWARE
 Copyright (c) 2025 Establishment Labs
 Developed by Little Endian Engineering
 
-Version: 3.0 (ESP32-S3 + Dashboard Mode Persistence + macOS Connection Improvements)
-Date: November 2025
+Version: 6.1 (ESP32-S3 + Dual Antenna + Low-SoC Service Access)
+Date: July 2026
 
 DESCRIPTION:
 Streamlit-based dashboard for Implant RFID Reader ESP32-S3 device with multi-button support and RGB LED status indicators.
 Provides real-time data visualization, filtering, and configuration management.
 Supports multiple timezones, CSV export functionality, configurable button timings, and hardware LED status monitoring.
-Includes Dashboard Mode persistence and improved macOS connection stability.
+Includes Dashboard Mode persistence, improved macOS connection stability, dual-antenna parsing,
+live data retrieval, idle-mode visibility, low-SoC controls, battery calibration, LED heartbeat
+configuration, low-SoC USB recovery access, Dashboard Mode service latch control,
+and firmware debug toggles.
 
 FEATURES:
 - Real-time serial communication with ESP32-S3
@@ -24,11 +27,14 @@ FEATURES:
 - Interactive data visualization with Plotly
 - CSV export functionality
 - ESP32-S3 configuration management
+- Advanced firmware configuration for low-SoC idle, USB recovery access, battery calibration, Dashboard Mode service access, verbose logging, and LED heartbeat timing
 - Multi-timezone display support
 - Password-protected storage clearing
 - Comprehensive User Guide with hardware setup instructions
-- Dashboard Mode persistence (survives device resets)
+- Dashboard Mode service latch persistence (survives device resets)
 - Improved macOS connection handling for ESP32-S3 USB-CDC
+- Dual-antenna ANT1/ANT2 parsing and display
+- Idle mode status, reason, and low-SoC USB recovery visibility
 
 REQUIREMENTS:
 - Python 3.8+
@@ -36,7 +42,7 @@ REQUIREMENTS:
 - ESP32-S3 device with Multi-Button Implant RFID Reader firmware
 
 USAGE:
-streamlit run rfid_dashboard_configure_lightsleep_multibutton_S3.py
+streamlit run rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py
 
 CONTACT:
 Establishment Labs lyu@establishmentlabs.com
@@ -103,8 +109,6 @@ if 'last_raw_response' not in st.session_state:
     st.session_state['last_raw_response'] = None
 if 'selected_timezone' not in st.session_state:
     st.session_state['selected_timezone'] = 'America/Costa_Rica'
-# last_ping variable removed - using dashboard mode approach instead
-# enable_keepalive variable removed - using dashboard mode approach instead
 if 'dashboard_mode' not in st.session_state:
     st.session_state['dashboard_mode'] = False
 # Initialize configuration widget defaults
@@ -118,6 +122,24 @@ if 'esp32_rfidOnTime' not in st.session_state:
     st.session_state['esp32_rfidOnTime'] = 5
 if 'esp32_periodicInterval' not in st.session_state:
     st.session_state['esp32_periodicInterval'] = 60
+if 'esp32_socLowIdleEnabled' not in st.session_state:
+    st.session_state['esp32_socLowIdleEnabled'] = True
+if 'esp32_lowSocUsbRecoveryWindow' not in st.session_state:
+    st.session_state['esp32_lowSocUsbRecoveryWindow'] = 15.0
+if 'esp32_socLowThresholdPercent' not in st.session_state:
+    st.session_state['esp32_socLowThresholdPercent'] = 10.0
+if 'esp32_batteryMinVoltage' not in st.session_state:
+    st.session_state['esp32_batteryMinVoltage'] = 3.52
+if 'esp32_batteryMaxVoltage' not in st.session_state:
+    st.session_state['esp32_batteryMaxVoltage'] = 4.15
+if 'esp32_verbose' not in st.session_state:
+    st.session_state['esp32_verbose'] = False
+if 'esp32_dashboardModeActive' not in st.session_state:
+    st.session_state['esp32_dashboardModeActive'] = False
+if 'esp32_ledHeartbeatInterval' not in st.session_state:
+    st.session_state['esp32_ledHeartbeatInterval'] = 20.0
+if 'esp32_ledHeartbeatOn' not in st.session_state:
+    st.session_state['esp32_ledHeartbeatOn'] = 1.0
 # Initialize Live View session state
 if 'live_view_enabled' not in st.session_state:
     st.session_state['live_view_enabled'] = False
@@ -139,6 +161,12 @@ if 'idle_mode_active' not in st.session_state:
     st.session_state['idle_mode_active'] = False
 if 'idle_mode_reason' not in st.session_state:
     st.session_state['idle_mode_reason'] = ""
+if 'idle_recovery_active' not in st.session_state:
+    st.session_state['idle_recovery_active'] = False
+if 'idle_recovery_remaining_s' not in st.session_state:
+    st.session_state['idle_recovery_remaining_s'] = 0
+if 'idle_recovery_updated_at' not in st.session_state:
+    st.session_state['idle_recovery_updated_at'] = 0
 if 'last_status_poll' not in st.session_state:
     st.session_state['last_status_poll'] = 0
 if 'status_state_initialized' not in st.session_state:
@@ -152,6 +180,7 @@ if 'status_retry_count' not in st.session_state:
 
 WAKE_DELAY = 0.22  # seconds; first byte wakes ESP32 from light sleep and is typically lost
 STATUS_POLL_INTERVAL_SECONDS = 300  # 5 minutes
+RECOVERY_STATUS_POLL_INTERVAL_SECONDS = 1
 MIN_RFID_ON_TIME_SECONDS = 3  # Safety minimum to keep dual-antenna windows reliable
 VERBOSE = True
 
@@ -474,7 +503,7 @@ def _wake_and_send_command(ser, command, wake_delay=WAKE_DELAY, max_retries=3, f
             ser.flush()
             time.sleep(wake_delay) # give ESP32 time to fully wake clocks
             
-            # Clear any old data before sending new command
+            # Clear stale buffered data before sending a new command.
             log_general_debug(f"[HOSTDBG] reset_input_buffer before cmd t={time.time():.3f} cmd={command}")
             ser.reset_input_buffer()
             
@@ -574,7 +603,7 @@ def send_command(ser, command):
         else:
             # For other commands, use the standard wake-then-send approach
             _wake_serial(ser)
-            # Clear any old data before sending new command
+            # Clear stale buffered data before sending a new command.
             log_general_debug(f"[HOSTDBG] reset_input_buffer before cmd t={time.time():.3f} cmd={command}")
             ser.reset_input_buffer()
             ser.write(f"{command}\n".encode())
@@ -632,9 +661,6 @@ def send_command(ser, command):
     except Exception as e:
         log_general_debug(f"[DEBUG] Error in send_command: {e}")
         return ""
-
-# Keep-alive function for dashboard mode - send periodic commands to prevent auto-deactivation
-# Keepalive function removed - dashboard mode is now controlled purely by toggle state
 
 def parse_readings(response):
     """Parse RFID readings from ESP32 response"""
@@ -718,7 +744,7 @@ def get_variable_with_markers(ser, var):
         return None
     
     try:
-        # Wake device and clear any old data
+        # Wake device and clear stale buffered data.
         _wake_serial(ser)
         ser.reset_input_buffer()
     except SERIAL_EXCEPTIONS as e:
@@ -735,7 +761,16 @@ def get_variable_with_markers(ser, var):
         "periodicIntervalMs": "PERIODICINTERVAL",
         "ssid": "SSID",
         "password": "PASSWORD",
-        "longPressMs": "LONGPRESSMS"
+        "longPressMs": "LONGPRESSMS",
+        "socLowIdleEnabled": "SOCLOWIDLEENABLED",
+        "lowSocUsbRecoveryWindowMs": "LOWSOCUSBRECOVERYWINDOWMS",
+        "socLowThresholdPercent": "SOCLOWTHRESHOLDPERCENT",
+        "batteryMinVoltage": "BATTERYMINVOLTAGE",
+        "batteryMaxVoltage": "BATTERYMAXVOLTAGE",
+        "verbose": "VERBOSE",
+        "dashboardModeActive": "DASHBOARDMODEACTIVE",
+        "ledHeartbeatIntervalMs": "LEDHEARTBEATINTERVALMS",
+        "ledHeartbeatOnMs": "LEDHEARTBEATONMS"
     }
     marker_base = marker_map.get(var, var.upper())
     start_marker = f"<GET_{marker_base}_BEGIN>"
@@ -841,12 +876,83 @@ def test_connection(ser):
         log_general_debug(f"[DEBUG] Connection test failed: {e}")
         return False
 
+def wait_for_device_ready(ser, max_wait=8.0):
+    """Probe status until the ESP32 is ready after USB serial open/reset."""
+    if ser is None or not is_serial_valid(ser):
+        return False
+
+    deadline = time.time() + max_wait
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            log_general_debug(f"[CONNECT] Readiness probe attempt {attempt}")
+            if hasattr(ser, "reset_input_buffer"):
+                ser.reset_input_buffer()
+            ser.write(b"\n")
+            ser.flush()
+            time.sleep(0.12)
+            if hasattr(ser, "reset_input_buffer"):
+                ser.reset_input_buffer()
+            ser.write(b"status\n")
+            ser.flush()
+
+            probe_deadline = time.time() + 1.0
+            response_lines = []
+            while time.time() < probe_deadline:
+                if ser.in_waiting:
+                    line = ser.readline().decode(errors='ignore').strip()
+                    if line:
+                        response_lines.append(line)
+                        log_general_debug(f"[CONNECT] Readiness probe received: {line}")
+                        if ("Dashboard Mode:" in line or
+                            "[IDLE] Mode:" in line or
+                            "CMD_RECEIVED" in line):
+                            log_general_debug("[CONNECT] ESP32 readiness confirmed")
+                            return True
+                else:
+                    time.sleep(0.02)
+
+            if response_lines:
+                joined = "\n".join(response_lines)
+                parsed = parse_status_response(joined)
+                if parsed["dashboard_mode"] is not None or parsed["idle_mode"] is not None:
+                    log_general_debug("[CONNECT] ESP32 readiness confirmed from parsed status")
+                    return True
+        except SERIAL_EXCEPTIONS as e:
+            log_general_debug(f"[CONNECT] Readiness probe serial error: {e}")
+            return False
+        except Exception as e:
+            log_general_debug(f"[CONNECT] Readiness probe warning: {e}")
+
+        time.sleep(0.35)
+
+    log_general_debug("[CONNECT] ESP32 readiness probe timed out")
+    return False
+
+def send_range_command_with_retry(ser, command, context_label, retries=1):
+    """Send a range command and retry briefly if Windows/USB timing returns empty."""
+    response = send_command(ser, command)
+    if response and response.strip():
+        return response
+
+    for attempt in range(retries):
+        log_general_debug(f"[HOSTDBG] {context_label}_empty_retry attempt={attempt+1}/{retries} t={time.time():.3f}")
+        time.sleep(0.8)
+        response = send_command(ser, command)
+        if response and response.strip():
+            return response
+
+    return response
+
 def parse_status_response(response):
     """Parse status response lines into dashboard/idle state."""
     status = {
         "dashboard_mode": None,
         "idle_mode": None,
-        "idle_reason": ""
+        "idle_reason": "",
+        "idle_recovery_active": None,
+        "idle_recovery_remaining_s": None
     }
 
     for raw_line in response.splitlines():
@@ -874,6 +980,24 @@ def parse_status_response(response):
             if len(parts) == 2:
                 status["idle_reason"] = parts[1].strip()
 
+        if "low soc usb recovery:" in line_lower:
+            line_upper = line.upper()
+            if "INACTIVE" in line_upper:
+                status["idle_recovery_active"] = False
+            elif "ACTIVE" in line_upper:
+                status["idle_recovery_active"] = True
+
+            match = re.search(r"(\d+)\s*s\s+remaining", line_lower)
+            if match:
+                status["idle_recovery_remaining_s"] = int(match.group(1))
+
+        if "[idle] usb recovery remaining:" in line_lower:
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                match = re.search(r"(\d+)", parts[1])
+                if match:
+                    status["idle_recovery_remaining_s"] = int(match.group(1))
+
     # Defensive fallback: if device reported a concrete idle reason but no explicit idle mode
     # line was parsed, infer active idle mode from reason.
     if status["idle_mode"] is None and status["idle_reason"]:
@@ -883,13 +1007,62 @@ def parse_status_response(response):
 
     return status
 
+def expire_idle_recovery_state():
+    """Expire the low-SoC recovery banner locally between device status polls."""
+    if not st.session_state.get('idle_recovery_active', False):
+        return
+
+    updated_at = st.session_state.get('idle_recovery_updated_at', 0)
+    remaining_s = st.session_state.get('idle_recovery_remaining_s', 0)
+    if updated_at <= 0 or remaining_s <= 0:
+        st.session_state['idle_recovery_active'] = False
+        st.session_state['idle_recovery_remaining_s'] = 0
+        return
+
+    elapsed_s = time.time() - updated_at
+    current_remaining = max(0, int(remaining_s - elapsed_s + 0.999))
+    st.session_state['idle_recovery_remaining_s'] = current_remaining
+    if current_remaining <= 0:
+        st.session_state['idle_recovery_active'] = False
+
+def apply_parsed_status(parsed):
+    """Apply parsed status/debug fields to session state."""
+    now_ts = time.time()
+    if parsed["dashboard_mode"] is not None:
+        st.session_state['device_dashboard_mode'] = parsed["dashboard_mode"]
+        if parsed["dashboard_mode"]:
+            st.session_state['idle_recovery_active'] = False
+            st.session_state['idle_recovery_remaining_s'] = 0
+            st.session_state['idle_recovery_updated_at'] = 0
+    if parsed["idle_mode"] is not None:
+        st.session_state['idle_mode_active'] = parsed["idle_mode"]
+    if parsed["idle_reason"]:
+        st.session_state['idle_mode_reason'] = parsed["idle_reason"]
+    if st.session_state.get('device_dashboard_mode', False):
+        st.session_state['idle_recovery_active'] = False
+        st.session_state['idle_recovery_remaining_s'] = 0
+        st.session_state['idle_recovery_updated_at'] = 0
+    elif parsed["idle_recovery_active"] is not None:
+        st.session_state['idle_recovery_active'] = parsed["idle_recovery_active"]
+        st.session_state['idle_recovery_updated_at'] = now_ts
+        if not parsed["idle_recovery_active"]:
+            st.session_state['idle_recovery_remaining_s'] = 0
+    if not st.session_state.get('device_dashboard_mode', False) and parsed["idle_recovery_remaining_s"] is not None:
+        st.session_state['idle_recovery_remaining_s'] = parsed["idle_recovery_remaining_s"]
+        st.session_state['idle_recovery_updated_at'] = now_ts
+        if parsed["idle_recovery_remaining_s"] <= 0:
+            st.session_state['idle_recovery_active'] = False
+
 def poll_device_status_if_due():
     """Poll status from ESP32 every 5 minutes while connected."""
     if not st.session_state.connected or not is_serial_valid(st.session_state.serial_connection):
         return
 
+    expire_idle_recovery_state()
+
     now_ts = time.time()
-    if now_ts - st.session_state.get('last_status_poll', 0) < STATUS_POLL_INTERVAL_SECONDS:
+    poll_interval = RECOVERY_STATUS_POLL_INTERVAL_SECONDS if st.session_state.get('idle_recovery_active', False) else STATUS_POLL_INTERVAL_SECONDS
+    if now_ts - st.session_state.get('last_status_poll', 0) < poll_interval:
         return
 
     log_general_debug(f"[HOSTDBG] status_poll_start t={time.time():.3f}")
@@ -903,7 +1076,9 @@ def poll_device_status_if_due():
     parsed_any = (
         parsed["dashboard_mode"] is not None or
         parsed["idle_mode"] is not None or
-        bool(parsed["idle_reason"])
+        bool(parsed["idle_reason"]) or
+        parsed["idle_recovery_active"] is not None or
+        parsed["idle_recovery_remaining_s"] is not None
     )
 
     if not parsed_any:
@@ -921,13 +1096,8 @@ def poll_device_status_if_due():
     st.session_state['last_status_poll'] = now_ts
     st.session_state['status_state_initialized'] = True
     st.session_state['status_retry_count'] = 0
-    if parsed["dashboard_mode"] is not None:
-        st.session_state['device_dashboard_mode'] = parsed["dashboard_mode"]
-    if parsed["idle_mode"] is not None:
-        st.session_state['idle_mode_active'] = parsed["idle_mode"]
-    if parsed["idle_reason"]:
-        st.session_state['idle_mode_reason'] = parsed["idle_reason"]
-    log_general_debug(f"[HOSTDBG] status_poll_done t={time.time():.3f} dashboard={st.session_state.get('device_dashboard_mode')} idle={st.session_state.get('idle_mode_active')}")
+    apply_parsed_status(parsed)
+    log_general_debug(f"[HOSTDBG] status_poll_done t={time.time():.3f} dashboard={st.session_state.get('device_dashboard_mode')} idle={st.session_state.get('idle_mode_active')} recovery={st.session_state.get('idle_recovery_active')}")
 
 
 # =============================================================================
@@ -1119,10 +1289,21 @@ with tabs[0]:
                     connection_success = (st.session_state.serial_connection is not None)
                     if st.session_state.serial_connection:
                         log_general_debug(f"[CONNECT] Connection object created successfully")
-                        # Wait a bit for ESP32 to finish booting after reset (if reset occurred)
-                        # Note: ESP32 should already be in dashboard mode when connecting
-                        log_general_debug(f"[CONNECT] Waiting for ESP32 to stabilize connection...")
-                        time.sleep(0.5)  # Brief delay for connection to stabilize
+                        # Wait for ESP32 to finish booting after reset/enumeration before marking it connected.
+                        # Windows can take longer than macOS to deliver the first reliable USB-CDC response.
+                        log_general_debug(f"[CONNECT] Waiting for ESP32 readiness handshake...")
+                        device_ready = wait_for_device_ready(st.session_state.serial_connection)
+                        if not device_ready:
+                            log_general_debug("[CONNECT] ESP32 did not answer readiness probes; closing connection")
+                            try:
+                                st.session_state.serial_connection.close()
+                            except Exception:
+                                pass
+                            st.session_state.serial_connection = None
+                            st.session_state.connected = False
+                            st.session_state.connected_port = None
+                            st.sidebar.error("⚠️ ESP32 did not respond. Confirm Dashboard Mode is active and try again.")
+                            st.stop()
                         
                         st.session_state.connected = True
                         st.session_state.connected_port = selected_port  # Store port name (persists across reruns)
@@ -1156,6 +1337,9 @@ with tabs[0]:
             st.session_state['device_dashboard_mode'] = False
             st.session_state['idle_mode_active'] = False
             st.session_state['idle_mode_reason'] = ""
+            st.session_state['idle_recovery_active'] = False
+            st.session_state['idle_recovery_remaining_s'] = 0
+            st.session_state['idle_recovery_updated_at'] = 0
             st.session_state['status_state_initialized'] = False
             st.session_state['status_retry_count'] = 0
             st.sidebar.info("Disconnected! (Dashboard mode remains active on ESP32)")
@@ -1190,11 +1374,18 @@ with tabs[0]:
         
         if st.session_state.connected:
             poll_device_status_if_due()
+            expire_idle_recovery_state()
             st.success("✅ Connected to RFID Reader")
 
             if st.session_state.get('idle_mode_active', False):
                 idle_reason = st.session_state.get('idle_mode_reason', '').strip() or "Unknown reason"
-                st.warning(f"🟨 **Idle Mode Active:** {idle_reason}")
+                if st.session_state.get('device_dashboard_mode', False):
+                    st.warning(f"🟨 **Idle Mode Active:** {idle_reason}. USB dashboard data retrieval and configuration remain available; RFID reads stay blocked while idle is active.")
+                elif st.session_state.get('idle_recovery_active', False):
+                    recovery_remaining = st.session_state.get('idle_recovery_remaining_s', 0)
+                    st.warning(f"🟨 **Idle Mode Active:** {idle_reason}. USB recovery window active ({recovery_remaining}s remaining); dashboard data/config access is available and RFID reads stay blocked.")
+                else:
+                    st.warning(f"🟨 **Idle Mode Active:** {idle_reason}")
             
             # Show connection status and last update time
             if st.session_state.get('live_view_enabled', False):
@@ -1391,7 +1582,7 @@ with tabs[0]:
                     with st.spinner("Retrieving data from RFID reader..."):
                         command = f"range {start_epoch} {end_epoch}"
                         log_general_debug(f"[HOSTDBG] manual_range_start t={time.time():.3f} start={start_epoch} end={end_epoch}")
-                        response = send_command(st.session_state.serial_connection, command)
+                        response = send_range_command_with_retry(st.session_state.serial_connection, command, "manual_range", retries=1)
                         # Always record something so the UI can show a summary area
                         st.session_state['last_raw_response'] = response if response is not None else ""
                         if response:
@@ -1450,7 +1641,7 @@ with tabs[0]:
                         log_general_debug(f"[HOSTDBG] live_range_start t={time.time():.3f} start={start_epoch_live} end={end_epoch_live_now}")
                         
                         try:
-                            response = send_command(st.session_state.serial_connection, command)
+                            response = send_range_command_with_retry(st.session_state.serial_connection, command, "live_range", retries=1)
                             st.session_state['last_raw_response'] = response if response is not None else ""
                             
                             if not response or response.strip() == "":
@@ -1662,7 +1853,7 @@ with tabs[0]:
                         # Only show warning if there are invalid numeric values (not just N/A)
                         invalid_count = len(df_chart) - len(df_clean) - na_count
                         if invalid_count > 0:
-                            st.warning(f"⚠️ Removed {invalid_count} row(s) with invalid temperature data")
+                            st.warning(f"⚠️ Filtered out {invalid_count} row(s) with invalid temperature data")
                     
                     if not df_clean.empty:
                         fig = px.line(
@@ -1762,6 +1953,8 @@ with tabs[0]:
         if st.button("🔢 Debug Info", use_container_width=True):
             response = send_command(st.session_state.serial_connection, "debug")
             if response:
+                parsed_debug_status = parse_status_response(response)
+                apply_parsed_status(parsed_debug_status)
                 st.text("Debug information:")
                 if "[SOC] Latest:" in response:
                     st.code(response)
@@ -1830,46 +2023,111 @@ with tabs[1]:
         st.session_state.update(st.session_state['pending_esp32_update'])
         st.session_state['pending_esp32_update'] = None
         st.rerun()
+    st.markdown("### Network")
     ssid = st.text_input("WiFi SSID", key="esp32_ssid")
+    st.caption("Network name used only when the RTC must be restored from NTP.")
     password = st.text_input("WiFi Password", type="password", key="esp32_password")
+    st.caption("Network password saved on the device for RTC/NTP recovery.")
+
+    st.markdown("### Reading and Button Timing")
     rfidOnTime = st.number_input("RFID ON Time (seconds)", min_value=MIN_RFID_ON_TIME_SECONDS, max_value=60, key="esp32_rfidOnTime")
-    st.caption(f"Minimum allowed: {MIN_RFID_ON_TIME_SECONDS}s for stable dual-antenna reads.")
+    st.caption(f"How long the RFID reader stays powered during each read window. Minimum allowed: {MIN_RFID_ON_TIME_SECONDS}s for stable dual-antenna reads.")
     periodicInterval = st.number_input("Periodic Interval (seconds)", min_value=10, max_value=3600, key="esp32_periodicInterval")
-    longPressTime = st.number_input("Long Press Timer (seconds)", min_value=1, max_value=30, key="esp32_longPressTime", 
-                                   help="Duration to hold button for dashboard mode toggle")
+    st.caption("Delay between automatic periodic RFID read attempts when dashboard mode and idle mode are inactive.")
+    longPressTime = st.number_input("Long Press Timer (seconds)", min_value=1, max_value=30, key="esp32_longPressTime")
+    st.caption("Button hold duration required to toggle Dashboard Mode service access from the device.")
+
+    st.markdown("### Power and Idle Mode")
+    socLowIdleEnabled = st.checkbox("Enable Low SoC Idle Mode", key="esp32_socLowIdleEnabled")
+    st.caption("Allows measured low battery percentage to place the device in idle mode.")
+    lowSocUsbRecoveryWindow = st.number_input("Low SoC USB Recovery Window (seconds)", min_value=0.0, max_value=300.0, step=1.0, format="%.0f", key="esp32_lowSocUsbRecoveryWindow")
+    st.caption("Temporary wake window after low-SoC idle so USB can connect and enable Dashboard Mode. Once Dashboard Mode is active, this countdown is no longer relevant.")
+    socLowThresholdPercent = st.number_input("Low SoC Threshold (%)", min_value=0.0, max_value=100.0, step=0.5, format="%.1f", key="esp32_socLowThresholdPercent")
+    st.caption("Battery percentage at or below which low-SoC idle mode becomes active.")
+    batteryMinVoltage = st.number_input("Battery Minimum Voltage", min_value=2.5, max_value=4.2, step=0.01, format="%.2f", key="esp32_batteryMinVoltage")
+    st.caption("Voltage treated as 0% battery for the linear SoC calculation.")
+    batteryMaxVoltage = st.number_input("Battery Maximum Voltage", min_value=3.5, max_value=4.5, step=0.01, format="%.2f", key="esp32_batteryMaxVoltage")
+    st.caption("Voltage treated as 100% battery for the linear SoC calculation.")
+
+    st.markdown("### Diagnostics and Runtime")
+    verbose = st.checkbox("Verbose Serial Prints", key="esp32_verbose")
+    st.caption("Enables detailed firmware debug logs over serial; leave off for normal dashboard use.")
+    dashboardModeActive = st.checkbox("Dashboard Mode Active", key="esp32_dashboardModeActive")
+    st.caption("Service mode latch. Keep ON while using USB dashboard access; turn OFF only when releasing the device back to normal light-sleep operation.")
+
+    st.markdown("### LED Heartbeat")
+    ledHeartbeatInterval = st.number_input("LED Heartbeat Interval (seconds)", min_value=1.0, max_value=120.0, step=0.5, format="%.1f", key="esp32_ledHeartbeatInterval")
+    st.caption("Off-time between status heartbeat blinks for sleep, dashboard, and idle states.")
+    ledHeartbeatOn = st.number_input("LED Heartbeat On Duration (seconds)", min_value=0.1, max_value=10.0, step=0.1, format="%.1f", key="esp32_ledHeartbeatOn")
+    st.caption("How long the LED stays on for each heartbeat blink.")
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Set Variables on ESP32"):
             st.session_state['set_debug_log'] = []  # Clear previous set debug log
             if st.session_state.connected:
-                cmds = [
-                    f"set ssid {ssid}",
-                    f"set password {password}",
-                    f"set rfidOnTimeMs {int(rfidOnTime*1000)}",
-                    f"set periodicIntervalMs {int(periodicInterval*1000)}",
-                    f"set longPressMs {int(longPressTime*1000)}"
-                ]
-                for cmd in cmds:
-                    log_set_debug(f"[DEBUG] Sending command: {cmd}")
-                    resp = send_command(st.session_state.serial_connection, cmd)
-                    # Move 'OK' to immediately after 'Response received:' if present
-                    if resp:
-                        lines = resp.splitlines()
-                        ok_lines = [line for line in lines if line.strip() == 'OK']
-                        other_lines = [line for line in lines if line.strip() != 'OK']
-                        if ok_lines:
-                            log_set_debug(f"[DEBUG] Response received:\nOK\n" + "\n".join(other_lines))
+                valid_config = True
+                if batteryMaxVoltage <= batteryMinVoltage:
+                    valid_config = False
+                    st.error("Battery maximum voltage must be greater than battery minimum voltage.")
+                    log_set_debug("[ERROR] Battery maximum voltage must be greater than battery minimum voltage.")
+                if ledHeartbeatOn >= ledHeartbeatInterval:
+                    valid_config = False
+                    st.error("LED heartbeat on duration must be shorter than the heartbeat interval.")
+                    log_set_debug("[ERROR] LED heartbeat on duration must be shorter than the heartbeat interval.")
+
+                if valid_config:
+                    cmds = [
+                        f"set ssid {ssid}",
+                        f"set password {password}",
+                        f"set rfidOnTimeMs {int(rfidOnTime*1000)}",
+                        f"set periodicIntervalMs {int(periodicInterval*1000)}",
+                        f"set longPressMs {int(longPressTime*1000)}",
+                        f"set socLowIdleEnabled {1 if socLowIdleEnabled else 0}",
+                        f"set lowSocUsbRecoveryWindowMs {int(lowSocUsbRecoveryWindow*1000)}",
+                        f"set socLowThresholdPercent {socLowThresholdPercent:.2f}",
+                        f"set batteryMinVoltage {batteryMinVoltage:.2f}",
+                        f"set batteryMaxVoltage {batteryMaxVoltage:.2f}",
+                        f"set verbose {1 if verbose else 0}",
+                        f"set dashboardModeActive {1 if dashboardModeActive else 0}",
+                        f"set ledHeartbeatIntervalMs {int(ledHeartbeatInterval*1000)}",
+                        f"set ledHeartbeatOnMs {int(ledHeartbeatOn*1000)}"
+                    ]
+                    for cmd in cmds:
+                        log_set_debug(f"[DEBUG] Sending command: {cmd}")
+                        resp = send_command(st.session_state.serial_connection, cmd)
+                        # Move 'OK' to immediately after 'Response received:' if present
+                        if resp:
+                            lines = resp.splitlines()
+                            ok_lines = [line for line in lines if line.strip() == 'OK']
+                            other_lines = [line for line in lines if line.strip() != 'OK']
+                            if ok_lines:
+                                log_set_debug(f"[DEBUG] Response received:\nOK\n" + "\n".join(other_lines))
+                            else:
+                                log_set_debug(f"[DEBUG] Response received:\n" + resp)
                         else:
-                            log_set_debug(f"[DEBUG] Response received:\n" + resp)
-                    else:
-                        log_set_debug(f"[DEBUG] Response received: (empty response)")
+                            log_set_debug(f"[DEBUG] Response received: (empty response)")
             else:
                 log_set_debug("[DEBUG] Not connected to ESP32.")
     with col2:
         if st.button("Read Variables from ESP32"):
             st.session_state['debug_log'] = []  # Clear previous read debug log
             if st.session_state.connected:
-                vars = ["ssid", "password", "rfidOnTimeMs", "periodicIntervalMs", "longPressMs"]
+                vars = [
+                    "ssid",
+                    "password",
+                    "rfidOnTimeMs",
+                    "periodicIntervalMs",
+                    "longPressMs",
+                    "socLowIdleEnabled",
+                    "lowSocUsbRecoveryWindowMs",
+                    "socLowThresholdPercent",
+                    "batteryMinVoltage",
+                    "batteryMaxVoltage",
+                    "verbose",
+                    "dashboardModeActive",
+                    "ledHeartbeatIntervalMs",
+                    "ledHeartbeatOnMs"
+                ]
                 updates = {}
                 for v in vars:
                     resp = get_variable_with_markers(st.session_state.serial_connection, v)
@@ -1895,6 +2153,42 @@ with tabs[1]:
                             updates["esp32_longPressTime"] = int(resp) / 1000 if resp else 5
                         except:
                             updates["esp32_longPressTime"] = 5
+                    elif v == "socLowIdleEnabled":
+                        updates["esp32_socLowIdleEnabled"] = str(resp).strip() == "1"
+                    elif v == "lowSocUsbRecoveryWindowMs":
+                        try:
+                            updates["esp32_lowSocUsbRecoveryWindow"] = int(resp) / 1000 if resp else 15.0
+                        except:
+                            updates["esp32_lowSocUsbRecoveryWindow"] = 15.0
+                    elif v == "socLowThresholdPercent":
+                        try:
+                            updates["esp32_socLowThresholdPercent"] = float(resp) if resp else 10.0
+                        except:
+                            updates["esp32_socLowThresholdPercent"] = 10.0
+                    elif v == "batteryMinVoltage":
+                        try:
+                            updates["esp32_batteryMinVoltage"] = float(resp) if resp else 3.52
+                        except:
+                            updates["esp32_batteryMinVoltage"] = 3.52
+                    elif v == "batteryMaxVoltage":
+                        try:
+                            updates["esp32_batteryMaxVoltage"] = float(resp) if resp else 4.15
+                        except:
+                            updates["esp32_batteryMaxVoltage"] = 4.15
+                    elif v == "verbose":
+                        updates["esp32_verbose"] = str(resp).strip() == "1"
+                    elif v == "dashboardModeActive":
+                        updates["esp32_dashboardModeActive"] = str(resp).strip() == "1"
+                    elif v == "ledHeartbeatIntervalMs":
+                        try:
+                            updates["esp32_ledHeartbeatInterval"] = int(resp) / 1000 if resp else 20.0
+                        except:
+                            updates["esp32_ledHeartbeatInterval"] = 20.0
+                    elif v == "ledHeartbeatOnMs":
+                        try:
+                            updates["esp32_ledHeartbeatOn"] = int(resp) / 1000 if resp else 1.0
+                        except:
+                            updates["esp32_ledHeartbeatOn"] = 1.0
                 st.session_state['pending_esp32_update'] = updates
                 st.rerun()
             else:
@@ -1950,21 +2244,21 @@ with tabs[2]:
         
         **Short Press (Quick Tap)**
         - **Function**: Manual RFID reading
-        - **Works in**: Both Dashboard Mode and Normal Mode
+        - **Works when**: Idle mode is inactive and RFID reads are allowed
         - **LED Feedback**: Green flash when tag detected
         - **Use Case**: Immediate RFID scanning when needed
         
         **Long Press (Hold for configured duration)**
-        - **Function**: Toggle Dashboard Mode ON/OFF
+        - **Function**: Toggle Dashboard Mode service access ON/OFF
         - **Default Duration**: 5 seconds (configurable)
         - **LED Feedback**: 
           - Red LED when Dashboard Mode is ON
           - Blue LED when Dashboard Mode is OFF
-        - **Use Case**: Switch between operational modes
+        - **Use Case**: Keep USB dashboard access available for service, data retrieval, and configuration
         
         **Dashboard Mode States:**
-        - **ON**: ESP32 stays awake, no periodic reads, fully responsive to dashboard
-        - **OFF**: Light sleep between reads, periodic RFID scanning enabled
+        - **ON**: ESP32 stays awake for dashboard service access; periodic reads are paused
+        - **OFF**: ESP32 may return to light sleep and autonomous periodic RFID scanning when idle mode is inactive
         """)
     
     # Data Retrieval Guide
@@ -2011,8 +2305,23 @@ with tabs[2]:
         - **Purpose**: Controls power consumption and reading frequency
         
         **Multi-Button Settings**
-        - **Long Press Timer**: Duration to hold button for dashboard mode (1-30 seconds)
+        - **Long Press Timer**: Duration to hold button for Dashboard Mode service access (1-30 seconds)
         - **Purpose**: Prevents accidental dashboard mode activation
+
+        **Power and Idle Mode Settings**
+        - **Enable Low SoC Idle Mode**: Allows measured low battery to enter idle mode
+        - **Low SoC USB Recovery Window**: Brief wake window after low-SoC idle so USB can connect and enable Dashboard Mode
+        - **Low SoC Threshold**: Battery percentage that triggers low-SoC idle mode
+        - **Battery Minimum/Maximum Voltage**: Calibration points for the linear SoC calculation
+
+        **Diagnostics and Runtime Settings**
+        - **Verbose Serial Prints**: Enables detailed firmware logs for debugging
+        - **Dashboard Mode Active**: Service latch that keeps USB dashboard access available; turn off only when releasing the device back to normal light-sleep operation
+
+        **LED Heartbeat Settings**
+        - **Heartbeat Interval**: Off-time between status heartbeat blinks
+        - **Heartbeat On Duration**: How long each heartbeat blink remains on
+        - **Low-SoC Recovery Pattern**: Idle mode uses a double-yellow heartbeat while the USB recovery window is active
         
         **Configuration Process:**
         1. Set desired values in the Configuration tab
@@ -2064,11 +2373,13 @@ with tabs[2]:
         - Power supply (3.3V/5V)
         
         **Pin Connections:**
-        - **Button**: GPIO 17 (with pull-up resistor)
-        - **RFID Power**: GPIO 16 (active LOW)
-        - **RFID TX**: GPIO 15 (UART communication)
-        - **RTC**: I2C (SDA/SCL pins)
-        - **RGB LED**: GPIO 18 (Red), GPIO 19 (Green), GPIO 4 (Blue)
+        - **Button**: GPIO 37 (INPUT_PULLUP, pressed = LOW)
+        - **RFID Power**: GPIO 42
+        - **RFID TX**: GPIO 41 (UART communication)
+        - **Antenna Select**: GPIO 36
+        - **RTC**: GPIO 35 SDA, GPIO 45 SCL
+        - **RGB LED**: GPIO 5 (Red), GPIO 6 (Green), GPIO 4 (Blue)
+        - **Battery SoC ADC**: GPIO 7
         
         **Power Requirements:**
         - ESP32: 3.3V, ~240mA active, ~10mA sleep
@@ -2081,6 +2392,7 @@ with tabs[2]:
         - **Blue**: Normal sleep mode
         - **Green**: Successful RFID reading (1 second flash)
         - **Red**: Dashboard mode active
+        - **Yellow**: Idle mode active
         """)
     
     # Software Guide
@@ -2089,9 +2401,12 @@ with tabs[2]:
         **Firmware Features:**
         - **Light Sleep Mode**: Low power consumption between reads
         - **Multi-Button Support**: Single button for multiple functions
-        - **Dashboard Mode**: Stay awake for real-time communication
-        - **Configurable Timers**: Adjustable button and reading intervals
+        - **Dashboard Mode**: Service latch for USB dashboard access, data retrieval, and configuration
+        - **Configurable Timers**: Adjustable button, reading, low-SoC, and LED heartbeat settings
+        - **Low-SoC Idle Mode**: Optional battery-based idle entry with configurable threshold and USB recovery window
+        - **Battery Calibration**: Adjustable min/max voltage points for SoC calculation
         - **Data Storage**: SPIFFS-based reading storage
+        - **Idle Event Logging**: Separate idle-entry event log without changing RFID reading format
         - **RTC Integration**: Accurate timestamping with DS1307
         
         **Dashboard Features:**
@@ -2099,7 +2414,7 @@ with tabs[2]:
         - **Timezone Support**: Multiple timezone display options
         - **Data Visualization**: Interactive plots and charts
         - **CSV Export**: Data export for external analysis
-        - **Configuration Management**: Remote ESP32 configuration
+        - **Configuration Management**: Remote ESP32 configuration for timing, low-SoC, battery calibration, Dashboard Mode service access, verbose logs, and LED heartbeat
         - **Multi-timezone Display**: Convert UTC to local time
         
         **System Requirements:**
@@ -2113,7 +2428,7 @@ with tabs[2]:
         **Installation:**
         ```bash
         pip install streamlit pandas pyserial plotly pytz
-        streamlit run rfid_dashboard_configure_lightsleep_multibutton.py
+        streamlit run rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py
         ```
         """)
 
@@ -2124,7 +2439,7 @@ with tabs[2]:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666; font-size: 12px; padding: 20px;'>
-    <p><strong>Implant RFID Reader Multi-Button Dashboard v3.0</strong></p>
+    <p><strong>Implant RFID Reader Multi-Button Dashboard v6.0</strong></p>
     <p>© 2025 Establishment Labs. All rights reserved.</p>
     <p>Developed by <a href='mailto:info@littleendianengineering.com' style='color: #666;'>Little Endian Engineering</a></p>
     <p>Contact: <a href='mailto:lyu@establishmentlabs.com' style='color: #666;'>lyu@establishmentlabs.com</a></p>

@@ -1,13 +1,17 @@
 /*
- * Implant RFID Reader - ESP32 Firmware (Light Sleep + Multi-Button + BLE Version)
+ * Implant RFID Reader - ESP32-S3 Firmware
  * ================================================================================
  *
  * PROPRIETARY SOFTWARE
  * Copyright (c) 2025 Establishment Labs
  * Developed by Little Endian Engineering
  *
- * Version: 1.4 (Light Sleep + Multi-Button + RGB LED + BLE) - ESP32-S3 Mac Compatible
- * Date: September 2025
+ * Version: 1.5 (Light Sleep + Multi-Button + BLE + Low-SoC Service Access)
+ * Date: July 2026
+ *
+ * Includes Dashboard Mode service access, configurable low-SoC idle entry,
+ * low-SoC USB recovery window, idle event logging, battery calibration, and
+ * dual-antenna RFID read support.
  */
 
 #include <SPIFFS.h>
@@ -122,6 +126,7 @@ void setup() {
   initSocSensor();
   Serial.println("[BOOT] RFID initialized");
   printBatterySoc("Boot init");
+  evaluateIdleState();
 
   Serial.println("[BOOT] Checking stored readings...");
   // concise summary instead of dumping all readings
@@ -158,6 +163,7 @@ void setup() {
   // Priority: idle > dashboard > sleeping.
   if (idleModeActive) {
     setLEDStatus("idle");  // Yellow LED for idle mode
+    storeIdleEvent(latestIdleReason);
     Serial.printf("[IDLE] Active at boot (%s)\n", idleReasonToString(latestIdleReason));
   } else if (dashboardModeActive) {
     setLEDStatus("dashboard_active");  // Red LED for dashboard mode
@@ -176,10 +182,17 @@ void loop() {
   // Evaluate idle state every loop to catch SoC transitions at runtime
   static bool prevIdleModeActive = false;
   static IdleReason prevIdleReason = IDLE_NONE;
+  static bool idleTransitionInitialized = false;
   evaluateIdleState();
+  if (!idleTransitionInitialized) {
+    prevIdleModeActive = idleModeActive;
+    prevIdleReason = latestIdleReason;
+    idleTransitionInitialized = true;
+  }
   if (idleModeActive != prevIdleModeActive || latestIdleReason != prevIdleReason) {
     if (idleModeActive) {
       VERBOSE_PRINTF("[IDLE] ENTER (%s)\n", idleReasonToString(latestIdleReason));
+      storeIdleEvent(latestIdleReason);
       setLEDStatus("idle");
     } else {
       VERBOSE_PRINTLN("[IDLE] EXIT");
@@ -189,14 +202,12 @@ void loop() {
     prevIdleReason = latestIdleReason;
   }
   
-  // Heartbeat removed - not needed in production
-  
   // ============================================================================
-  // PRIORITY: Serial command processing when Dashboard Mode is active
+  // PRIORITY: Serial command processing when dashboard access is allowed
   // ============================================================================
-  // When Dashboard Mode is active, prioritize Serial commands to ensure
-  // dashboard can communicate with ESP32 without delays from other loop operations
-  if (dashboardModeActive && Serial.available()) {
+  // Dashboard access is allowed in Dashboard Mode and during the low-SoC USB
+  // recovery window, so the dashboard can connect before the device sleeps again.
+  if (dashboardAccessAllowed() && Serial.available()) {
     String command = Serial.readStringUntil('\n');
     command.trim();
     
@@ -215,7 +226,8 @@ void loop() {
       processSerialCommand(command);
       
       // After processing command, return to loop start to check for more commands
-      // This ensures Serial commands are processed with highest priority in Dashboard Mode
+      // This ensures Serial commands are processed with highest priority while
+      // dashboard access is allowed.
       return;
     }
   }
@@ -226,8 +238,9 @@ void loop() {
     VERBOSE_PRINTLN("[UART] Wake-up detected - staying awake for command processing");
     VERBOSE_PRINTLN("[UART] *** UART WAKE-UP WORKING ***");
     
-    // UART wake-up occurred - process command but don't change Dashboard Mode
-    // Dashboard Mode is controlled ONLY by the multi-button (long press)
+    // UART wake-up occurred. Process any pending command without implicitly
+    // changing Dashboard Mode; Dashboard Mode changes only by explicit command
+    // or configured long button press.
     
     // Mark host as active to prevent immediate re-sleep
     lastCommandTime = millis();
@@ -287,7 +300,7 @@ void loop() {
         // Start feedback at 1 second
         if (pressDuration >= LONG_PRESS_FEEDBACK_MS && !longPressFeedbackStarted) {
           longPressFeedbackStarted = true;
-          // Removed verbose feedback message to reduce print clutter
+          // Long-press feedback state is tracked without additional serial output.
         }
         
         // Detect long press completion
@@ -379,16 +392,16 @@ void loop() {
     }
 
     // Skip periodic reads when Dashboard Mode is active to maintain responsiveness
-    if (dashboardModeActive) {
+    if (dashboardAccessAllowed()) {
       VERBOSE_PRINTLN("[PERIODIC] Skipped (Dashboard Mode active)");
       lastPeriodicRead = millis(); // Reset timer to prevent immediate retry
       return; // Don't go to sleep, stay awake for dashboard
     }
 
-    if (idleModeActive) {
+    if (!rfidReadsAllowed()) {
       VERBOSE_PRINTF("[IDLE] Periodic read blocked (%s)\n", idleReasonToString(latestIdleReason));
       lastPeriodicRead = millis();
-      if (!Serial.available() && !dashboardModeActive) {
+      if (!Serial.available() && !dashboardAccessAllowed()) {
         lightSleepUntilNextEvent((uint64_t)IDLE_SOC_POLL_INTERVAL_MS * 1000ULL);
       }
       return;
@@ -411,7 +424,7 @@ void loop() {
       }
     }
 
-    if (!Serial.available() && !dashboardModeActive) {
+    if (!Serial.available() && !dashboardAccessAllowed()) {
       uint64_t sleep_us = (uint64_t)periodicIntervalMs * 1000ULL; // full interval until next slot
       lightSleepUntilNextEvent(sleep_us);
       return; // <-- handle next wake cleanly
@@ -422,11 +435,10 @@ void loop() {
   unsigned long nowMs = millis();
   bool periodicDue = (nowMs - lastPeriodicRead) >= periodicIntervalMs;
   
-  // Debug: Show dashboard mode status periodically (reduced frequency)
+  // Periodic activity checkpoint for awake-loop housekeeping.
   static unsigned long lastDebugTime = 0;
-  if (nowMs - lastDebugTime > 60000) { // Every 60 seconds (reduced from 10s)
+  if (nowMs - lastDebugTime > 60000) { // Every 60 seconds
     lastDebugTime = nowMs;
-    // Removed frequent debug message to reduce print clutter
   }
   
   // --- Watchdog: If we've been in light sleep too long without activity, force a wake ---
@@ -435,8 +447,7 @@ void loop() {
     lastActivityCheck = nowMs;
     // If no serial activity for a long time, ensure we're responsive
     if (nowMs - lastCommandTime > 600000) { // No commands for 10 minutes (increased from 2 minutes)
-      // Force a brief activity to keep the system responsive
-      // Watchdog message removed - not needed in production
+      // Keep this checkpoint quiet during normal production operation.
     }
   }
 
@@ -449,10 +460,10 @@ void loop() {
   // --- Periodic automatic reading (fallback path) ---
   if (periodicDue) {
     // Skip periodic reads when Dashboard Mode is active to maintain responsiveness
-    if (dashboardModeActive) {
+    if (dashboardAccessAllowed()) {
       VERBOSE_PRINTLN("[PERIODIC] Timer slot -> skipped (Dashboard Mode active)");
       lastPeriodicRead = nowMs; // Reset timer to prevent immediate retry
-    } else if (idleModeActive) {
+    } else if (!rfidReadsAllowed()) {
       VERBOSE_PRINTF("[IDLE] Fallback periodic read blocked (%s)\n", idleReasonToString(latestIdleReason));
       lastPeriodicRead = nowMs;
     } else {
@@ -464,13 +475,11 @@ void loop() {
     }
   }
 
-  // Serial data checking removed - UART wake-up should handle this properly
-
   // --- Enter Light Sleep until next event (timer or button/uart) ---
   // Compute remaining time to next periodic slot
   nowMs = millis();
   unsigned long remainingMs = 0;
-  if (idleModeActive && !dashboardModeActive) {
+  if (idleModeActive && !dashboardAccessAllowed()) {
     remainingMs = IDLE_SOC_POLL_INTERVAL_MS;
   } else {
     unsigned long elapsed = nowMs - lastPeriodicRead;
@@ -479,7 +488,7 @@ void loop() {
 
   // If we don't have pending serial input and nothing is immediately due, sleep
   // CRITICAL: Never sleep when dashboard mode is active
-  if (!Serial.available() && !dashboardModeActive && !uartWakePending) {
+  if (!Serial.available() && !dashboardAccessAllowed() && !uartWakePending) {
     // If button is being held LOW, skip sleeping to avoid bouncing
     if (digitalRead(BUTTON_PIN) == HIGH && remainingMs > 0) { // <-- don't sleep for 0 ms
       // Ensure LED status is properly set before going to sleep
@@ -490,7 +499,7 @@ void loop() {
       lightSleepUntilNextEvent((uint64_t)remainingMs * 1000ULL);
       return; // <-- next iteration will handle the wake cause immediately
     }
-  } else if (dashboardModeActive) {
+  } else if (dashboardAccessAllowed()) {
     // Dashboard mode is active - stay awake and don't sleep
     // Only print this message occasionally to avoid spam
     static unsigned long lastDashboardMessage = 0;
@@ -513,9 +522,9 @@ void loop() {
   }
 
   // --- Serial config commands (for non-Dashboard Mode or fallback) ---
-  // Note: When Dashboard Mode is active, Serial commands are processed at the
+  // Note: When dashboard access is allowed, Serial commands are processed at the
   // beginning of loop() for immediate response. This section handles commands
-  // when Dashboard Mode is not active or as a fallback.
+  // when dashboard access is not active or as a fallback.
   if (Serial.available()) {
     String command = Serial.readStringUntil('\n');
     command.trim();

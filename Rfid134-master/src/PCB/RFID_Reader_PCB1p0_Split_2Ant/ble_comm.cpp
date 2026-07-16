@@ -263,7 +263,7 @@ void processBLECommand(const String& command) {
   }
   else if (command == "readnow") {
     // Trigger manual RFID read (same as button press)
-    if (idleModeActive) {
+    if (!rfidReadsAllowed()) {
       sendBLEResponse("[IDLE] Manual read blocked: " + String(idleReasonToString(latestIdleReason)));
     } else {
       sendBLEResponse("[MANUAL] Starting RFID read...");
@@ -518,7 +518,7 @@ void sendStoredReadingsByBLEChunk(int chunkIndex) {
   }
 }
 
-// Legacy function - now calls chunked version with chunk 0
+// Range response entry point; starts BLE pagination at the first chunk.
 void sendStoredReadingsByRangeBLE(uint32_t startTime, uint32_t endTime) {
   sendStoredReadingsByRangeBLEChunk(startTime, endTime, 0);
 }

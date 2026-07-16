@@ -32,13 +32,13 @@ void handleMultiButton() {
       
       if (pressDuration < longPressMs) {
         // Short press - trigger RFID read
-        // Use different debounce thresholds for different states
+        // Use state-specific debounce thresholds for awake and sleeping paths.
         unsigned long minPressTime = dashboardModeActive ? 50 : 100; // 50ms when awake, 100ms when sleeping
         VERBOSE_PRINTF("[BTNDBG] RELEASE_SHORT t=%lu duration=%lu min=%lu dashboard=%d idle=%d\n",
                        currentTime, pressDuration, minPressTime, dashboardModeActive ? 1 : 0, idleModeActive ? 1 : 0);
         
         if (pressDuration > minPressTime) {
-          if (idleModeActive) {
+          if (!rfidReadsAllowed()) {
             VERBOSE_PRINTF("[IDLE] Short press ignored - manual read blocked (%s)\n", idleReasonToString(latestIdleReason));
           } else {
             VERBOSE_PRINTLN("[BUTTON] Short press -> RFID read");
@@ -87,7 +87,7 @@ void handleMultiButton() {
     // Start feedback at 1 second
     if (pressDuration >= LONG_PRESS_FEEDBACK_MS && !longPressFeedbackStarted) {
       longPressFeedbackStarted = true;
-      // Removed verbose feedback message to reduce print clutter
+      // Long-press feedback state is tracked without additional serial output.
     }
     
     // Detect long press completion

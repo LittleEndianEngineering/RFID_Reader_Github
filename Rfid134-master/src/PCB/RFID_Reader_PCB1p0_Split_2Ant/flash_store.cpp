@@ -6,12 +6,93 @@
 #include "globals.h"
 
 static const char* FLASH_TMP_FILENAME = "/readings.tmp";
+static const char* IDLE_EVENTS_FILENAME = "/idle_events.dat";
+static const char* IDLE_EVENTS_TMP_FILENAME = "/idle_events.tmp";
 
 static const char* antennaFromFlags(uint8_t flags) {
   if (flags & FLAG_ANT2) return "ANT2";
-  // Default to ANT1 for backward compatibility with old stored records
-  // that predate antenna metadata.
+  // Records without antenna metadata are interpreted as ANT1.
   return "ANT1";
+}
+
+static const char* idleReasonName(uint8_t reason) {
+  switch (reason) {
+    case IDLE_RTC_INIT_FAILED: return "IDLE_RTC_INIT_FAILED";
+    case IDLE_SOC_LOW: return "IDLE_SOC_LOW";
+    case IDLE_NONE:
+    default: return "IDLE_NONE";
+  }
+}
+
+static uint32_t currentEventTimestamp() {
+  if (!rtcAvailable) {
+    return 0;
+  }
+
+  DateTime eventTime = rtc.now();
+  if (eventTime.year() < 2020 || eventTime.year() > 2100) {
+    return 0;
+  }
+  return eventTime.unixtime();
+}
+
+static bool dropOldestIdleEventFIFO() {
+  File inFile = SPIFFS.open(IDLE_EVENTS_FILENAME, "r");
+  if (!inFile) {
+    return true;
+  }
+
+  int totalEvents = inFile.size() / IDLE_EVENT_SIZE;
+  if (totalEvents <= 0) {
+    inFile.close();
+    return true;
+  }
+
+  File outFile = SPIFFS.open(IDLE_EVENTS_TMP_FILENAME, "w");
+  if (!outFile) {
+    inFile.close();
+    Serial.println("[FS] Idle FIFO drop failed: cannot open temp file");
+    return false;
+  }
+
+  if (inFile.available() >= IDLE_EVENT_SIZE) {
+    inFile.seek(IDLE_EVENT_SIZE, SeekSet);
+  }
+
+  uint8_t buffer[IDLE_EVENT_SIZE];
+  while (inFile.available() >= IDLE_EVENT_SIZE) {
+    if (inFile.read(buffer, IDLE_EVENT_SIZE) != IDLE_EVENT_SIZE) {
+      outFile.close();
+      inFile.close();
+      SPIFFS.remove(IDLE_EVENTS_TMP_FILENAME);
+      Serial.println("[FS] Idle FIFO drop failed: source read error");
+      return false;
+    }
+    if (outFile.write(buffer, IDLE_EVENT_SIZE) != IDLE_EVENT_SIZE) {
+      outFile.close();
+      inFile.close();
+      SPIFFS.remove(IDLE_EVENTS_TMP_FILENAME);
+      Serial.println("[FS] Idle FIFO drop failed: temp write error");
+      return false;
+    }
+    yield();
+  }
+
+  outFile.close();
+  inFile.close();
+
+  if (!SPIFFS.remove(IDLE_EVENTS_FILENAME)) {
+    SPIFFS.remove(IDLE_EVENTS_TMP_FILENAME);
+    Serial.println("[FS] Idle FIFO drop failed: could not remove original file");
+    return false;
+  }
+  if (!SPIFFS.rename(IDLE_EVENTS_TMP_FILENAME, IDLE_EVENTS_FILENAME)) {
+    SPIFFS.remove(IDLE_EVENTS_TMP_FILENAME);
+    Serial.println("[FS] Idle FIFO drop failed: could not rename temp file");
+    return false;
+  }
+
+  return true;
 }
 
 // Drop exactly one oldest reading by compacting records [1..end] into a temp file.
@@ -143,6 +224,84 @@ void storeReading(const RfidReading& reading) {
   // Extra blank line before the stored-reading line
   if (verbose) Serial.println();
   VERBOSE_PRINTF("[FS] Stored reading #%d\n", readingCount);
+}
+
+void storeIdleEvent(uint8_t reason) {
+  if (reason == IDLE_NONE) {
+    return;
+  }
+  if (!SPIFFS.begin(true)) {
+    Serial.println("[FS] SPIFFS Mount Failed");
+    return;
+  }
+
+  File countFile = SPIFFS.open(IDLE_EVENTS_FILENAME, "r");
+  int eventCount = 0;
+  if (countFile) {
+    eventCount = countFile.size() / IDLE_EVENT_SIZE;
+    countFile.close();
+  }
+
+  if (eventCount >= MAX_IDLE_EVENTS) {
+    if (!dropOldestIdleEventFIFO()) {
+      Serial.println("[FS] Failed to apply idle FIFO drop; skipping idle event");
+      return;
+    }
+  }
+
+  IdleEvent event = {};
+  event.timestamp = currentEventTimestamp();
+  event.reason = reason;
+
+  File file = SPIFFS.open(IDLE_EVENTS_FILENAME, "a");
+  if (!file) {
+    Serial.println("[FS] Failed to open idle events file for writing");
+    return;
+  }
+
+  if (file.write((uint8_t*)&event, IDLE_EVENT_SIZE) != IDLE_EVENT_SIZE) {
+    Serial.println("[FS] Failed to append idle event");
+  } else {
+    VERBOSE_PRINTF("[FS] Stored idle event reason=%s timestamp=%lu\n",
+                   idleReasonName(reason), (unsigned long)event.timestamp);
+  }
+  file.close();
+}
+
+void printIdleEvents() {
+  Serial.println("---BEGIN_IDLE_EVENTS---");
+  File file = SPIFFS.open(IDLE_EVENTS_FILENAME, "r");
+  if (!file) {
+    Serial.println("---END_IDLE_EVENTS---");
+    return;
+  }
+
+  int i = 0;
+  while (file.available() >= IDLE_EVENT_SIZE) {
+    IdleEvent event;
+    if (file.read((uint8_t*)&event, IDLE_EVENT_SIZE) != IDLE_EVENT_SIZE) {
+      break;
+    }
+    i++;
+    if (event.timestamp > 1000000000UL) {
+      time_t timestamp = event.timestamp;
+      struct tm* ti = gmtime(&timestamp);
+      Serial.printf("#%d: %04d-%02d-%02d %02d:%02d:%02d, %s\n",
+                    i, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+                    ti->tm_hour, ti->tm_min, ti->tm_sec,
+                    idleReasonName(event.reason));
+    } else {
+      Serial.printf("#%d: timestamp_unavailable, %s\n", i, idleReasonName(event.reason));
+    }
+    yield();
+  }
+  file.close();
+  Serial.println("---END_IDLE_EVENTS---");
+}
+
+void clearIdleEvents() {
+  SPIFFS.remove(IDLE_EVENTS_FILENAME);
+  Serial.println("[FS] Idle events cleared");
 }
 
 void printStoredReadings() {

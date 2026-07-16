@@ -52,6 +52,9 @@ extern bool idleModeActive;
 extern IdleReason latestIdleReason;
 extern bool rtcIdleLatch;
 extern bool socLowTestOverride;
+extern bool socLowIdleEnabled;
+extern unsigned long lowSocUsbRecoveryWindowMs;
+extern unsigned long lowSocRecoveryWindowStartMs;
 
 // BLE State
 extern BLEServer* pServer;
@@ -97,8 +100,8 @@ extern String configFile;
 extern String currentLEDStatus;
 extern unsigned long ledStatusStartTime;
 extern unsigned long ledFlashDuration;
-extern const unsigned long ledHeartbeatIntervalMs;
-extern const unsigned long ledHeartbeatOnMs;
+extern unsigned long ledHeartbeatIntervalMs;
+extern unsigned long ledHeartbeatOnMs;
 extern bool ledHeartbeatOn;
 extern unsigned long ledHeartbeatPhaseStartTime;
 
@@ -112,13 +115,18 @@ extern uint32_t wake_timer_consumed;
 extern bool lastButtonState;
 
 // Idle helpers
+bool dashboardAccessAllowed();
+bool rfidReadsAllowed();
+bool lowSocUsbRecoveryWindowActive();
+unsigned long lowSocUsbRecoveryWindowRemainingMs();
 bool isSocBelowThreshold();
 void evaluateIdleState();
 const char* idleReasonToString(IdleReason reason);
 
 // SoC helpers
-extern const float BATTERY_MIN_VOLTAGE;
-extern const float BATTERY_MAX_VOLTAGE;
+extern float BATTERY_MIN_VOLTAGE;
+extern float BATTERY_MAX_VOLTAGE;
+extern float SOC_LOW_THRESHOLD_PERCENT;
 extern const float SOC_DIVIDER_R1_OHMS;
 extern const float SOC_DIVIDER_R2_OHMS;
 void initSocSensor();

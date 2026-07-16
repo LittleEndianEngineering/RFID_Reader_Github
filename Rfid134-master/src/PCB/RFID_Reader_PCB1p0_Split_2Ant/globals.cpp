@@ -34,7 +34,10 @@ const unsigned long IDLE_SOC_POLL_INTERVAL_MS = 5000;
 bool idleModeActive = false;
 IdleReason latestIdleReason = IDLE_NONE;
 bool rtcIdleLatch = false;
-bool socLowTestOverride = false; // Placeholder hook until real SoC logic is integrated
+bool socLowTestOverride = false; // Manual test hook; real SoC is checked in isSocBelowThreshold().
+bool socLowIdleEnabled = true;
+unsigned long lowSocUsbRecoveryWindowMs = 15000;
+unsigned long lowSocRecoveryWindowStartMs = 0;
 
 // BLE State
 BLEServer* pServer = nullptr;
@@ -80,8 +83,8 @@ String configFile = "/config.txt";
 String currentLEDStatus = "off";
 unsigned long ledStatusStartTime = 0;
 unsigned long ledFlashDuration = 0;
-const unsigned long ledHeartbeatIntervalMs = 20000; // off time between heartbeat blinks
-const unsigned long ledHeartbeatOnMs = 1000;        // on time for each heartbeat blink
+unsigned long ledHeartbeatIntervalMs = 20000; // off time between heartbeat blinks
+unsigned long ledHeartbeatOnMs = 1000;        // on time for each heartbeat blink
 bool ledHeartbeatOn = false;
 unsigned long ledHeartbeatPhaseStartTime = 0;
 
@@ -96,14 +99,17 @@ bool lastButtonState = HIGH;
 
 // SoC configuration for linear mapping.
 // Hardware divider: R1 (battery->ADC) = 220k, R2 (ADC->GND) = 220k
-const float BATTERY_MIN_VOLTAGE = 3.52f;
-const float BATTERY_MAX_VOLTAGE = 4.15f;
+float BATTERY_MIN_VOLTAGE = 3.52f;
+float BATTERY_MAX_VOLTAGE = 4.15f;
+float SOC_LOW_THRESHOLD_PERCENT = 10.0f;
 const float SOC_DIVIDER_R1_OHMS = 220000.0f;
 const float SOC_DIVIDER_R2_OHMS = 220000.0f;
+static bool socSensorInitialized = false;
 
 void initSocSensor() {
   analogReadResolution(12);
   analogSetPinAttenuation(SOC_PIN, ADC_11db); // Up to ~3.1V at ADC pin
+  socSensorInitialized = true;
 }
 
 bool readBatterySoc(float& batteryVoltage, float& socPercent, uint16_t& rawAdc, uint32_t& pinMilliVolts) {
@@ -144,10 +150,59 @@ void printBatterySoc(const char* context) {
 }
 
 bool isSocBelowThreshold() {
-  return socLowTestOverride;
+  if (!socLowIdleEnabled) {
+    return false;
+  }
+
+  if (socLowTestOverride) {
+    return true;
+  }
+
+  if (!socSensorInitialized) {
+    return false;
+  }
+
+  float batteryVoltage = 0.0f;
+  float socPercent = 0.0f;
+  uint16_t rawAdc = 0;
+  uint32_t pinMilliVolts = 0;
+
+  if (!readBatterySoc(batteryVoltage, socPercent, rawAdc, pinMilliVolts)) {
+    return false;
+  }
+
+  return socPercent <= SOC_LOW_THRESHOLD_PERCENT;
+}
+
+bool dashboardAccessAllowed() {
+  return dashboardModeActive || lowSocUsbRecoveryWindowActive();
+}
+
+bool rfidReadsAllowed() {
+  return !idleModeActive;
+}
+
+bool lowSocUsbRecoveryWindowActive() {
+  if (!idleModeActive || latestIdleReason != IDLE_SOC_LOW || lowSocUsbRecoveryWindowMs == 0) {
+    return false;
+  }
+  if (lowSocRecoveryWindowStartMs == 0) {
+    return false;
+  }
+  return (millis() - lowSocRecoveryWindowStartMs) < lowSocUsbRecoveryWindowMs;
+}
+
+unsigned long lowSocUsbRecoveryWindowRemainingMs() {
+  if (!lowSocUsbRecoveryWindowActive()) {
+    return 0;
+  }
+  unsigned long elapsedMs = millis() - lowSocRecoveryWindowStartMs;
+  return (elapsedMs >= lowSocUsbRecoveryWindowMs) ? 0 : (lowSocUsbRecoveryWindowMs - elapsedMs);
 }
 
 void evaluateIdleState() {
+  bool previousIdleModeActive = idleModeActive;
+  IdleReason previousIdleReason = latestIdleReason;
   bool rtcCondition = rtcIdleLatch;
   bool socCondition = isSocBelowThreshold();
 
@@ -159,6 +214,11 @@ void evaluateIdleState() {
     latestIdleReason = IDLE_RTC_INIT_FAILED;
   } else {
     latestIdleReason = IDLE_NONE;
+  }
+
+  if (idleModeActive && latestIdleReason == IDLE_SOC_LOW &&
+      (!previousIdleModeActive || previousIdleReason != IDLE_SOC_LOW)) {
+    lowSocRecoveryWindowStartMs = millis();
   }
 }
 

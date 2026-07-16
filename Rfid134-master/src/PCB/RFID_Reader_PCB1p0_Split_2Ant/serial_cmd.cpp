@@ -14,6 +14,9 @@
 static void printIdleStatus() {
   Serial.printf("[IDLE] Mode: %s\n", idleModeActive ? "ACTIVE" : "INACTIVE");
   Serial.printf("[IDLE] Latest reason: %s\n", idleReasonToString(latestIdleReason));
+  Serial.printf("[IDLE] Low SoC idle: %s\n", socLowIdleEnabled ? "ENABLED" : "DISABLED");
+  Serial.printf("[IDLE] Low SoC USB recovery: %s\n", lowSocUsbRecoveryWindowActive() ? "ACTIVE" : "INACTIVE");
+  Serial.printf("[IDLE] USB recovery remaining: %lus\n", lowSocUsbRecoveryWindowRemainingMs() / 1000UL);
 }
 
 // Centralized function to process Serial commands - used by both Dashboard Mode
@@ -89,6 +92,10 @@ void processSerialCommand(const String& command) {
     Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
     Serial.printf("[DEBUG] Idle mode: %s\n", idleModeActive ? "ACTIVE" : "INACTIVE");
     Serial.printf("[DEBUG] Idle reason: %s\n", idleReasonToString(latestIdleReason));
+    Serial.printf("[DEBUG] Low SoC idle: %s\n", socLowIdleEnabled ? "ENABLED" : "DISABLED");
+    Serial.printf("[DEBUG] Low SoC USB recovery: %s (%lus remaining)\n",
+                  lowSocUsbRecoveryWindowActive() ? "ACTIVE" : "INACTIVE",
+                  lowSocUsbRecoveryWindowRemainingMs() / 1000UL);
     float batteryVoltage = 0.0f;
     float socPercent = 0.0f;
     uint16_t rawAdc = 0;
@@ -113,6 +120,10 @@ void processSerialCommand(const String& command) {
     Serial.printf("[DEBUG] Dashboard mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
     Serial.printf("[DEBUG] Idle mode: %s\n", idleModeActive ? "ACTIVE" : "INACTIVE");
     Serial.printf("[DEBUG] Idle reason: %s\n", idleReasonToString(latestIdleReason));
+    Serial.printf("[DEBUG] Low SoC idle: %s\n", socLowIdleEnabled ? "ENABLED" : "DISABLED");
+    Serial.printf("[DEBUG] Low SoC USB recovery: %s (%lus remaining)\n",
+                  lowSocUsbRecoveryWindowActive() ? "ACTIVE" : "INACTIVE",
+                  lowSocUsbRecoveryWindowRemainingMs() / 1000UL);
     if (rtcAvailable) {
       now = rtc.now();
       Serial.printf("[DEBUG] Current time: %04d-%02d-%02d %02d:%02d:%02d\n",
@@ -180,6 +191,76 @@ void processSerialCommand(const String& command) {
     Serial.flush();
     return;
   }
+  if (command == "get soclowidle") {
+    Serial.println("<GET_SOCLOWIDLE_BEGIN>");
+    Serial.println(socLowIdleEnabled ? "1" : "0");
+    Serial.println("<GET_SOCLOWIDLE_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get socLowIdleEnabled") {
+    Serial.println("<GET_SOCLOWIDLEENABLED_BEGIN>");
+    Serial.println(socLowIdleEnabled ? "1" : "0");
+    Serial.println("<GET_SOCLOWIDLEENABLED_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get lowSocUsbRecoveryWindowMs") {
+    Serial.println("<GET_LOWSOCUSBRECOVERYWINDOWMS_BEGIN>");
+    Serial.println(lowSocUsbRecoveryWindowMs);
+    Serial.println("<GET_LOWSOCUSBRECOVERYWINDOWMS_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get socLowThresholdPercent") {
+    Serial.println("<GET_SOCLOWTHRESHOLDPERCENT_BEGIN>");
+    Serial.println(SOC_LOW_THRESHOLD_PERCENT, 2);
+    Serial.println("<GET_SOCLOWTHRESHOLDPERCENT_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get batteryMinVoltage") {
+    Serial.println("<GET_BATTERYMINVOLTAGE_BEGIN>");
+    Serial.println(BATTERY_MIN_VOLTAGE, 2);
+    Serial.println("<GET_BATTERYMINVOLTAGE_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get batteryMaxVoltage") {
+    Serial.println("<GET_BATTERYMAXVOLTAGE_BEGIN>");
+    Serial.println(BATTERY_MAX_VOLTAGE, 2);
+    Serial.println("<GET_BATTERYMAXVOLTAGE_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get verbose") {
+    Serial.println("<GET_VERBOSE_BEGIN>");
+    Serial.println(verbose ? "1" : "0");
+    Serial.println("<GET_VERBOSE_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get dashboardModeActive") {
+    Serial.println("<GET_DASHBOARDMODEACTIVE_BEGIN>");
+    Serial.println(dashboardModeActive ? "1" : "0");
+    Serial.println("<GET_DASHBOARDMODEACTIVE_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get ledHeartbeatIntervalMs") {
+    Serial.println("<GET_LEDHEARTBEATINTERVALMS_BEGIN>");
+    Serial.println(ledHeartbeatIntervalMs);
+    Serial.println("<GET_LEDHEARTBEATINTERVALMS_END>");
+    Serial.flush();
+    return;
+  }
+  if (command == "get ledHeartbeatOnMs") {
+    Serial.println("<GET_LEDHEARTBEATONMS_BEGIN>");
+    Serial.println(ledHeartbeatOnMs);
+    Serial.println("<GET_LEDHEARTBEATONMS_END>");
+    Serial.flush();
+    return;
+  }
   if (command.startsWith("set ssid ")) {
     String value = command.substring(9);
     ssid_str = value; ssid = ssid_str.c_str(); saveConfigVar("ssid", value); 
@@ -205,6 +286,26 @@ void processSerialCommand(const String& command) {
     longPressMs = value.toInt(); saveConfigVar("longPressMs", value); 
     Serial.println("OK");
     Serial.flush();
+  } else if (command.startsWith("set verbose ")) {
+    String value = command.substring(12);
+    verbose = (value.toInt() != 0);
+    saveConfigVar("verbose", verbose ? "true" : "false");
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set dashboardModeActive ")) {
+    String value = command.substring(24);
+    dashboardModeActive = (value.toInt() != 0);
+    saveConfigVar("dashboardModeActive", dashboardModeActive ? "true" : "false");
+    if (dashboardModeActive) {
+      Serial.println("[DASHBOARD] Dashboard Mode: ON - ESP32 will stay awake");
+      startBLEAdvertising();
+    } else {
+      Serial.println("[DASHBOARD] Dashboard Mode: OFF - ESP32 will use light sleep");
+      stopBLEAdvertising();
+    }
+    setLEDStatus(idleModeActive ? "idle" : (dashboardModeActive ? "dashboard_active" : "sleeping"));
+    Serial.println("OK");
+    Serial.flush();
   } else if (command.startsWith("set soclow ")) {
     String value = command.substring(11);
     socLowTestOverride = (value.toInt() != 0);
@@ -212,6 +313,100 @@ void processSerialCommand(const String& command) {
     if (!dashboardModeActive) {
       setLEDStatus(idleModeActive ? "idle" : "sleeping");
     }
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set soclowidle ")) {
+    String value = command.substring(15);
+    socLowIdleEnabled = (value.toInt() != 0);
+    saveConfigVar("socLowIdleEnabled", socLowIdleEnabled ? "true" : "false");
+    evaluateIdleState();
+    setLEDStatus(idleModeActive ? "idle" : (dashboardModeActive ? "dashboard_active" : "sleeping"));
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set socLowIdleEnabled ")) {
+    String value = command.substring(22);
+    socLowIdleEnabled = (value.toInt() != 0);
+    saveConfigVar("socLowIdleEnabled", socLowIdleEnabled ? "true" : "false");
+    evaluateIdleState();
+    setLEDStatus(idleModeActive ? "idle" : (dashboardModeActive ? "dashboard_active" : "sleeping"));
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set lowSocUsbRecoveryWindowMs ")) {
+    String value = command.substring(30);
+    unsigned long parsed = value.toInt();
+    if (parsed > 300000UL) {
+      Serial.println("ERROR: lowSocUsbRecoveryWindowMs must be 0-300000");
+      Serial.flush();
+      return;
+    }
+    lowSocUsbRecoveryWindowMs = parsed;
+    saveConfigVar("lowSocUsbRecoveryWindowMs", String(lowSocUsbRecoveryWindowMs));
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set socLowThresholdPercent ")) {
+    String value = command.substring(27);
+    float parsed = value.toFloat();
+    if (parsed < 0.0f || parsed > 100.0f) {
+      Serial.println("ERROR: socLowThresholdPercent must be 0-100");
+      Serial.flush();
+      return;
+    }
+    SOC_LOW_THRESHOLD_PERCENT = parsed;
+    saveConfigVar("socLowThresholdPercent", String(SOC_LOW_THRESHOLD_PERCENT, 2));
+    evaluateIdleState();
+    setLEDStatus(idleModeActive ? "idle" : (dashboardModeActive ? "dashboard_active" : "sleeping"));
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set batteryMinVoltage ")) {
+    String value = command.substring(22);
+    float parsed = value.toFloat();
+    if (parsed < 2.5f || parsed > 4.2f) {
+      Serial.println("ERROR: batteryMinVoltage must be 2.5-4.2");
+      Serial.flush();
+      return;
+    }
+    BATTERY_MIN_VOLTAGE = parsed;
+    saveConfigVar("batteryMinVoltage", String(BATTERY_MIN_VOLTAGE, 2));
+    evaluateIdleState();
+    setLEDStatus(idleModeActive ? "idle" : (dashboardModeActive ? "dashboard_active" : "sleeping"));
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set batteryMaxVoltage ")) {
+    String value = command.substring(22);
+    float parsed = value.toFloat();
+    if (parsed < 3.5f || parsed > 4.5f) {
+      Serial.println("ERROR: batteryMaxVoltage must be 3.5-4.5");
+      Serial.flush();
+      return;
+    }
+    BATTERY_MAX_VOLTAGE = parsed;
+    saveConfigVar("batteryMaxVoltage", String(BATTERY_MAX_VOLTAGE, 2));
+    evaluateIdleState();
+    setLEDStatus(idleModeActive ? "idle" : (dashboardModeActive ? "dashboard_active" : "sleeping"));
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set ledHeartbeatIntervalMs ")) {
+    String value = command.substring(27);
+    unsigned long parsed = value.toInt();
+    if (parsed < 1000UL) {
+      Serial.println("ERROR: ledHeartbeatIntervalMs must be >= 1000");
+      Serial.flush();
+      return;
+    }
+    ledHeartbeatIntervalMs = parsed;
+    saveConfigVar("ledHeartbeatIntervalMs", String(ledHeartbeatIntervalMs));
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set ledHeartbeatOnMs ")) {
+    String value = command.substring(21);
+    unsigned long parsed = value.toInt();
+    if (parsed < 100UL || parsed >= ledHeartbeatIntervalMs) {
+      Serial.println("ERROR: ledHeartbeatOnMs must be >= 100 and below ledHeartbeatIntervalMs");
+      Serial.flush();
+      return;
+    }
+    ledHeartbeatOnMs = parsed;
+    saveConfigVar("ledHeartbeatOnMs", String(ledHeartbeatOnMs));
     Serial.println("OK");
     Serial.flush();
   } else if (command == "resetconfig") {
@@ -226,6 +421,12 @@ void processSerialCommand(const String& command) {
     Serial.flush();
   } else if (command == "last") {
     printLastReading();
+    Serial.flush();
+  } else if (command == "idlelog") {
+    printIdleEvents();
+    Serial.flush();
+  } else if (command == "clearidlelog") {
+    clearIdleEvents();
     Serial.flush();
   } else if (command == "clear") {
     SPIFFS.remove(FLASH_FILENAME); readingCount = 0; Serial.println("Cleared");

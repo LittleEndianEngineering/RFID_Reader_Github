@@ -202,20 +202,27 @@ Complete RFID reader system for medical implant temperature monitoring, featurin
 - RGB LED indicates sleep status
 
 #### Dashboard Mode
-- Activated by long-pressing the button (default: 3 seconds)
-- ESP32 stays awake, no periodic reads
+- Activated by long-pressing the button (default: 5 seconds) or by explicit dashboard configuration command
+- ESP32 stays awake for USB dashboard service access
+- Periodic RFID reads are paused while Dashboard Mode is active
 - BLE advertising enabled for mobile app
 - Responsive to serial/USB commands from dashboard
 - RGB LED indicates dashboard active status
 
+#### Low-SoC Idle Mode
+- Optional battery-based idle entry using configurable SoC threshold and voltage calibration
+- RFID reads are blocked while idle mode is active
+- A configurable USB recovery window keeps the device awake briefly after low-SoC idle so Dashboard Mode can be enabled
+- Once Dashboard Mode is active, USB dashboard access remains available even if low-SoC idle remains active
+
 #### Manual Read
 - Short press button: Trigger immediate RFID read
-- Works in both Normal and Dashboard Mode
+- Works when idle mode is inactive and RFID reads are allowed
 
 ### Mobile App Workflow
 
 1. **Connect to ESP32**:
-   - Enable Dashboard Mode on ESP32 (long press button)
+   - Enable Dashboard Mode on ESP32 using the long press button or dashboard service configuration
    - Open mobile app
    - Tap Bluetooth button to scan
    - Select "RFID Reader" device
@@ -332,7 +339,7 @@ Rfid134-master/
 - Ensure router allows ESP32 connections
 
 ### BLE Not Discoverable
-- Ensure Dashboard Mode is active (long press button)
+- Ensure Dashboard Mode is active using the long press button or dashboard service configuration
 - Check RGB LED shows dashboard active status
 - Restart ESP32 if BLE doesn't start
 - Verify mobile app has Bluetooth permissions
@@ -365,6 +372,7 @@ For technical support or inquiries:
 
 ## Version History
 
+- **v1.5** (July 2026): Low-SoC idle controls, USB recovery window, Dashboard Mode service latch, idle event logging
 - **v1.4** (September 2025): ESP32-S3 Mac compatibility, BLE reconnection fix, responsive mobile app UI
 - **v1.3**: Multi-button support, RGB LED status indicators
 - **v1.2**: Light sleep optimization, Dashboard Mode

@@ -3,6 +3,10 @@
 #include "globals.h"
 #include "pins.h"
 
+static const unsigned long RECOVERY_HEARTBEAT_PULSE_MS = 300;
+static const unsigned long RECOVERY_HEARTBEAT_GAP_MS = 250;
+static uint8_t recoveryHeartbeatStep = 0;
+
 void setLEDColor(int red, int green, int blue) {
   VERBOSE_PRINTF("[LEDDBG] COLOR t=%lu R=%d G=%d B=%d\n", millis(), red, green, blue);
   digitalWrite(LED_RED_PIN, red);
@@ -28,6 +32,7 @@ static void setLEDColorForStatus(const String& status) {
 
 static void startLEDHeartbeat() {
   ledHeartbeatOn = true;
+  recoveryHeartbeatStep = 0;
   ledHeartbeatPhaseStartTime = millis();
   ledFlashDuration = 0;
   setLEDColorForStatus(currentLEDStatus);
@@ -38,7 +43,17 @@ bool getLEDHeartbeatNextEventMs(unsigned long& waitMs) {
     return false;
   }
 
+  bool recoveryPattern = (currentLEDStatus == "idle" && lowSocUsbRecoveryWindowActive());
   unsigned long targetMs = ledHeartbeatOn ? ledHeartbeatOnMs : ledHeartbeatIntervalMs;
+  if (recoveryPattern) {
+    if (recoveryHeartbeatStep == 0 || recoveryHeartbeatStep == 2) {
+      targetMs = RECOVERY_HEARTBEAT_PULSE_MS;
+    } else if (recoveryHeartbeatStep == 1) {
+      targetMs = RECOVERY_HEARTBEAT_GAP_MS;
+    } else {
+      targetMs = ledHeartbeatIntervalMs;
+    }
+  }
   unsigned long elapsedMs = millis() - ledHeartbeatPhaseStartTime;
   waitMs = (elapsedMs >= targetMs) ? 0 : (targetMs - elapsedMs);
   return true;
@@ -96,7 +111,14 @@ void updateLEDStatus() {
     unsigned long waitMs = 0;
     if (getLEDHeartbeatNextEventMs(waitMs) && waitMs == 0) {
       ledHeartbeatPhaseStartTime = now;
-      ledHeartbeatOn = !ledHeartbeatOn;
+      bool recoveryPattern = (currentLEDStatus == "idle" && lowSocUsbRecoveryWindowActive());
+      if (recoveryPattern) {
+        recoveryHeartbeatStep = (recoveryHeartbeatStep + 1) % 4;
+        ledHeartbeatOn = (recoveryHeartbeatStep == 0 || recoveryHeartbeatStep == 2);
+      } else {
+        recoveryHeartbeatStep = 0;
+        ledHeartbeatOn = !ledHeartbeatOn;
+      }
       if (ledHeartbeatOn) {
         setLEDColorForStatus(currentLEDStatus);
       } else {

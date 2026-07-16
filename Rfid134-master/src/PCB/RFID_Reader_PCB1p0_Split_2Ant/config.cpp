@@ -61,6 +61,64 @@ void loadConfig() {
   if (s.length() > 0) { periodicIntervalMs = s.toInt(); Serial.printf("[CONFIG] periodicIntervalMs=%lu\n", periodicIntervalMs); }
   s = loadConfigVar("longPressMs");
   if (s.length() > 0) { longPressMs = s.toInt(); Serial.printf("[CONFIG] longPressMs=%lu\n", longPressMs); }
+  s = loadConfigVar("verbose");
+  if (s.length() > 0) {
+    verbose = (s == "true");
+    Serial.printf("[CONFIG] verbose=%s\n", verbose ? "true" : "false");
+  }
+  s = loadConfigVar("socLowIdleEnabled");
+  if (s.length() > 0) {
+    socLowIdleEnabled = (s == "true");
+    Serial.printf("[CONFIG] socLowIdleEnabled=%s\n", socLowIdleEnabled ? "true" : "false");
+  }
+  s = loadConfigVar("lowSocUsbRecoveryWindowMs");
+  if (s.length() > 0) {
+    unsigned long value = s.toInt();
+    if (value <= 300000UL) {
+      lowSocUsbRecoveryWindowMs = value;
+      Serial.printf("[CONFIG] lowSocUsbRecoveryWindowMs=%lu\n", lowSocUsbRecoveryWindowMs);
+    }
+  }
+  s = loadConfigVar("socLowThresholdPercent");
+  if (s.length() > 0) {
+    float value = s.toFloat();
+    if (value >= 0.0f && value <= 100.0f) {
+      SOC_LOW_THRESHOLD_PERCENT = value;
+      Serial.printf("[CONFIG] socLowThresholdPercent=%.2f\n", SOC_LOW_THRESHOLD_PERCENT);
+    }
+  }
+  s = loadConfigVar("batteryMinVoltage");
+  if (s.length() > 0) {
+    float value = s.toFloat();
+    if (value >= 2.5f && value <= 4.2f) {
+      BATTERY_MIN_VOLTAGE = value;
+      Serial.printf("[CONFIG] batteryMinVoltage=%.2f\n", BATTERY_MIN_VOLTAGE);
+    }
+  }
+  s = loadConfigVar("batteryMaxVoltage");
+  if (s.length() > 0) {
+    float value = s.toFloat();
+    if (value >= 3.5f && value <= 4.5f) {
+      BATTERY_MAX_VOLTAGE = value;
+      Serial.printf("[CONFIG] batteryMaxVoltage=%.2f\n", BATTERY_MAX_VOLTAGE);
+    }
+  }
+  s = loadConfigVar("ledHeartbeatIntervalMs");
+  if (s.length() > 0) {
+    unsigned long value = s.toInt();
+    if (value >= 1000UL) {
+      ledHeartbeatIntervalMs = value;
+      Serial.printf("[CONFIG] ledHeartbeatIntervalMs=%lu\n", ledHeartbeatIntervalMs);
+    }
+  }
+  s = loadConfigVar("ledHeartbeatOnMs");
+  if (s.length() > 0) {
+    unsigned long value = s.toInt();
+    if (value >= 100UL && value < ledHeartbeatIntervalMs) {
+      ledHeartbeatOnMs = value;
+      Serial.printf("[CONFIG] ledHeartbeatOnMs=%lu\n", ledHeartbeatOnMs);
+    }
+  }
   // Restore Dashboard Mode state from flash (persists across resets)
   s = loadConfigVar("dashboardModeActive");
   if (s.length() > 0 && s == "true") {

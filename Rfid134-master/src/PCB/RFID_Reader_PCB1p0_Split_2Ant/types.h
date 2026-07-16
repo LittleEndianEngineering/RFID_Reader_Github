@@ -12,6 +12,12 @@ typedef struct RfidReading {
   uint8_t  reserved;
 } RfidReading;
 
+typedef struct IdleEvent {
+  uint32_t timestamp;    // Unix UTC, 0 if RTC/time is unavailable
+  uint8_t reason;        // IdleReason value
+  uint8_t reserved[3];
+} IdleEvent;
+
 // RfidReading::flags bit layout.
 static const uint8_t FLAG_IS_DATA  = 0x01;
 static const uint8_t FLAG_IS_ANIMAL = 0x02;
