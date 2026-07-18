@@ -1,0 +1,59 @@
+# OS and editor noise
+.DS_Store
+**/.DS_Store
+desktop.ini
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+dist/
+build/
+venv/
+env/
+ENV/
+
+# Arduino and firmware build outputs
+*.d
+*.hex
+*.elf
+*.bin
+*.map
+*.o
+*.obj
+*.a
+*.lib
+
+# Flutter / Dart
+**/build/
+**/.symlinks/
+**/ephemeral/
+**/.plugin_symlinks/
+.dart_tool/
+.pub-cache/
+
+# Local exports, debug captures, and generated packages
+debug/
+*.csv
+*.zip
+
+# Local project archives and scratch work
+Local Backup/
+TEMP/
+Rfid134-master/checkpoints/
+Rfid134-master/dashboard/src/TEMP_live/
+Rfid134-master/dashboard/deliverables/
+Rfid134-master/Notes.rtf
+Rfid134-master/git_safe_commit_flow_cheat_sheet.pdf
+
+# Reference PDFs kept locally, not in normal source commits
+Datasheets/
+Rfid134-master/resources/

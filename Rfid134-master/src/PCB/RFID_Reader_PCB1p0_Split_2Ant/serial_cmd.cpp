@@ -8,6 +8,7 @@
 #include "led_status.h"
 #include "ble_comm.h"
 #include "flash_store.h"
+#include "rfid_reader.h"
 #include "rtc_time.h"
 #include "sleep_wake.h"
 
@@ -27,6 +28,23 @@ void processSerialCommand(const String& command) {
   if (command == "status") {
     Serial.printf("[DASHBOARD] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
     printIdleStatus();
+    Serial.flush();
+    return;
+  }
+
+  if (command == "readnow") {
+    if (!rfidReadsAllowed()) {
+      Serial.printf("[IDLE] Manual read blocked: %s\n", idleReasonToString(latestIdleReason));
+      Serial.println("[MANUAL] RFID read skipped");
+      Serial.flush();
+      return;
+    }
+
+    Serial.printf("[MANUAL] Starting RFID read window (%lums)\n", rfidOnTimeMs);
+    Serial.flush();
+    powerOnAndReadTagWindow(rfidOnTimeMs);
+    lastPeriodicRead = millis();
+    Serial.printf("[MANUAL] RFID read complete count=%u\n", readingCount);
     Serial.flush();
     return;
   }
@@ -177,6 +195,13 @@ void processSerialCommand(const String& command) {
     Serial.flush();
     return;
   }
+  if (command == "get liveViewAutoReadIntervalMs") {
+    Serial.println("<GET_LIVEVIEWAUTOREADINTERVALMS_BEGIN>");
+    Serial.println(liveViewAutoReadIntervalMs);
+    Serial.println("<GET_LIVEVIEWAUTOREADINTERVALMS_END>");
+    Serial.flush();
+    return;
+  }
   if (command == "get longPressMs") {
     Serial.println("<GET_LONGPRESSMS_BEGIN>");
     Serial.println(longPressMs);
@@ -279,6 +304,18 @@ void processSerialCommand(const String& command) {
   } else if (command.startsWith("set periodicIntervalMs ")) {
     String value = command.substring(23);
     periodicIntervalMs = value.toInt(); saveConfigVar("periodicIntervalMs", value); 
+    Serial.println("OK");
+    Serial.flush();
+  } else if (command.startsWith("set liveViewAutoReadIntervalMs ")) {
+    String value = command.substring(31);
+    unsigned long parsed = value.toInt();
+    if (parsed < 8000UL || parsed > 300000UL) {
+      Serial.println("ERROR: liveViewAutoReadIntervalMs must be 8000-300000");
+      Serial.flush();
+      return;
+    }
+    liveViewAutoReadIntervalMs = parsed;
+    saveConfigVar("liveViewAutoReadIntervalMs", String(liveViewAutoReadIntervalMs));
     Serial.println("OK");
     Serial.flush();
   } else if (command.startsWith("set longPressMs ")) {

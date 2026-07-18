@@ -94,11 +94,11 @@ void tryReadAndStoreTag(uint8_t antennaId) {
     VERBOSE_PRINTF("[READDBG] STORE_OK t=%lu ant=%u count=%u ts=%lu\n",
                    millis(), antennaId, readingCount, (unsigned long)storedReading.timestamp);
     if (temperatureAvailable) {
-      Serial.printf("[RFID_RESULT] stored=true ant=ANT%u reading=%d tag=%03u %012llu temp=%.2f°C\n",
-                    antennaId, readingCount, lastTag.country, lastTag.id, temperature);
+      Serial.printf("[RFID_RESULT] stored=true ant=ANT%u reading=%d ts=%lu tag=%03u %012llu temp=%.2f°C\n",
+                    antennaId, readingCount, (unsigned long)storedReading.timestamp, lastTag.country, lastTag.id, temperature);
     } else {
-      Serial.printf("[RFID_RESULT] stored=true ant=ANT%u reading=%d tag=%03u %012llu temp=N/A\n",
-                    antennaId, readingCount, lastTag.country, lastTag.id);
+      Serial.printf("[RFID_RESULT] stored=true ant=ANT%u reading=%d ts=%lu tag=%03u %012llu temp=N/A\n",
+                    antennaId, readingCount, (unsigned long)storedReading.timestamp, lastTag.country, lastTag.id);
     }
     VERBOSE_PRINTF("#%d\n", readingCount);
     if (temperatureAvailable) {

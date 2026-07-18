@@ -9,8 +9,8 @@ Developed by Little Endian Engineering
 ## Overview
 
 Complete RFID reader system for medical implant temperature monitoring, featuring:
-- **ESP32-S3 Firmware**: RFID reading with RTC, flash storage, light sleep power saving, and BLE connectivity
-- **Python Dashboard**: Streamlit web interface for device configuration and data analysis
+- **ESP32-S3 2Ant Firmware**: Dual-antenna RFID reading with RTC, flash storage, light sleep power saving, BLE connectivity, low-SoC idle protection, and USB service recovery
+- **Python Dashboard**: Streamlit web interface for live reads, device configuration, data retrieval, battery/idle visibility, and data analysis
 - **Flutter Mobile App**: Cross-platform mobile application for BLE connectivity and data visualization
 
 ---
@@ -35,23 +35,25 @@ Complete RFID reader system for medical implant temperature monitoring, featurin
 ## Features
 
 ### ESP32-S3 Firmware
-- ✅ **RFID Reading**: WL-134 module with temperature sensor data extraction
+- ✅ **Dual-Antenna RFID Reading**: WL-134 module with ANT1/ANT2 selection and temperature sensor data extraction
 - ✅ **RTC Integration**: DS1307 external RTC module for accurate timekeeping
 - ✅ **Flash Storage**: SPIFFS-based storage for up to 20,160 readings
 - ✅ **Light Sleep Mode**: Power-efficient sleep with timer, GPIO, and UART wake-up
 - ✅ **Multi-Button Control**: Single button for manual reads and Dashboard Mode toggle
-- ✅ **RGB LED Status**: Visual feedback (booting, sleeping, reading success, dashboard active)
+- ✅ **RGB LED Status**: Visual feedback for boot, sleep, dashboard, idle, and read states
 - ✅ **BLE Support**: Bluetooth Low Energy for mobile app connectivity (Dashboard Mode only)
-- ✅ **WiFi & NTP**: Automatic time synchronization via WiFi
+- ✅ **Low-SoC Idle Protection**: Configurable battery threshold, voltage calibration, and USB recovery window
+- ✅ **Live View Support**: Serial `readnow` command with timestamped `[RFID_RESULT]` output for dashboard plotting
 - ✅ **ESP32-S3 Mac Compatible**: USB-CDC stability improvements for macOS
 
 ### Python Dashboard
 - ✅ **Streamlit Web Interface**: Real-time device monitoring and control
+- ✅ **Live View**: Manual and automatic `readnow` cycles with latest ANT1/ANT2 result cards
 - ✅ **Data Visualization**: Temperature charts and reading history
 - ✅ **Date/Time Filtering**: Timezone-aware data retrieval
 - ✅ **CSV Export**: Data export functionality
-- ✅ **Configuration Management**: WiFi, button timings, and device settings
-- ✅ **Latest Reading Highlight**: Quick access to most recent reading
+- ✅ **Configuration Management**: WiFi, read timing, Live View timing, low-SoC, Dashboard Mode, verbose logging, and LED heartbeat settings
+- ✅ **Latest Reading Highlight**: Quick access to most recent ANT1/ANT2 readings
 
 ### Flutter Mobile App
 - ✅ **BLE Connectivity**: Connect to ESP32-S3 via Bluetooth Low Energy
@@ -73,16 +75,18 @@ Complete RFID reader system for medical implant temperature monitoring, featurin
 
 ### RFID Module
 - WL-134 RFID reader module
-- Connected via UART (GPIO 48)
+- Connected via UART (GPIO 41)
+- Antenna select control on GPIO 36
 
 ### RTC Module
 - DS1307 Real-Time Clock
-- Connected via I2C (GPIO 8 = SDA, GPIO 9 = SCL)
+- Connected via I2C (GPIO 35 = SDA, GPIO 45 = SCL)
 
 ### Additional Components
 - Push button (GPIO 37) for manual reads and Dashboard Mode
-- RGB LED (GPIO 2 = Red, GPIO 5 = Green, GPIO 6 = Blue) for status indication
-- RFID power control (GPIO 36)
+- RGB LED (GPIO 5 = Red, GPIO 6 = Green, GPIO 4 = Blue) for status indication
+- RFID power control (GPIO 42)
+- Battery SoC ADC input (GPIO 7)
 
 ---
 
@@ -127,17 +131,17 @@ Complete RFID reader system for medical implant temperature monitoring, featurin
 
 2. **Install Required Libraries**:
    - Install `RTClib` by Adafruit from Library Manager
-   - Copy `src/Rfid134.h` to your Arduino libraries folder
+   - Use the included RFID library header at `src/PCB/Rfid134.h`
 
 3. **Upload Firmware**:
-   - Open `src/ReadRfid_RealRTC_FLASH_LightSleep_Multibutton_BLE_S3/ReadRfid_RealRTC_FLASH_LightSleep_Multibutton_BLE_S3.ino`
+   - Open `src/PCB/RFID_Reader_PCB1p0_Split_2Ant/RFID_Reader_PCB1p0_Split_2Ant.ino`
    - Select board: **ESP32S3 Dev Module**
    - Select port: Your ESP32-S3 USB port
    - Upload
 
 4. **Configure WiFi** (optional, for NTP sync):
    - Edit `ssid_str` and `password_str` in the firmware code
-   - Or use serial commands: `wifi SSID PASSWORD`
+   - Or use dashboard configuration fields / serial `set ssid ...` and `set password ...` commands
 
 ### 2. Python Dashboard
 
@@ -149,7 +153,7 @@ Complete RFID reader system for medical implant temperature monitoring, featurin
 
 2. **Run Dashboard**:
    ```bash
-   streamlit run rfid_dashboard_configure_lightsleep_multibutton.py
+   streamlit run rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py
    ```
 
 3. **Access Dashboard**:
@@ -219,6 +223,12 @@ Complete RFID reader system for medical implant temperature monitoring, featurin
 - Short press button: Trigger immediate RFID read
 - Works when idle mode is inactive and RFID reads are allowed
 
+#### Live View
+- Dashboard-controlled read loop using the serial `readnow` command
+- Configurable auto-read interval saved as `liveViewAutoReadIntervalMs`
+- Dashboard enforces a safe minimum interval for dual-antenna read windows
+- New readings are plotted directly from timestamped `[RFID_RESULT]` lines
+
 ### Mobile App Workflow
 
 1. **Connect to ESP32**:
@@ -253,11 +263,11 @@ Complete RFID reader system for medical implant temperature monitoring, featurin
 
 2. **Configure Settings**:
    - Update WiFi credentials
-   - Adjust button press timings
-   - Configure periodic read intervals
+   - Adjust RFID, Live View, and button timings
+   - Configure low-SoC idle, USB recovery, Dashboard Mode, verbose logging, and LED heartbeat settings
 
 3. **View Data**:
-   - See latest reading in "Latest Reading" section
+   - Use **Read Now** or **Live View** for immediate ANT1/ANT2 reads
    - Filter by date/time range
    - Export data as CSV
    - View temperature trends
@@ -281,12 +291,19 @@ Complete RFID reader system for medical implant temperature monitoring, featurin
 - `range <start_epoch> <end_epoch>` - Get readings in time range (UTC Unix timestamps)
 - `status` - Get device status
 - `debugsimple` - Enable verbose debug output
+- `dashboardmode on|off` - Enable or disable Dashboard Mode service access
+- `get liveViewAutoReadIntervalMs` / `set liveViewAutoReadIntervalMs <ms>` - Read or configure Live View interval
 
 ### Response Format
 
 Individual readings:
 ```
 #1: 2025-10-22 04:29:52, 999, 141004263679, 25.87°C
+```
+
+Live Read Now results:
+```
+[RFID_RESULT] stored=true ant=ANT1 reading=42 ts=1761107392 tag=999 141004263679 temp=25.87°C
 ```
 
 Range responses:
@@ -305,12 +322,18 @@ Range responses:
 ```
 Rfid134-master/
 ├── src/
-│   ├── ReadRfid_RealRTC_FLASH_LightSleep_Multibutton_BLE_S3/
-│   │   └── ReadRfid_RealRTC_FLASH_LightSleep_Multibutton_BLE_S3.ino  # Main firmware
-│   └── Rfid134.h                                                      # RFID library
+│   └── PCB/
+│       ├── Rfid134.h                                                  # RFID library
+│       └── RFID_Reader_PCB1p0_Split_2Ant/
+│           ├── RFID_Reader_PCB1p0_Split_2Ant.ino                      # Main firmware
+│           ├── config.cpp/.h                                          # Persistent configuration
+│           ├── serial_cmd.cpp/.h                                      # USB serial command handling
+│           ├── rfid_reader.cpp/.h                                     # Dual-antenna RFID reads
+│           ├── sleep_wake.cpp/.h                                      # Light sleep and idle behavior
+│           └── pins.h                                                 # Hardware pin map
 ├── dashboard/
 │   └── src/
-│       ├── rfid_dashboard_configure_lightsleep_multibutton.py         # Streamlit dashboard
+│       ├── rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py
 │       ├── requirements.txt                                          # Python dependencies
 │       └── README_MultiButton_Dashboard.md                           # Dashboard docs
 └── mobile_app/
@@ -372,6 +395,7 @@ For technical support or inquiries:
 
 ## Version History
 
+- **v1.6** (July 2026): Live View auto-read interval persistence, serial `readnow`, timestamped `[RFID_RESULT]` output, latest ANT1/ANT2 cards, and dashboard timeout controls
 - **v1.5** (July 2026): Low-SoC idle controls, USB recovery window, Dashboard Mode service latch, idle event logging
 - **v1.4** (September 2025): ESP32-S3 Mac compatibility, BLE reconnection fix, responsive mobile app UI
 - **v1.3**: Multi-button support, RGB LED status indicators

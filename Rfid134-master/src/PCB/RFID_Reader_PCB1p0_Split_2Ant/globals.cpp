@@ -26,6 +26,7 @@ const unsigned long debounceDelay = 200; // ms
 unsigned long rfidOnTimeMs = 5 * 1000;   // configurable
 unsigned long lastPeriodicRead = 0;
 unsigned long periodicIntervalMs = 1 * 60 * 1000UL; // configurable
+unsigned long liveViewAutoReadIntervalMs = 8 * 1000UL; // dashboard-configurable
 bool radiosOffBetweenReads = true;
 bool dashboardModeActive = false;
 const unsigned long IDLE_SOC_POLL_INTERVAL_MS = 5000;

@@ -59,6 +59,14 @@ void loadConfig() {
   if (s.length() > 0) { rfidOnTimeMs = s.toInt(); Serial.printf("[CONFIG] rfidOnTimeMs=%lu\n", rfidOnTimeMs); }
   s = loadConfigVar("periodicIntervalMs");
   if (s.length() > 0) { periodicIntervalMs = s.toInt(); Serial.printf("[CONFIG] periodicIntervalMs=%lu\n", periodicIntervalMs); }
+  s = loadConfigVar("liveViewAutoReadIntervalMs");
+  if (s.length() > 0) {
+    unsigned long value = s.toInt();
+    if (value >= 8000UL && value <= 300000UL) {
+      liveViewAutoReadIntervalMs = value;
+      Serial.printf("[CONFIG] liveViewAutoReadIntervalMs=%lu\n", liveViewAutoReadIntervalMs);
+    }
+  }
   s = loadConfigVar("longPressMs");
   if (s.length() > 0) { longPressMs = s.toInt(); Serial.printf("[CONFIG] longPressMs=%lu\n", longPressMs); }
   s = loadConfigVar("verbose");

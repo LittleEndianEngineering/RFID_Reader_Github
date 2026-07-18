@@ -37,6 +37,7 @@ extern const unsigned long debounceDelay; // ms
 extern unsigned long rfidOnTimeMs;        // configurable
 extern unsigned long lastPeriodicRead;
 extern unsigned long periodicIntervalMs; // configurable
+extern unsigned long liveViewAutoReadIntervalMs; // dashboard-configurable
 extern bool radiosOffBetweenReads;
 extern bool dashboardModeActive;
 extern const unsigned long IDLE_SOC_POLL_INTERVAL_MS;
