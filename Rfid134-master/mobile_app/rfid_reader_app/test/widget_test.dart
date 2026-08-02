@@ -1,30 +1,33 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
 import 'package:flutter/material.dart';
+// ignore: depend_on_referenced_packages
+import 'package:flutter_blue_plus_platform_interface/flutter_blue_plus_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
-
 import 'package:rfid_reader_app/main.dart';
 
+final class FakeFlutterBluePlusPlatform extends FlutterBluePlusPlatform {
+  @override
+  Stream<BmBluetoothAdapterState> get onAdapterStateChanged =>
+      const Stream.empty();
+
+  @override
+  Future<BmBluetoothAdapterState> getAdapterState(
+    BmBluetoothAdapterStateRequest request,
+  ) async {
+    return BmBluetoothAdapterState(adapterState: BmAdapterStateEnum.on);
+  }
+}
+
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  testWidgets('RFID reader app renders dashboard shell', (
+    WidgetTester tester,
+  ) async {
+    FlutterBluePlusPlatform.instance = FakeFlutterBluePlusPlatform();
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
-
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
+    await tester.pumpWidget(const RFIDReaderApp());
     await tester.pump();
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(find.text('Implant RFID Reader'), findsOneWidget);
+    expect(find.text('Dashboard'), findsWidgets);
+    expect(find.byIcon(Icons.bluetooth_searching), findsOneWidget);
   });
 }

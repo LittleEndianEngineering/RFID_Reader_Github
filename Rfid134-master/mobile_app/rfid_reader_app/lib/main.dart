@@ -92,6 +92,10 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   int _currentIndex = 0;
   final GlobalKey _chartKey = GlobalKey();
   final ScrollController _horizontalScrollController = ScrollController();
+  StreamSubscription<BluetoothAdapterState>? _adapterStateSubscription;
+  StreamSubscription<List<ScanResult>>? _scanResultsSubscription;
+  StreamSubscription<List<int>>? _responseSubscription;
+  StreamSubscription<List<int>>? _statusSubscription;
   
   // Date/Time filtering (matching dashboard functionality)
   DateTime startDate = DateTime.now().subtract(const Duration(days: 7));
@@ -124,9 +128,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     _initializeBLE();
   }
 
+  void _safeSetState(VoidCallback update) {
+    if (!mounted) return;
+    setState(update);
+  }
+
   void _initializeBLE() {
     // Request Bluetooth permissions
-    FlutterBluePlus.adapterState.listen((state) {
+    _adapterStateSubscription = FlutterBluePlus.adapterState.listen((state) {
       if (state == BluetoothAdapterState.on) {
         print("Bluetooth is on");
       } else {
@@ -138,22 +147,18 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   void _startScan() async {
     if (isScanning) return;
 
-    setState(() {
+    _safeSetState(() {
       isScanning = true;
       scanResults.clear();
     });
 
     try {
-      await FlutterBluePlus.startScan(
-        timeout: const Duration(seconds: 10),
-        withServices: [],
-      );
-
-      FlutterBluePlus.scanResults.listen((results) {
+      await _scanResultsSubscription?.cancel();
+      _scanResultsSubscription = FlutterBluePlus.onScanResults.listen((results) {
         for (ScanResult result in results) {
-          if (result.device.name.contains(DEVICE_NAME) || 
-              result.advertisementData.localName.contains(DEVICE_NAME)) {
-            setState(() {
+          if (result.device.platformName.contains(DEVICE_NAME) ||
+              result.advertisementData.advName.contains(DEVICE_NAME)) {
+            _safeSetState(() {
               if (!scanResults.any((element) => element.device.remoteId == result.device.remoteId)) {
                 scanResults.add(result);
               }
@@ -161,10 +166,24 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           }
         }
       });
+
+      await FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 10),
+        withKeywords: [DEVICE_NAME],
+        androidUsesFineLocation: false,
+      );
+
+      await FlutterBluePlus.isScanning
+          .where((active) => active == false)
+          .first
+          .timeout(const Duration(seconds: 12), onTimeout: () => false);
     } catch (e) {
       print("Error starting scan: $e");
     } finally {
-      setState(() {
+      if (FlutterBluePlus.isScanningNow) {
+        await FlutterBluePlus.stopScan();
+      }
+      _safeSetState(() {
         isScanning = false;
       });
     }
@@ -172,12 +191,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
 
   void _connectToDevice(BluetoothDevice device) async {
     try {
-      await device.connect();
-      
-      setState(() {
-        connectedDevice = device;
-        isConnected = true;
-      });
+      await device.connect().timeout(const Duration(seconds: 15));
 
       // Note: iOS doesn't support manual MTU negotiation via requestMtu()
       // iOS automatically negotiates MTU (typically 185 bytes on iOS)
@@ -186,6 +200,9 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
 
       // Discover services
       List<BluetoothService> services = await device.discoverServices();
+      BluetoothCharacteristic? commandChar;
+      BluetoothCharacteristic? responseChar;
+      BluetoothCharacteristic? statusChar;
       
       for (BluetoothService service in services) {
         if (service.uuid.toString().toUpperCase() == SERVICE_UUID.toUpperCase()) {
@@ -193,23 +210,59 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             String charUuid = characteristic.uuid.toString().toUpperCase();
             
             if (charUuid == COMMAND_CHAR_UUID.toUpperCase()) {
-              commandCharacteristic = characteristic;
+              commandChar = characteristic;
             } else if (charUuid == RESPONSE_CHAR_UUID.toUpperCase()) {
-              responseCharacteristic = characteristic;
-              await characteristic.setNotifyValue(true);
-              characteristic.lastValueStream.listen(_handleESP32Response);
+              responseChar = characteristic;
             } else if (charUuid == STATUS_CHAR_UUID.toUpperCase()) {
-              statusCharacteristic = characteristic;
-              await characteristic.setNotifyValue(true);
-              characteristic.lastValueStream.listen(_handleESP32Status);
+              statusChar = characteristic;
             }
           }
         }
       }
+
+      if (commandChar == null || responseChar == null || statusChar == null) {
+        await device.disconnect();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('RFID BLE service is incomplete. Please restart the reader and try again.'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+        return;
+      }
+
+      await _responseSubscription?.cancel();
+      await _statusSubscription?.cancel();
+
+      await responseChar.setNotifyValue(true);
+      await statusChar.setNotifyValue(true);
+
+      _responseSubscription = responseChar.lastValueStream.listen(_handleESP32Response);
+      _statusSubscription = statusChar.lastValueStream.listen(_handleESP32Status);
+
+      _safeSetState(() {
+        connectedDevice = device;
+        isConnected = true;
+        commandCharacteristic = commandChar;
+        responseCharacteristic = responseChar;
+        statusCharacteristic = statusChar;
+      });
       
-      print("Connected to device: ${device.name}");
+      print("Connected to device: ${device.platformName}");
     } catch (e) {
       print("Error connecting to device: $e");
+      try {
+        await device.disconnect();
+      } catch (_) {}
+      _safeSetState(() {
+        connectedDevice = null;
+        isConnected = false;
+        commandCharacteristic = null;
+        responseCharacteristic = null;
+        statusCharacteristic = null;
+      });
     }
   }
 
@@ -236,6 +289,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   bool _waitingForLastReading = false; // Track if we're waiting for "last" command response
 
   void _handleESP32Response(List<int> value) {
+    if (!mounted) return;
     String response = utf8.decode(value);
     
     // Log empty responses to help diagnose BLE issues
@@ -255,7 +309,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     
     print("🔍 Received ESP32 response: $response (length: ${response.length}, bytes: ${value.length})");
     
-    setState(() {
+    _safeSetState(() {
       rfidReadings.add(response);
     });
     
@@ -364,12 +418,15 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           _totalExpectedReadings = expectedCount;
           _currentReceivedReadings = 0;
           _lastReceivedCount = 0;
-          _isLoadingReadings = true; // Start loading state for range query
+          _isLoadingReadings = expectedCount > 0; // Start loading state for range query
+          isLoadingData = expectedCount > 0;
           _isRangeQuery = true; // Mark as range query for pagination
         });
         print("📊 Found $expectedCount readings in range");
-        // Start timeout timer for range query
-        _startDataRetrievalTimeout();
+        if (expectedCount > 0) {
+          // Start timeout timer for range query
+          _startDataRetrievalTimeout();
+        }
       }
     }
     
@@ -416,6 +473,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       _currentChunkIndex++;
       if (_totalChunks > 0 && _currentChunkIndex < _totalChunks) {
         Future.delayed(const Duration(milliseconds: 500), () {
+          if (!mounted || !_isFetchingChunks) return;
           // Small delay to ensure previous chunk is fully processed
           // Use range_chunk for range queries, print_chunk for "All Readings"
           if (_isRangeQuery && _currentRangeStartEpoch != null && _currentRangeEndEpoch != null) {
@@ -494,11 +552,13 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             _totalExpectedReadings = expectedCount;
             _currentReceivedReadings = 0;
             _lastReceivedCount = 0;
-            _isLoadingReadings = true; // Start loading state - this enables parsing of individual readings
+            _isLoadingReadings = expectedCount > 0; // Start loading state - this enables parsing of individual readings
           });
           print("📊 [PRINT DEBUG] ESP32 reports $expectedCount stored readings | Starting loading state");
-          // Start timeout timer for print query
-          _startDataRetrievalTimeout();
+          if (expectedCount > 0) {
+            // Start timeout timer for print query
+            _startDataRetrievalTimeout();
+          }
         }
       
       // Check if this is a paginated response (contains chunk info)
@@ -554,6 +614,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   }
 
   void _handleESP32Status(List<int> value) {
+    if (!mounted) return;
     String status = utf8.decode(value);
     print("Received ESP32 status: $status");
   }
@@ -626,6 +687,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     // Start timeout timer (15 seconds - enough for RFID read window + processing)
     _readTimeoutTimer?.cancel();
     _readTimeoutTimer = Timer(const Duration(seconds: 15), () {
+      if (!mounted) return;
       if (isReadingRFID) {
         print("⏱️ Read Now timeout - no response received");
         setState(() {
@@ -646,17 +708,36 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     _sendCommand('readnow');
   }
 
-  void _disconnect() async {
-    if (connectedDevice != null) {
-      await connectedDevice!.disconnect();
-      setState(() {
-        connectedDevice = null;
+  Future<void> _disconnect({bool updateState = true}) async {
+    _readTimeoutTimer?.cancel();
+    _dataRetrievalTimeoutTimer?.cancel();
+    await _responseSubscription?.cancel();
+    await _statusSubscription?.cancel();
+    _responseSubscription = null;
+    _statusSubscription = null;
+
+    final device = connectedDevice;
+    if (device != null) {
+      try {
+        await device.disconnect();
+      } catch (e) {
+        print("Error disconnecting device: $e");
+      }
+    }
+
+    connectedDevice = null;
+    commandCharacteristic = null;
+    responseCharacteristic = null;
+    statusCharacteristic = null;
+
+    if (updateState) {
+      _safeSetState(() {
         isConnected = false;
-        commandCharacteristic = null;
-        responseCharacteristic = null;
-        statusCharacteristic = null;
         rfidReadings.clear();
       });
+    } else {
+      isConnected = false;
+      rfidReadings.clear();
     }
   }
 
@@ -1506,9 +1587,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   void _startDataRetrievalTimeout() {
     // Cancel existing timeout if any
     _dataRetrievalTimeoutTimer?.cancel();
+
+    if (_totalExpectedReadings <= 0) {
+      return;
+    }
     
     // Start 30-second timeout
     _dataRetrievalTimeoutTimer = Timer(const Duration(seconds: 30), () {
+      if (!mounted) return;
       if (_isLoadingReadings) {
         // Check if we've received new data since timeout started
         final currentCount = _currentReceivedReadings;
@@ -1600,10 +1686,12 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       // Timeout will be started when "Found X readings in range" is received
     } catch (e) {
       print("❌ Error converting timezone: $e");
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Timezone conversion error: $e')),
-      );
-      setState(() {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Timezone conversion error: $e')),
+        );
+      }
+      _safeSetState(() {
         isLoadingData = false;
         _isLoadingReadings = false; // Reset loading state on error
       });
@@ -1742,7 +1830,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         ],
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: isConnected ? _disconnect : _startScan,
+        onPressed: isConnected ? () => _disconnect() : _startScan,
         tooltip: isConnected ? 'Disconnect' : 'Scan for devices',
         child: Icon(isConnected ? Icons.bluetooth_disabled : Icons.bluetooth_searching),
       ),
@@ -3281,8 +3369,16 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   @override
   void dispose() {
     _readTimeoutTimer?.cancel();
+    _dataRetrievalTimeoutTimer?.cancel();
+    _adapterStateSubscription?.cancel();
+    _scanResultsSubscription?.cancel();
+    _responseSubscription?.cancel();
+    _statusSubscription?.cancel();
+    if (FlutterBluePlus.isScanningNow) {
+      unawaited(FlutterBluePlus.stopScan());
+    }
     _horizontalScrollController.dispose();
-    _disconnect();
+    unawaited(_disconnect(updateState: false));
     super.dispose();
   }
 }
