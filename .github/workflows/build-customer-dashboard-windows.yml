@@ -1,0 +1,45 @@
+name: Build customer Windows dashboard
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'customer/windows-dashboard-*'
+    paths:
+      - 'Rfid134-master/dashboard/customer/**'
+      - '.github/workflows/build-customer-dashboard-windows.yml'
+permissions:
+  contents: read
+jobs:
+  windows-executable:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: Rfid134-master/dashboard/customer
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+      - name: Build single-file executable and run frozen smoke tests
+        run: ./build_windows.ps1
+      - name: Upload executable and verification results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: RFIDDashboard-Windows-x64
+          path: Rfid134-master/dashboard/customer/dist/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: RFIDDashboard-build-diagnostics
+          path: |
+            Rfid134-master/dashboard/customer/dist/*.json
+            Rfid134-master/dashboard/customer/dist/*.log
+            Rfid134-master/dashboard/customer/build/RFIDDashboard/warn-RFIDDashboard.txt
+          if-no-files-found: ignore
+          retention-days: 7
