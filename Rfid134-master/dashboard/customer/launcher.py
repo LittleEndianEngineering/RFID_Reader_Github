@@ -1,10 +1,11 @@
-"""Double-click launcher for the self-contained Windows customer dashboard."""
+"""Double-click launcher for the self-contained customer dashboard."""
 from __future__ import annotations
 
 import argparse
 import importlib.metadata
 import json
 import os
+import platform
 from pathlib import Path
 import socket
 import subprocess
@@ -28,7 +29,12 @@ def resource_directory():
 
 
 def runtime_directory():
-    base = Path(os.environ.get('LOCALAPPDATA', Path.home() / '.local' / 'share'))
+    if sys.platform == 'darwin':
+        base = Path.home() / 'Library' / 'Application Support'
+    elif sys.platform == 'win32':
+        base = Path(os.environ.get('LOCALAPPDATA', Path.home() / '.local' / 'share'))
+    else:
+        base = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local' / 'share'))
     path = base / 'EstablishmentLabs' / APP_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -48,6 +54,28 @@ def local_url(value):
     except (TypeError, ValueError):
         pass
     return None
+
+
+
+def open_dashboard_browser(url, new=0):
+    """Use the system browser's libraries, then restore the frozen app environment."""
+    if not local_url(url):
+        return False
+    if not sys.platform.startswith('linux'):
+        return webbrowser.open(url, new=new)
+    original = os.environ.get('LD_LIBRARY_PATH')
+    system = os.environ.get('LD_LIBRARY_PATH_ORIG')
+    try:
+        if system is None:
+            os.environ.pop('LD_LIBRARY_PATH', None)
+        else:
+            os.environ['LD_LIBRARY_PATH'] = system
+        return webbrowser.open(url, new=new)
+    finally:
+        if original is None:
+            os.environ.pop('LD_LIBRARY_PATH', None)
+        else:
+            os.environ['LD_LIBRARY_PATH'] = original
 
 
 def healthy(url):
@@ -135,7 +163,7 @@ def serve(port):
 
 
 def self_test(report):
-    result = {'version': VERSION, 'firmware_baseline': BASELINE, 'frozen': bool(getattr(sys, 'frozen', False))}
+    result = {'version': VERSION, 'firmware_baseline': BASELINE, 'frozen': bool(getattr(sys, 'frozen', False)), 'platform': sys.platform, 'machine': platform.machine()}
     try:
         import pandas
         import plotly.express
@@ -151,13 +179,13 @@ def self_test(report):
         assert 'Read ANT1' not in labels and 'Read ANT2' not in labels
         assert 'Set Variables on ESP32' in labels
         result['packages'] = {name: importlib.metadata.version(name) for name in ('streamlit', 'pandas', 'plotly', 'pyserial', 'pytz')}
-        if sys.platform == 'win32':
-            import tkinter
-            root = tkinter.Tk()
-            root.withdraw()
-            root.update_idletasks()
-            root.destroy()
-            result['native_window'] = True
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        root.update_idletasks()
+        root.destroy()
+        result['native_window'] = True
+        result['tk_version'] = tkinter.TkVersion
         result['passed'] = True
     except Exception:
         result['passed'] = False
@@ -184,7 +212,7 @@ def launch():
             except (OSError, ValueError):
                 url = None
             if url and healthy(url):
-                webbrowser.open(url, new=0)
+                open_dashboard_browser(url, new=0)
                 return 0
             time.sleep(0.3)
         messagebox.showinfo('RFID Dashboard', 'The dashboard is already starting. Please use its control window.')
@@ -209,7 +237,7 @@ def launch():
         if os.name == 'nt':
             options['creationflags'] = subprocess.CREATE_NO_WINDOW
         process = subprocess.Popen(child_command(port), **options)
-        open_button = tk.Button(root, text='Open Dashboard', command=lambda: webbrowser.open(url, new=0), state='disabled')
+        open_button = tk.Button(root, text='Open Dashboard', command=lambda: open_dashboard_browser(url, new=0), state='disabled')
         open_button.pack(pady=(8, 4))
         tk.Button(root, text='Close Dashboard', command=root.destroy).pack()
         root.protocol('WM_DELETE_WINDOW', root.destroy)
@@ -227,7 +255,7 @@ def launch():
                 opened = True
                 open_button.configure(state='normal')
                 label.set('The dashboard is running. Keep this window open while using the reader.')
-                webbrowser.open(url, new=0)
+                open_dashboard_browser(url, new=0)
             elif not opened and time.monotonic() > deadline:
                 label.set('Startup took too long. Close this window and try again.')
                 return

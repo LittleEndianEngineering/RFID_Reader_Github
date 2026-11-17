@@ -144,6 +144,43 @@ class CustomerProtocolTests(unittest.TestCase):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_native_runtime_directories(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            cases = [
+                ('darwin', {}, home / 'Library' / 'Application Support'),
+                ('linux', {}, home / '.local' / 'share'),
+                ('linux', {'XDG_DATA_HOME': str(home / 'xdg')}, home / 'xdg'),
+                ('win32', {'LOCALAPPDATA': str(home / 'windows')}, home / 'windows'),
+            ]
+            for system, environment, base in cases:
+                with mock.patch.object(launcher.sys, 'platform', system), \
+                        mock.patch.object(launcher.Path, 'home', return_value=home), \
+                        mock.patch.dict(launcher.os.environ, environment, clear=True):
+                    self.assertEqual(launcher.runtime_directory(), base / 'EstablishmentLabs' / 'RFIDDashboard')
+
+    def test_linux_browser_uses_system_libraries_and_restores_app_environment(self):
+        for original in [None, '/system-libraries']:
+            environment = {'LD_LIBRARY_PATH': '/frozen-libraries'}
+            if original is not None:
+                environment['LD_LIBRARY_PATH_ORIG'] = original
+            observed = []
+            with mock.patch.object(launcher.sys, 'platform', 'linux'), \
+                    mock.patch.dict(launcher.os.environ, environment, clear=True), \
+                    mock.patch.object(launcher.webbrowser, 'open', side_effect=lambda *a, **k: observed.append(launcher.os.environ.get('LD_LIBRARY_PATH')) or True):
+                self.assertTrue(launcher.open_dashboard_browser('http://127.0.0.1:8501/'))
+                self.assertEqual(observed, [original])
+                self.assertEqual(launcher.os.environ['LD_LIBRARY_PATH'], '/frozen-libraries')
+                self.assertFalse(launcher.open_dashboard_browser('https://example.com/'))
+
+    def test_browser_failure_restores_frozen_library_path(self):
+        with mock.patch.object(launcher.sys, 'platform', 'linux'), \
+                mock.patch.dict(launcher.os.environ, {'LD_LIBRARY_PATH': '/frozen-libraries'}, clear=True), \
+                mock.patch.object(launcher.webbrowser, 'open', side_effect=OSError('No browser')):
+            with self.assertRaises(OSError):
+                launcher.open_dashboard_browser('http://127.0.0.1:8501/')
+            self.assertEqual(launcher.os.environ['LD_LIBRARY_PATH'], '/frozen-libraries')
+
     def test_windows_shutdown_closes_frozen_process_tree(self):
         process = mock.Mock(pid=1234)
         process.poll.return_value = None

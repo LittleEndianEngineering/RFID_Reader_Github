@@ -1,4 +1,4 @@
-# Customer Windows dashboard 6.2.0
+# Customer desktop dashboard 6.2.0
 
 This dashboard targets the delivered PCB v2/v3 firmware at `dbf098dbd869d88fe63274aad421fdba6d7ed18a` (`main_2Ant`). It is derived from the preferred local dashboard appearance and configuration protections. Experimental firmware and mobile code are separate.
 
@@ -40,3 +40,20 @@ Source/dependency verification references: [PyInstaller platform rules](https://
 ## Before delivery
 
 Validate the executable on the customer's Windows environment with the actual shipped firmware on both PCB revisions: COM connection/reconnect, two/single/no tags, recovery, Live View stop/start, empty/full/range history, configuration roundtrip and selected reboot persistence. Test clearing only on expendable data. Include any required USB driver separately. This build does not carry a publisher signing certificate; signing requires the organization's existing code-signing process.
+
+
+## macOS and Linux packages
+
+The same dashboard source is packaged for macOS 15+ on Apple Silicon (`macos-arm64`) and Intel (`macos-x64`), and desktop Linux x64 (`linux-x64`). Linux builds use Ubuntu 22.04/glibc 2.35; compatible newer glibc-based distributions may work but are not all independently tested. Linux requires an X11/XWayland desktop, default browser, and user access to the USB serial device (commonly the `dialout` group on Ubuntu).
+
+On macOS, unzip `RFIDDashboard-macos-<architecture>.zip`, move `RFIDDashboard.app` to Applications, and open it. The app bundle includes Python, dependencies, and the launcher. It is ad-hoc signed for integrity, without an Apple Developer ID or notarization; macOS may require approving the trusted download under Privacy & Security. It runs from the extracted app bundle without loose Python files.
+
+On Linux, extract `RFIDDashboard-linux-x64.tar.gz` and open the executable `RFIDDashboard`. The archive preserves its executable permission. Some file managers require explicitly allowing execution. Python is bundled; the application does not install USB drivers or change system device permissions.
+
+Both platforms open the dashboard in the default browser and provide the same small control window as Windows. Use Close Dashboard to exit. macOS logs are in `~/Library/Application Support/EstablishmentLabs/RFIDDashboard`; Linux uses `$XDG_DATA_HOME/EstablishmentLabs/RFIDDashboard` (default `~/.local/share/EstablishmentLabs/RFIDDashboard`). Browser launch on Linux restores system library paths so bundled libraries do not interfere with the desktop browser.
+
+The Git-root workflow `.github/workflows/build-customer-dashboard-unix.yml` builds all three targets on native runners with Python 3.11. Developer build commands are `python -m pip install -r requirements-build.txt` then `python build_native.py --target <target>`. On headless Linux, run the build under `xvfb-run --auto-servernum` and provide Tcl/Tk and X11 libraries. Dependencies are installed only on the build machine.
+
+Each artifact includes the package archive, the corresponding dashboard `.py` reference with its helper/logo, README, package hash, source/dependency manifest, and frozen UI/native Tk/server/assets/shutdown test reports. Reports are outside the macOS app bundle to preserve its signature. Build outputs are `dist/macos-arm64/`, `dist/macos-x64/`, and `dist/linux-x64/`; existing Windows delivery files at `dist/` stay separate.
+
+Packaging references: [PyInstaller macOS app bundles and Linux compatibility](https://pyinstaller.org/en/stable/usage.html), [external browser library environment](https://pyinstaller.org/en/stable/common-issues-and-pitfalls.html), [GitHub native runner architectures](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).

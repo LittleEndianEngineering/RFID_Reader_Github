@@ -12,13 +12,14 @@ import urllib.request
 from launcher import stop_server
 
 
-def check(executable):
+def check(executable, output_directory=None):
     executable = executable.resolve()
-    folder = executable.parent
+    folder = Path(output_directory).resolve() if output_directory else executable.parent
+    folder.mkdir(parents=True, exist_ok=True)
     report = folder / 'self-test.json'
     subprocess.run([str(executable), '--self-test', '--report', str(report)], check=True, timeout=240)
     details = json.loads(report.read_text(encoding='utf-8'))
-    assert details['passed'] and details['frozen'], details
+    assert details['passed'] and details['frozen'] and details.get('native_window'), details
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
@@ -64,4 +65,6 @@ def check(executable):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('executable', type=Path)
-    check(parser.parse_args().executable)
+    parser.add_argument('--output-dir', type=Path)
+    args = parser.parse_args()
+    check(args.executable, args.output_dir)

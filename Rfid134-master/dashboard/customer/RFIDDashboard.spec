@@ -1,5 +1,6 @@
-# Run on 64-bit Windows: python -m PyInstaller --clean --noconfirm RFIDDashboard.spec
+# Run on the target platform: python -m PyInstaller --clean --noconfirm RFIDDashboard.spec
 from pathlib import Path
+import sys
 from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 HERE = Path(SPECPATH)
@@ -19,6 +20,21 @@ a = Analysis([str(HERE / 'launcher.py')], pathex=[str(HERE)], binaries=binaries,
              runtime_hooks=[], excludes=['IPython', 'jupyter', 'matplotlib', 'scipy'],
              noarchive=False)
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name='RFIDDashboard',
-          debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
-          console=False, disable_windowed_traceback=False)
+if sys.platform == 'darwin':
+    # A normal app bundle opens in Finder without one-file extraction on every launch.
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='RFIDDashboard',
+              debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
+              console=False, disable_windowed_traceback=False, argv_emulation=False)
+    collection = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='RFIDDashboard')
+    app = BUNDLE(collection, name='RFIDDashboard.app',
+                 bundle_identifier='com.establishmentlabs.rfiddashboard',
+                 info_plist={'CFBundleDisplayName': 'RFID Dashboard',
+                             'CFBundleShortVersionString': '6.2.0',
+                             'CFBundleVersion': '6.2.0',
+                             'LSMinimumSystemVersion': '15.0',
+                             'NSHighResolutionCapable': True,
+                             'LSUIElement': True})
+else:
+    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name='RFIDDashboard',
+              debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
+              console=False, disable_windowed_traceback=False)
