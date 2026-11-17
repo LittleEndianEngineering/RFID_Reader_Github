@@ -1,0 +1,5 @@
+# Customer executable packages use Git LFS; source, manifests and checksums stay in Git.
+releases/**/*.exe filter=lfs diff=lfs merge=lfs -text
+releases/**/*.zip filter=lfs diff=lfs merge=lfs -text
+releases/**/*.tar.gz filter=lfs diff=lfs merge=lfs -text
+*.py text eol=lf

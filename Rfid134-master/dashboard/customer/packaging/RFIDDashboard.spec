@@ -4,7 +4,10 @@ import sys
 from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 HERE = Path(SPECPATH)
-datas = [(str(HERE / 'app.py'), 'customer'), (str(HERE / 'EB_logo.png'), 'customer')]
+SOURCE = HERE.parent / 'src'
+sys.path.insert(0, str(SOURCE))
+from customer_protocol import VERSION, DASHBOARD_FILENAME
+datas = [(str(SOURCE / DASHBOARD_FILENAME), 'customer'), (str(SOURCE / 'EB_logo.png'), 'customer')]
 binaries = []
 hiddenimports = ['customer_protocol', 'plotly.express', 'serial.tools.list_ports', 'pytz', 'streamlit.testing.v1']
 for package in ['streamlit', 'plotly']:
@@ -15,7 +18,7 @@ for package in ['streamlit', 'plotly']:
 for distribution in ['streamlit', 'pandas', 'plotly', 'pyserial', 'pytz']:
     datas += copy_metadata(distribution)
 
-a = Analysis([str(HERE / 'launcher.py')], pathex=[str(HERE)], binaries=binaries,
+a = Analysis([str(HERE / 'launcher.py')], pathex=[str(HERE), str(SOURCE)], binaries=binaries,
              datas=datas, hiddenimports=hiddenimports, hookspath=[], hooksconfig={},
              runtime_hooks=[], excludes=['IPython', 'jupyter', 'matplotlib', 'scipy'],
              noarchive=False)
@@ -29,8 +32,8 @@ if sys.platform == 'darwin':
     app = BUNDLE(collection, name='RFIDDashboard.app',
                  bundle_identifier='com.establishmentlabs.rfiddashboard',
                  info_plist={'CFBundleDisplayName': 'RFID Dashboard',
-                             'CFBundleShortVersionString': '6.2.0',
-                             'CFBundleVersion': '6.2.0',
+                             'CFBundleShortVersionString': VERSION,
+                             'CFBundleVersion': VERSION,
                              'LSMinimumSystemVersion': '15.0',
                              'NSHighResolutionCapable': True,
                              'LSUIElement': True})

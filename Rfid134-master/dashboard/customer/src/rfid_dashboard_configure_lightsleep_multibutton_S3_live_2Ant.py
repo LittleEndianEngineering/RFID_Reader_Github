@@ -6,7 +6,12 @@ PROPRIETARY SOFTWARE
 Copyright (c) 2025 Establishment Labs
 Developed by Little Endian Engineering
 
-Version: 6.2.0 Customer (USB dashboard for delivered firmware dbf098d)
+Version: 6.2.1 Customer - Final deliverable for RFID Reader 2026
+Delivered firmware: 1.5 (July 2026), Git branch main_2Ant
+Firmware source commit: dbf098dbd869d88fe63274aad421fdba6d7ed18a
+Customer hardware: PCB v2 and PCB v3
+Release source: dashboard/customer/src/rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py
+This USB dashboard targets the firmware above; mobile-oriented local firmware is a separate track.
 Date: November 2026
 
 DESCRIPTION:

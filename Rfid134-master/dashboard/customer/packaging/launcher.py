@@ -17,15 +17,18 @@ import urllib.request
 from urllib.parse import urlparse
 import webbrowser
 
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+from customer_protocol import VERSION, FIRMWARE_BASELINE, FIRMWARE_VERSION, FIRMWARE_BRANCH, DASHBOARD_FILENAME
+
 APP_NAME = 'RFIDDashboard'
-VERSION = '6.2.0'
-BASELINE = 'dbf098dbd869d88fe63274aad421fdba6d7ed18a'
+BASELINE = FIRMWARE_BASELINE
 
 
 def resource_directory():
     if getattr(sys, 'frozen', False):
         return Path(sys._MEIPASS) / 'customer'
-    return Path(__file__).resolve().parent
+    return Path(__file__).resolve().parents[1] / 'src'
 
 
 def runtime_directory():
@@ -159,18 +162,18 @@ def serve(port):
     }
     # bootstrap.run does not apply CLI options itself; load them before creating Server.
     bootstrap.load_config_options(options)
-    bootstrap.run(str(resource_directory() / 'app.py'), False, [], options)
+    bootstrap.run(str(resource_directory() / DASHBOARD_FILENAME), False, [], options)
 
 
 def self_test(report):
-    result = {'version': VERSION, 'firmware_baseline': BASELINE, 'frozen': bool(getattr(sys, 'frozen', False)), 'platform': sys.platform, 'machine': platform.machine()}
+    result = {'version': VERSION, 'firmware_baseline': BASELINE, 'firmware_version': FIRMWARE_VERSION, 'firmware_branch': FIRMWARE_BRANCH, 'frozen': bool(getattr(sys, 'frozen', False)), 'platform': sys.platform, 'machine': platform.machine()}
     try:
         import pandas
         import plotly.express
         import serial.tools.list_ports
         import pytz
         from streamlit.testing.v1 import AppTest
-        app = resource_directory() / 'app.py'
+        app = resource_directory() / DASHBOARD_FILENAME
         assert app.is_file() and (app.parent / 'EB_logo.png').is_file()
         # This renders the actual customer UI without opening any serial port.
         test = AppTest.from_file(str(app), default_timeout=60).run()

@@ -10,12 +10,14 @@ import unittest
 from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE / 'src'))
+sys.path.insert(0, str(HERE / 'packaging'))
 from customer_protocol import manual_read_finished, empty_history_response
 import launcher
 import pandas as pd
 
-SOURCE = (HERE / 'app.py').read_text(encoding='utf-8')
+DASHBOARD = HERE / 'src' / 'rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py'
+SOURCE = DASHBOARD.read_text(encoding='utf-8')
 TREE = ast.parse(SOURCE)
 ANT1 = '[RFID_RESULT] stored=true ant=ANT1 reading=1 ts=1785633185 tag=999 141004265912 temp=24.86°C'
 ANT2 = '[RFID_RESULT] stored=true ant=ANT2 reading=2 ts=1785633190 tag=999 141004265913 temp=N/A'
@@ -66,7 +68,7 @@ class CustomerProtocolTests(unittest.TestCase):
                  'recover_pending_read', 'readings_to_dataframe', 'merge_live_view_dataframe',
                  'convert_timestamp_to_timezone', 'response_has_ok', 'response_has_error', 'test_connection'}
         nodes = [node for node in TREE.body if isinstance(node, ast.FunctionDef) and node.name in names]
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(HERE / 'app.py'), 'exec'), self.env)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(DASHBOARD), 'exec'), self.env)
 
     def test_never_finishes_on_first_antenna_or_no_tag(self):
         for text in [ANT1, ANT2, '[RFID][ANT1] No tag detected during window', '[RFID][ANT2] Power OFF']:
@@ -222,7 +224,7 @@ class LauncherTests(unittest.TestCase):
     def test_child_command_stays_on_loopback_server_path(self):
         command = launcher.child_command(12345)
         self.assertEqual(command[-3:], ['--serve', '--port', '12345'])
-        self.assertTrue((launcher.resource_directory() / 'app.py').is_file())
+        self.assertTrue((launcher.resource_directory() / 'rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py').is_file())
         self.assertTrue((launcher.resource_directory() / 'EB_logo.png').is_file())
 
 

@@ -8,5 +8,5 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Build and executable checks passed. The executable is in the dist folder.
+echo Build and executable checks passed. The executable is in ..\dist\windows-x64.
 pause

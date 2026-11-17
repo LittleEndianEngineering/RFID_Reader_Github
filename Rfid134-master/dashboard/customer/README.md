@@ -1,59 +1,119 @@
-# Customer desktop dashboard 6.2.0
+# Final deliverable for RFID Reader 2026
 
-This dashboard targets the delivered PCB v2/v3 firmware at `dbf098dbd869d88fe63274aad421fdba6d7ed18a` (`main_2Ant`). It is derived from the preferred local dashboard appearance and configuration protections. Experimental firmware and mobile code are separate.
+Customer dashboard **6.2.1** targets the firmware already delivered on **PCB v2 and PCB v3**:
 
-## What the customer receives
+- Firmware header version: **1.5**, July 2026.
+- Firmware branch: **`main_2Ant`**.
+- Firmware commit: **`dbf098dbd869d88fe63274aad421fdba6d7ed18a`**.
+- Firmware source: `src/PCB/RFID_Reader_PCB1p0_Split_2Ant/` relative to the project root.
 
-**RFIDDashboard.exe** is the only application file required. On 64-bit Windows, double-click it; the dashboard opens in the default browser. Keep the small control window open while using the reader. Use **Close Dashboard** to exit and release the serial port. No Python installation, pip commands, terminal, or Streamlit setup is required on the customer's computer.
+The exact commit identifies the delivery; a firmware version string alone is insufficient.
+The firmware on the customer-release branch must stay identical to this baseline.
+Experimental firmware and the future mobile app are developed separately.
 
-Plug in the delivered reader, choose its COM port, and connect in the dashboard. A driver for the reader's USB adapter must already be installed or provided by Windows. The application does not install device drivers or change reader firmware. Internet access is unnecessary for running the dashboard. Windows/PCB acceptance testing remains a release check; software smoke tests do not verify physical antenna or power behavior.
+## Layout
 
-The dashboard is served only on `127.0.0.1`. The launcher chooses an available port and opens the browser automatically. Its log is under `%LOCALAPPDATA%\EstablishmentLabs\RFIDDashboard\dashboard.log`.
+```text
+customer/
+  src/          Editable dashboard, protocol helpers and logo
+  packaging/    Launcher, PyInstaller spec, pinned requirements, build/release tools
+  tests/        Protocol and launcher regression tests
+  releases/
+    rfid-reader-2026/
+      source/           Exact dashboard .py/helper/logo snapshot used in these builds
+      windows-x64/      Customer executable
+      macos-arm64/      Apple Silicon app archive
+      macos-x64/        Intel app archive
+      linux-x64/        Linux executable archive
+      verification/     Native manifests and test evidence
+      release_manifest.json
+      SHA256SUMS.txt
+      README.md
+```
 
-## Changes for this customer build
+The canonical editable dashboard is
+**`src/rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py`**.
+There is no separate `app.py` implementation. The `source/` copy in each versioned
+release is an immutable reference that must match that release's executable builds.
+Generated `build/`, `dist/`, virtual environments and Python caches are ignored.
 
-- Dual-antenna Read Now, Live View, history, graph, CSV, status and configuration are retained.
-- Unsupported individual-antenna controls, their capability probe and the experimental-firmware flash prompt are omitted.
-- Recovery-aware timeout and configuration acknowledgment/retry/mode protections are retained.
-- Partial reads retain their data, pause Live View and prevent another serial command until the pending completion is drained or a new connection is used.
-- An empty `No readings stored.` response is recognized normally.
-- A reported configuration flash-write failure is treated as a failure even if firmware also prints `OK`.
-- The logo is bundled and resolved relative to the app, independent of the working directory.
+## Customer delivery
 
-## Build on Windows (developer only)
+Use the packages and instructions in `releases/rfid-reader-2026/`. Python is bundled;
+the customer receives only the application/package for their platform. Reference source
+and verification records are provided alongside it for traceability.
 
-Use **64-bit CPython 3.11**. Double-click `build_windows.bat`, or run `build_windows.ps1` in PowerShell. Build-time dependencies are downloaded into `.build-venv`. The customer does not run this build script.
+This dashboard retains dual-antenna Read Now, Live View, history/range retrieval, charts,
+CSV export, status and configuration. It keeps recovery-aware read timeouts, delayed-ACK
+handling and mode synchronization. It preserves partial reads and blocks further commands
+until pending completion is drained; empty history and flash-write errors are handled.
+Individual-antenna commands remain hidden because delivered firmware lacks `readant`.
 
-The script runs regression tests, builds the single-file/windowed PyInstaller executable, renders the actual frozen Streamlit application, initializes its bundled native Tk window, starts its local server, checks health and bundled front-end assets, and records a SHA-256 and dependency manifest.
+The release is prepared for handoff. Physical USB acceptance on both PCB revisions and
+customer-like Windows Explorer/Linux desktop launch checks remain pending. Mac native
+builds also exercise Finder/LaunchServices, following the 2026-11-17 local launch issue.
 
-Build outputs are under `dist/`:
+## Development and native builds
 
-- `RFIDDashboard.exe`: customer application.
-- `SHA256SUMS.txt`: exact executable hash.
-- `build_manifest.json`: dashboard, baseline and dependency identities.
-- `self-test.json`, `server-smoke.json`: verification results.
+Use Python **3.11** on the target platform. From this directory:
 
-The repository-root workflow `.github/workflows/build-customer-dashboard-windows.yml` performs the same build on a Windows x64 runner. It runs on the dedicated `customer/windows-dashboard-*` build branches or manual dispatch. A Windows executable must be produced on Windows; a macOS PyInstaller output is not a Windows executable.
+```sh
+python -m pip install -r packaging/requirements-build.txt
+python -m unittest discover -s tests -v
+python packaging/build.py --target windows-x64
+# Or: macos-arm64, macos-x64, linux-x64 on their matching native platforms.
+```
 
-Source/dependency verification references: [PyInstaller platform rules](https://pyinstaller.org/en/stable/), [Streamlit CLI](https://docs.streamlit.io/develop/api-reference/cli/run).
+Windows developers can double-click `packaging/build_windows.bat`, which creates the
+local build environment and runs the same build/test pipeline. Linux headless builds
+need Tcl/Tk/X11, Xvfb and `xvfb-run --auto-servernum` before the Python build command.
+The Git-root `.github/workflows/build-customer-dashboard.yml` builds all four native
+targets. It triggers on source/packaging/test changes, not on release-binary commits.
 
-## Before delivery
+Build products are written to ignored `dist/<target>/` directories. Each contains the
+package, exact source reference, manifest, and frozen UI/native Tk/server/assets/shutdown
+reports. Mac tests launch through LaunchServices. All platform builds must use the same
+source commit before assembling a release:
 
-Validate the executable on the customer's Windows environment with the actual shipped firmware on both PCB revisions: COM connection/reconnect, two/single/no tags, recovery, Live View stop/start, empty/full/range history, configuration roundtrip and selected reboot persistence. Test clearing only on expendable data. Include any required USB driver separately. This build does not carry a publisher signing certificate; signing requires the organization's existing code-signing process.
+```sh
+python packaging/assemble_release.py --artifacts-root /path/to/downloaded/platform-folders
+```
 
+The assembler checks firmware/version identities, identical source, package/binary hashes,
+required test results, and a common build commit. It refuses to overwrite an existing
+release directory. For subsequent deliveries choose a new `--output releases/<release-id>`;
+update dashboard version/build metadata and keep earlier delivered snapshots immutable.
 
-## macOS and Linux packages
+## Version control
 
-The same dashboard source is packaged for macOS 15+ on Apple Silicon (`macos-arm64`) and Intel (`macos-x64`), and desktop Linux x64 (`linux-x64`). Linux builds use Ubuntu 22.04/glibc 2.35; compatible newer glibc-based distributions may work but are not all independently tested. Linux requires an X11/XWayland desktop, default browser, and user access to the USB serial device (commonly the `dialout` group on Ubuntu).
+Source, release manifests, checksums and test evidence are normal Git files. Executables
+and platform archives under `releases/` use **Git LFS**, because the Linux binary package
+exceeds GitHub's 100 MiB normal-file limit. Developers need Git LFS installed:
 
-On macOS, unzip `RFIDDashboard-macos-<architecture>.zip`, move `RFIDDashboard.app` to Applications, and open it. The app bundle includes Python, dependencies, and the launcher. It is ad-hoc signed for integrity, without an Apple Developer ID or notarization; macOS may require approving the trusted download under Privacy & Security. It runs from the extracted app bundle without loose Python files.
+```sh
+git lfs install
+git lfs pull
+```
 
-On Linux, extract `RFIDDashboard-linux-x64.tar.gz` and open the executable `RFIDDashboard`. The archive preserves its executable permission. Some file managers require explicitly allowing execution. Python is bundled; the application does not install USB drivers or change system device permissions.
+Never force-add generated `dist/`, extracted app bundles, duplicate binaries or caches.
+Review `git status` and stage only the customer release and its workflow. The surrounding
+working tree also contains experimental firmware/mobile work that belongs to its own track.
+A suitable release commit title is:
 
-Both platforms open the dashboard in the default browser and provide the same small control window as Windows. Use Close Dashboard to exit. macOS logs are in `~/Library/Application Support/EstablishmentLabs/RFIDDashboard`; Linux uses `$XDG_DATA_HOME/EstablishmentLabs/RFIDDashboard` (default `~/.local/share/EstablishmentLabs/RFIDDashboard`). Browser launch on Linux restores system library paths so bundled libraries do not interfere with the desktop browser.
+`Final deliverable for RFID Reader 2026 — dashboard 6.2.1 for firmware 1.5 (dbf098d)`
 
-The Git-root workflow `.github/workflows/build-customer-dashboard-unix.yml` builds all three targets on native runners with Python 3.11. Developer build commands are `python -m pip install -r requirements-build.txt` then `python build_native.py --target <target>`. On headless Linux, run the build under `xvfb-run --auto-servernum` and provide Tcl/Tk and X11 libraries. Dependencies are installed only on the build machine.
+## Validation and runtime notes
 
-Each artifact includes the package archive, the corresponding dashboard `.py` reference with its helper/logo, README, package hash, source/dependency manifest, and frozen UI/native Tk/server/assets/shutdown test reports. Reports are outside the macOS app bundle to preserve its signature. Build outputs are `dist/macos-arm64/`, `dist/macos-x64/`, and `dist/linux-x64/`; existing Windows delivery files at `dist/` stay separate.
+Software tests do not replace reader testing. Before customer delivery check COM connection
+and reconnect, two/single/no tags, recovery, Live View stop/start, empty/full/range history,
+configuration roundtrip and reboot persistence on both PCB revisions. Clear only expendable
+stored data. USB adapter drivers and Linux serial permissions are host requirements.
+Windows builds are unsigned; Mac bundles are ad-hoc signed without Apple notarization.
 
-Packaging references: [PyInstaller macOS app bundles and Linux compatibility](https://pyinstaller.org/en/stable/usage.html), [external browser library environment](https://pyinstaller.org/en/stable/common-issues-and-pitfalls.html), [GitHub native runner architectures](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+The app serves only `127.0.0.1`. Logs are under
+`%LOCALAPPDATA%\EstablishmentLabs\RFIDDashboard` on Windows,
+`~/Library/Application Support/EstablishmentLabs/RFIDDashboard` on Mac, or
+`$XDG_DATA_HOME/EstablishmentLabs/RFIDDashboard` on Linux (default `~/.local/share`).
+
+References: [PyInstaller platform rules](https://pyinstaller.org/en/stable/usage.html),
+[GitHub large-file limits](https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-large-files-on-github).

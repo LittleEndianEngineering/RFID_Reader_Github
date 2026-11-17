@@ -1,21 +1,28 @@
-name: Build customer macOS and Linux dashboards
+name: Build RFID Reader 2026 customer dashboards
+# Delivered firmware: 1.5 / main_2Ant / dbf098dbd869d88fe63274aad421fdba6d7ed18a.
 on:
   workflow_dispatch:
   push:
     branches:
+      - 'customer/final-deliverable-*'
       - 'customer/windows-dashboard-*'
     paths:
-      - 'Rfid134-master/dashboard/customer/**'
-      - '.github/workflows/build-customer-dashboard-unix.yml'
+      - 'Rfid134-master/dashboard/customer/src/**'
+      - 'Rfid134-master/dashboard/customer/packaging/**'
+      - 'Rfid134-master/dashboard/customer/tests/**'
+      - '.github/workflows/build-customer-dashboard.yml'
 permissions:
   contents: read
 jobs:
-  native-executable:
+  dashboard:
     name: Build ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          - runner: windows-2022
+            architecture: x64
+            target: windows-x64
           - runner: macos-15
             architecture: arm64
             target: macos-arm64
@@ -43,17 +50,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb xauth python3-tk libx11-6 libxext6 libxrender1 libxss1
       - name: Install pinned build dependencies
-        run: python -m pip install -r requirements-build.txt
-      - name: Build and test macOS app
-        if: runner.os == 'macOS'
-        run: python build_native.py --target '${{ matrix.target }}'
-      - name: Build and test Linux executable with a virtual display
+        run: python -m pip install -r packaging/requirements-build.txt
+      - name: Build and verify Windows or macOS
+        if: runner.os != 'Linux'
+        run: python packaging/build.py --target '${{ matrix.target }}'
+      - name: Build and verify Linux with a virtual display
         if: runner.os == 'Linux'
-        run: xvfb-run --auto-servernum python build_native.py --target '${{ matrix.target }}'
-      - name: Upload package and verification results
+        run: xvfb-run --auto-servernum python packaging/build.py --target '${{ matrix.target }}'
+      - name: Upload deliverable and verification results
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: RFIDDashboard-${{ matrix.target }}
+          name: RFIDReader2026-${{ matrix.target }}
           path: Rfid134-master/dashboard/customer/dist/${{ matrix.target }}/*
           if-no-files-found: error
           retention-days: 30
@@ -61,10 +68,10 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: RFIDDashboard-${{ matrix.target }}-diagnostics
+          name: RFIDReader2026-${{ matrix.target }}-diagnostics
           path: |
             Rfid134-master/dashboard/customer/dist/${{ matrix.target }}/*.json
             Rfid134-master/dashboard/customer/dist/${{ matrix.target }}/*.log
-            Rfid134-master/dashboard/customer/build/native-work/RFIDDashboard/warn-RFIDDashboard.txt
+            Rfid134-master/dashboard/customer/build/${{ matrix.target }}/work/RFIDDashboard/warn-RFIDDashboard.txt
           if-no-files-found: ignore
           retention-days: 7

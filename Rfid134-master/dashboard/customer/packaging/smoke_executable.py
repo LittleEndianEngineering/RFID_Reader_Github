@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import socket
+import sys
 import subprocess
 import time
 import urllib.request
@@ -17,9 +18,18 @@ def check(executable, output_directory=None):
     folder = Path(output_directory).resolve() if output_directory else executable.parent
     folder.mkdir(parents=True, exist_ok=True)
     report = folder / 'self-test.json'
-    subprocess.run([str(executable), '--self-test', '--report', str(report)], check=True, timeout=240)
+    if sys.platform == 'darwin':
+        # Exercise LaunchServices/Finder; a successful direct exec does not prove this works.
+        app = executable.parents[2]
+        assert app.suffix == '.app'
+        subprocess.run(['/usr/bin/open', '-n', '-W', str(app), '--args', '--self-test',
+                        '--report', str(report)], check=True, timeout=240)
+    else:
+        subprocess.run([str(executable), '--self-test', '--report', str(report)], check=True, timeout=240)
     details = json.loads(report.read_text(encoding='utf-8'))
     assert details['passed'] and details['frozen'] and details.get('native_window'), details
+    details['launch_method'] = 'Finder/LaunchServices' if sys.platform == 'darwin' else 'direct executable'
+    report.write_text(json.dumps(details, indent=2), encoding='utf-8')
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
