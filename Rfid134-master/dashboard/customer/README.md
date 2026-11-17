@@ -64,6 +64,14 @@ python packaging/build.py --target windows-x64
 # Or: macos-arm64, macos-x64, linux-x64 on their matching native platforms.
 ```
 
+For quick development without rebuilding an executable:
+
+```sh
+python -m streamlit run src/rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py
+# Or test the native launcher against the editable source:
+python packaging/launcher.py
+```
+
 Windows developers can double-click `packaging/build_windows.bat`, which creates the
 local build environment and runs the same build/test pipeline. Linux headless builds
 need Tcl/Tk/X11, Xvfb and `xvfb-run --auto-servernum` before the Python build command.

@@ -1,0 +1,5 @@
+streamlit==1.51.0
+pandas==2.3.3
+pyserial==3.5
+plotly==6.3.1
+pytz==2025.2

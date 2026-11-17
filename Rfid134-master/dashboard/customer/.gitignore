@@ -6,3 +6,9 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .pytest_cache/
+# Explicit versioned release packages override repository-wide binary/archive ignores.
+!releases/
+!releases/**/
+!releases/**/*.exe
+!releases/**/*.zip
+!releases/**/*.tar.gz
