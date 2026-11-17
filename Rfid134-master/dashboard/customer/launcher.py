@@ -101,7 +101,7 @@ def child_command(port):
 def serve(port):
     from streamlit.web import bootstrap
     # No network access is needed at runtime. Serve the UI only on this computer.
-    bootstrap.run(str(resource_directory() / 'app.py'), False, [], {
+    options = {
         'server.address': '127.0.0.1',
         'server.port': port,
         'server.headless': True,
@@ -109,7 +109,10 @@ def serve(port):
         'server.runOnSave': False,
         'browser.gatherUsageStats': False,
         'global.developmentMode': False,
-    })
+    }
+    # bootstrap.run does not apply CLI options itself; load them before creating Server.
+    bootstrap.load_config_options(options)
+    bootstrap.run(str(resource_directory() / 'app.py'), False, [], options)
 
 
 def self_test(report):

@@ -144,6 +144,16 @@ class CustomerProtocolTests(unittest.TestCase):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_server_applies_requested_loopback_and_port(self):
+        from streamlit import config
+        with mock.patch('streamlit.web.bootstrap.run') as run:
+            launcher.serve(12345)
+        self.assertEqual(config.get_option('server.address'), '127.0.0.1')
+        self.assertEqual(config.get_option('server.port'), 12345)
+        self.assertTrue(config.get_option('server.headless'))
+        self.assertFalse(config.get_option('browser.gatherUsageStats'))
+        run.assert_called_once()
+
     def test_only_local_dashboard_urls_are_accepted(self):
         self.assertEqual(launcher.local_url('http://127.0.0.1:8501/'), 'http://127.0.0.1:8501/')
         for url in ['https://example.com/', 'http://127.0.0.1.evil.test:8501/', 'file:///C:/Windows', 'http://127.0.0.1:99999/']:
