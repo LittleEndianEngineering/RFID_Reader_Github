@@ -9,6 +9,8 @@ import subprocess
 import time
 import urllib.request
 
+from launcher import stop_server
+
 
 def check(executable):
     executable = executable.resolve()
@@ -43,12 +45,17 @@ def check(executable):
             for asset in assets:
                 with urllib.request.urlopen(url + '/' + asset, timeout=10) as response:
                     assert response.status == 200 and len(response.read()) > 0, asset
-            (folder / 'server-smoke.json').write_text(json.dumps({'passed': True, 'health': True, 'frontend_assets': assets}, indent=2), encoding='utf-8')
         finally:
-            process.terminate()
-            try: process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                process.kill(); process.wait(timeout=5)
+            stop_server(process)
+    deadline = time.monotonic() + 10
+    while True:
+        with socket.socket() as probe:
+            probe.settimeout(.5)
+            closed = probe.connect_ex(('127.0.0.1', port)) != 0
+        if closed: break
+        if time.monotonic() >= deadline: raise RuntimeError('Server child survived dashboard shutdown')
+        time.sleep(.2)
+    (folder / 'server-smoke.json').write_text(json.dumps({'passed': True, 'health': True, 'frontend_assets': assets, 'shutdown_released_port': True}, indent=2), encoding='utf-8')
     digest = hashlib.sha256(executable.read_bytes()).hexdigest()
     (folder / 'SHA256SUMS.txt').write_text(f'{digest}  {executable.name}\n', encoding='ascii')
     print('Frozen app/UI, local server and bundled front-end assets passed. SHA-256:', digest)

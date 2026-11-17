@@ -144,6 +144,17 @@ class CustomerProtocolTests(unittest.TestCase):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_windows_shutdown_closes_frozen_process_tree(self):
+        process = mock.Mock(pid=1234)
+        process.poll.return_value = None
+        with mock.patch.object(launcher.sys, 'platform', 'win32'), \
+                mock.patch.object(launcher.subprocess, 'CREATE_NO_WINDOW', 0x08000000, create=True), \
+                mock.patch.object(launcher.subprocess, 'run') as run:
+            launcher.stop_server(process)
+        self.assertEqual(run.call_args.args[0][1:], ['/PID', '1234', '/T', '/F'])
+        process.wait.assert_called_once()
+        process.terminate.assert_not_called()
+
     def test_server_applies_requested_loopback_and_port(self):
         from streamlit import config
         with mock.patch('streamlit.web.bootstrap.run') as run:

@@ -98,6 +98,25 @@ def child_command(port):
     return [sys.executable, str(Path(__file__).resolve()), *args]
 
 
+
+def stop_server(process):
+    """Stop the frozen one-file bootloader and its server child on Windows."""
+    if process.poll() is not None:
+        return
+    if sys.platform == 'win32':
+        taskkill = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe')
+        subprocess.run([taskkill, '/PID', str(process.pid), '/T', '/F'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       creationflags=subprocess.CREATE_NO_WINDOW, timeout=15, check=True)
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
 def serve(port):
     from streamlit.web import bootstrap
     # No network access is needed at runtime. Serve the UI only on this computer.
@@ -218,17 +237,14 @@ def launch():
         root.mainloop()
         return 0
     finally:
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-        if log:
-            log.close()
-        state.unlink(missing_ok=True)
-        lock.close()
+        try:
+            if process is not None:
+                stop_server(process)
+        finally:
+            if log:
+                log.close()
+            state.unlink(missing_ok=True)
+            lock.close()
 
 
 def main():
