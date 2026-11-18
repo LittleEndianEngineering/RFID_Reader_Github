@@ -56,6 +56,7 @@ bool longPressDetected = false;
 unsigned long longPressMs = 5000; // Configurable long press duration (default 5 seconds)
 const unsigned long LONG_PRESS_FEEDBACK_MS = 1000; // Start feedback at 1 second
 bool longPressFeedbackStarted = false;
+unsigned long suppressButtonReadUntilMs = 0;
 
 // Store last tag read (for button logic)
 Rfid134Reading lastTag;
@@ -176,7 +177,7 @@ bool isSocBelowThreshold() {
 }
 
 bool dashboardAccessAllowed() {
-  return dashboardModeActive || lowSocUsbRecoveryWindowActive();
+  return dashboardModeActive || deviceConnected || lowSocUsbRecoveryWindowActive();
 }
 
 bool rfidReadsAllowed() {

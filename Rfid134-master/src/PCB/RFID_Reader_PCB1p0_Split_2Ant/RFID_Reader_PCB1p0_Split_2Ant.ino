@@ -6,7 +6,7 @@
  * Copyright (c) 2025 Establishment Labs
  * Developed by Little Endian Engineering
  *
- * Version: 1.5 (Light Sleep + Multi-Button + BLE + Low-SoC Service Access)
+ * Version: 1.6.0-dev.1 (development; NOT the customer build. Customer PCB v2/v3 = 1.5 / tag firmware/v1.5)
  * Date: July 2026
  *
  * Includes Dashboard Mode service access, configurable low-SoC idle entry,
@@ -433,7 +433,6 @@ void loop() {
 
   // --- Determine if periodic read is due (fallback when awake for a while) ---
   unsigned long nowMs = millis();
-  bool periodicDue = (nowMs - lastPeriodicRead) >= periodicIntervalMs;
   
   // Periodic activity checkpoint for awake-loop housekeeping.
   static unsigned long lastDebugTime = 0;
@@ -458,6 +457,8 @@ void loop() {
   updateLEDStatus();
 
   // --- Periodic automatic reading (fallback path) ---
+  nowMs = millis();
+  bool periodicDue = (nowMs - lastPeriodicRead) >= periodicIntervalMs;
   if (periodicDue) {
     // Skip periodic reads when Dashboard Mode is active to maintain responsiveness
     if (dashboardAccessAllowed()) {

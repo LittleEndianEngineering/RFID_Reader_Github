@@ -73,6 +73,7 @@ extern bool longPressDetected;
 extern unsigned long longPressMs;
 extern const unsigned long LONG_PRESS_FEEDBACK_MS;
 extern bool longPressFeedbackStarted;
+extern unsigned long suppressButtonReadUntilMs;
 
 // Store last tag read (for button logic)
 extern Rfid134Reading lastTag;

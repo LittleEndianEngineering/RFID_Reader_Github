@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "delivery_id": "v6",
+  "recorded_on": "2026-11-17",
+  "status": "prepared_for_customer_testing",
+  "customer_sent": "not_confirmed",
+  "customer_acceptance": "pending",
+  "previous_delivery_id": "v5",
+  "repository": "https://github.com/LittleEndianEngineering/RFID_Reader_Github",
+  "firmware": {
+    "version": "1.5",
+    "branch": "main_2Ant",
+    "commit": "dbf098dbd869d88fe63274aad421fdba6d7ed18a",
+    "git_path": "Rfid134-master/src/PCB/RFID_Reader_PCB1p0_Split_2Ant",
+    "git_tree": "2fa972b3259c8a983cec0191f1271cab57d428b0",
+    "hardware": [
+      "PCB v2",
+      "PCB v3"
+    ],
+    "deployment": "already_on_customer_boards",
+    "update_required": false
+  },
+  "dashboard": {
+    "version": "6.2.1",
+    "build_commit": "4f1f01e22cb9411a7b76aa0c45fdf358053cc1a1",
+    "release_commit": "0f6ea3f93c688f446b8462d2d49f5758fea09410",
+    "release_branch": "customer/final-deliverable-rfid-reader-2026",
+    "source_git_path": "Rfid134-master/dashboard/customer/src/rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py",
+    "source_sha256": "03a1809c8e84bf075c3261a09a380588b9d91ba9fffdab073a4c6ca4cbb2a756",
+    "metadata_git_path": "Rfid134-master/dashboard/customer/src/customer_protocol.py",
+    "build_trees": [
+      {
+        "git_path": "Rfid134-master/dashboard/customer/src",
+        "git_tree": "0300732d301a448ae3641fadec9d6a852aeef0ac"
+      },
+      {
+        "git_path": "Rfid134-master/dashboard/customer/packaging",
+        "git_tree": "8f4f117ea9324f89660033ba2b190e70857c6384"
+      }
+    ],
+    "artifact_snapshot": "dashboard/customer/releases/rfid-reader-2026",
+    "snapshot_source": "source/rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py",
+    "artifacts": {
+      "windows-x64": {
+        "file": "windows-x64/RFIDDashboard.exe",
+        "sha256": "023dc81254163aef568e55a412bc34e00c2d7eb1b120270cf9a643e2e302b21a",
+        "size_bytes": 98476280
+      },
+      "macos-arm64": {
+        "file": "macos-arm64/RFIDDashboard-macos-arm64.zip",
+        "sha256": "984f5d88e938cc22ae495018156fbaac7125127b8bcde4956d3cc4405898b6ef",
+        "size_bytes": 94526943
+      },
+      "macos-x64": {
+        "file": "macos-x64/RFIDDashboard-macos-x64.zip",
+        "sha256": "ab5fb1394889a13b7b6c5ebb8acb99584f5986dde32f4c1c43efe40083cb66da",
+        "size_bytes": 99278447
+      },
+      "linux-x64": {
+        "file": "linux-x64/RFIDDashboard-linux-x64.tar.gz",
+        "sha256": "fae385d3409e8e1e27f877f87c61265c79185b899343aa5681436b9dd355a720",
+        "size_bytes": 132701225
+      }
+    }
+  },
+  "mobile": {
+    "included": false,
+    "customer_version": null,
+    "status": "future_development_only"
+  },
+  "customer_package": {
+    "file": "dashboard/deliverables/deliverable v6/rfid_deliverable_v6.zip",
+    "size_bytes": 425019050,
+    "sha256": "115ae88244763cba0d5882064cb5ca50661771045d4914ca379cbbccfecb82e0",
+    "entries": [
+      {
+        "file": "README.md",
+        "size_bytes": 1071,
+        "sha256": "91124e187ad820a6fe7a87b71059299a85f8cc12224ba7bec08a58ebc85cfaa3"
+      },
+      {
+        "file": "RFIDDashboard-linux-x64.tar.gz",
+        "size_bytes": 132701225,
+        "sha256": "fae385d3409e8e1e27f877f87c61265c79185b899343aa5681436b9dd355a720"
+      },
+      {
+        "file": "RFIDDashboard-macos-arm64.zip",
+        "size_bytes": 94526943,
+        "sha256": "984f5d88e938cc22ae495018156fbaac7125127b8bcde4956d3cc4405898b6ef"
+      },
+      {
+        "file": "RFIDDashboard-macos-x64.zip",
+        "size_bytes": 99278447,
+        "sha256": "ab5fb1394889a13b7b6c5ebb8acb99584f5986dde32f4c1c43efe40083cb66da"
+      },
+      {
+        "file": "RFIDDashboard.exe",
+        "size_bytes": 98476280,
+        "sha256": "023dc81254163aef568e55a412bc34e00c2d7eb1b120270cf9a643e2e302b21a"
+      },
+      {
+        "file": "rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py",
+        "size_bytes": 161309,
+        "sha256": "03a1809c8e84bf075c3261a09a380588b9d91ba9fffdab073a4c6ca4cbb2a756"
+      }
+    ],
+    "contents": "Four native application packages, one dashboard .py reference, short README"
+  },
+  "compatibility": {
+    "usb_dashboard": "source_contract_and_software_checks_passed_physical_acceptance_pending",
+    "individual_antenna_controls": "disabled_delivered_firmware_lacks_readant",
+    "experimental_firmware": "not_part_of_delivery_not_approved_for_customer_update",
+    "mobile_ble": "excluded_no_customer_compatibility_claim"
+  },
+  "validation": {
+    "automated_native_tests": "passed",
+    "macos_finder_launch": "passed",
+    "windows_explorer_launch": "pending",
+    "linux_file_manager_launch": "pending",
+    "physical_pcb_v2_v3_usb_acceptance": "pending"
+  },
+  "changes": [
+    "Derived customer dashboard from the improved local version for delivered firmware",
+    "Standalone Windows, Apple Silicon/Intel Mac and Linux application packages",
+    "Customer package simplified; no firmware or mobile changes included"
+  ],
+  "proposed_annotated_tags": [
+    {
+      "name": "firmware/v1.5",
+      "commit": "dbf098dbd869d88fe63274aad421fdba6d7ed18a"
+    },
+    {
+      "name": "dashboard/v6.2.1",
+      "commit": "4f1f01e22cb9411a7b76aa0c45fdf358053cc1a1"
+    },
+    {
+      "name": "delivery/v6",
+      "commit": "0f6ea3f93c688f446b8462d2d49f5758fea09410"
+    }
+  ],
+  "tags_created_by_setup": false,
+  "record_policy": "Immutable identity. Add new delivery records and separate dated feedback/acceptance evidence."
+}

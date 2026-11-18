@@ -38,10 +38,18 @@ void handleMultiButton() {
                        currentTime, pressDuration, minPressTime, dashboardModeActive ? 1 : 0, idleModeActive ? 1 : 0);
         
         if (pressDuration > minPressTime) {
-          if (!rfidReadsAllowed()) {
+          if ((long)(suppressButtonReadUntilMs - currentTime) > 0) {
+            VERBOSE_PRINTLN("[BUTTON] Short press suppressed after BLE manual read");
+            if (dashboardModeActive && deviceConnected) {
+              sendBLEResponse("[BUTTON] Short press suppressed after BLE manual read");
+            }
+          } else if (!rfidReadsAllowed()) {
             VERBOSE_PRINTF("[IDLE] Short press ignored - manual read blocked (%s)\n", idleReasonToString(latestIdleReason));
           } else {
             VERBOSE_PRINTLN("[BUTTON] Short press -> RFID read");
+            if (dashboardModeActive && deviceConnected) {
+              sendBLEResponse("[BUTTON] Short press -> RFID read");
+            }
             powerOnAndReadTagWindow(rfidOnTimeMs);
             lastPeriodicRead = millis(); // Reset periodic timer
             VERBOSE_PRINTF("[BTNDBG] MANUAL_READ_DONE t=%lu\n", millis());

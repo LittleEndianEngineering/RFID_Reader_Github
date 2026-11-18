@@ -84,7 +84,6 @@ if 'CLEAR_PASSWORD' not in globals():
 
 st.set_page_config(
     page_title="Implant RFID Reader Multi-Button Dashboard",
-    page_icon="📊",
     layout="wide"
 )
 
@@ -203,6 +202,10 @@ if 'read_now_latest_at' not in st.session_state:
     st.session_state['read_now_latest_at'] = None
 if 'read_now_latest_response' not in st.session_state:
     st.session_state['read_now_latest_response'] = ""
+if 'read_now_latest_label' not in st.session_state:
+    st.session_state['read_now_latest_label'] = "Read Now"
+if 'read_now_latest_antennas' not in st.session_state:
+    st.session_state['read_now_latest_antennas'] = ["ANT1", "ANT2"]
 if 'selected_timezone' not in st.session_state:
     st.session_state['selected_timezone'] = 'America/Costa_Rica'
 if 'dashboard_mode' not in st.session_state:
@@ -291,6 +294,10 @@ if 'status_state_initialized' not in st.session_state:
     st.session_state['status_state_initialized'] = False
 if 'status_retry_count' not in st.session_state:
     st.session_state['status_retry_count'] = 0
+if 'esp32_dashboardModeActive_user_edited' not in st.session_state:
+    st.session_state['esp32_dashboardModeActive_user_edited'] = False
+if 'esp32_dashboardModeActive_synced_port' not in st.session_state:
+    st.session_state['esp32_dashboardModeActive_synced_port'] = None
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -309,6 +316,28 @@ DEFAULT_DASHBOARD_FETCH_TIMEOUT_SECONDS = 30
 LIVE_VIEW_EMPTY_RESPONSE_LIMIT = 2
 LIVE_VIEW_EMPTY_RESPONSE_BACKOFF_SECONDS = 5
 VERBOSE = True
+
+def mark_dashboard_mode_checkbox_edited():
+    st.session_state['esp32_dashboardModeActive_user_edited'] = True
+
+def response_has_ok(response):
+    return any(line.strip() == "OK" for line in (response or "").splitlines())
+
+def response_has_error(response):
+    return any(
+        line.strip() == "Invalid value" or line.strip().startswith("ERROR")
+        for line in (response or "").splitlines()
+    )
+
+def supports_individual_antenna_reads(ser):
+    """Probe once per serial connection without commanding an RFID read."""
+    cached = st.session_state.get('readant_capability')
+    if cached is not None and cached['connection'] is ser:
+        return cached['supported']
+    response = send_command(ser, "protocol")
+    supported = any(line.strip() == "RFID_PROTOCOL_V2" for line in response.splitlines())
+    st.session_state['readant_capability'] = {'connection': ser, 'supported': supported}
+    return supported
 
 def log_debug(msg):
     """Log debug messages with automatic cleanup (max 100 entries)"""
@@ -613,8 +642,8 @@ def connect_to_arduino(port, baud_rate=115200):
     except serial.SerialException as e:
         error_msg = str(e).lower()
         if "already open" in error_msg or "busy" in error_msg or "access denied" in error_msg:
-            st.error(f"⚠️ Port {port} is already in use.")
-            st.info("💡 **Solution:** This can happen after a page refresh. Wait a few seconds and try again, or close Arduino IDE Serial Monitor if it's open.")
+            st.error(f"Port {port} is already in use.")
+            st.info("**Solution:** This can happen after a page refresh. Wait a few seconds and try again, or close Arduino IDE Serial Monitor if it's open.")
             log_general_debug(f"[CONNECTION] Port busy error: {e}")
             log_general_debug(f"[CONNECTION] Port may be in use by Arduino IDE, another application, or a previous connection")
             log_general_debug(f"[CONNECTION] Suggestion: Wait a moment for the port to be released, then retry")
@@ -883,7 +912,8 @@ def send_command(ser, command, range_timeout_seconds=None):
         stripped_command = command.strip()
         expect_range = stripped_command.startswith("range ")
         expect_print_all = stripped_command == "print"
-        expect_readnow = stripped_command == "readnow"
+        expect_readnow = stripped_command == "readnow" or stripped_command.startswith("readant ")
+        expect_set = stripped_command.startswith("set ")
         expect_readings = expect_range or expect_print_all
         received_any = False
         last_rx_time = None
@@ -897,9 +927,14 @@ def send_command(ser, command, range_timeout_seconds=None):
             MIN_DASHBOARD_FETCH_TIMEOUT_SECONDS,
             min(MAX_DASHBOARD_FETCH_TIMEOUT_SECONDS, range_timeout)
         )
-        readnow_timeout = max(15, int(st.session_state.get('esp32_rfidOnTime', 5) * 2 + 10))
-        hard_timeout = 180 if expect_print_all else (
-            range_timeout if expect_range else (readnow_timeout if expect_readnow else 20)
+        # Allow one recovery window per antenna plus initialization/BLE overhead.
+        antenna_count = 1 if stripped_command.startswith("readant ") else 2
+        readnow_timeout = max(15, int(
+            st.session_state.get('esp32_rfidOnTime', 5) * antenna_count * 2 +
+            (30 if antenna_count == 2 else 20)
+        ))
+        hard_timeout = 3 if stripped_command == "protocol" else 180 if expect_print_all else (
+            range_timeout if expect_range else (readnow_timeout if expect_readnow else (12 if expect_set else 20))
         )
         
         # Wait for response with better timeout handling
@@ -917,16 +952,23 @@ def send_command(ser, command, range_timeout_seconds=None):
                     received_any = True
                     last_rx_time = time.time()
                     log_general_debug(f"[DEBUG] Received: {line}")
+                if stripped_command == "protocol" and line == "RFID_PROTOCOL_V2":
+                    end_reason = "protocol_capability"
+                    break
                 # Primary end condition for reading responses
                 if '</DASHBOARD_DATA>' in line or (expect_readings and '---END_READINGS---' in line):
                     end_reason = "end_marker"
                     break
-                if expect_readnow and ('[MANUAL] RFID read complete' in line or '[MANUAL] RFID read skipped' in line):
+                if expect_readnow and ('RFID read complete' in line or '[MANUAL] RFID read skipped' in line):
                     end_reason = "readnow_done"
+                    break
+                if expect_set and (line == "OK" or line == "Invalid value" or line.startswith("ERROR")):
+                    end_reason = "set_confirmation"
                     break
             # Check timeout
             now_ts = time.time()
             if (
+                not expect_set and
                 not expect_readnow and
                 received_any and
                 last_rx_time is not None and
@@ -1104,6 +1146,8 @@ def clear_read_now_latest_state():
     st.session_state['read_now_latest_message'] = ""
     st.session_state['read_now_latest_at'] = None
     st.session_state['read_now_latest_response'] = ""
+    st.session_state['read_now_latest_label'] = "Read Now"
+    st.session_state['read_now_latest_antennas'] = ["ANT1", "ANT2"]
 
 def clear_display_state():
     """Clear dashboard-side display data without deleting device storage."""
@@ -1122,6 +1166,10 @@ def render_latest_read_now_panel():
     records = st.session_state.get('read_now_latest_records', [])
     message = st.session_state.get('read_now_latest_message', "")
     latest_at = st.session_state.get('read_now_latest_at')
+    latest_label = st.session_state.get('read_now_latest_label', "Read Now")
+    display_antennas = st.session_state.get('read_now_latest_antennas', ["ANT1", "ANT2"])
+    if not display_antennas:
+        display_antennas = ["ANT1", "ANT2"]
 
     if not status:
         return
@@ -1129,7 +1177,7 @@ def render_latest_read_now_panel():
     with st.container(border=True):
         st.markdown("#### Latest Reading")
         if latest_at:
-            st.caption(f"Read Now completed at {latest_at.strftime('%Y-%m-%d %H:%M:%S')}")
+            st.caption(f"{latest_label} completed at {latest_at.strftime('%Y-%m-%d %H:%M:%S')}")
 
         if status == "readings" and records:
             st.success(message or f"{len(records)} tag reading(s) stored and added to the graph.")
@@ -1137,8 +1185,8 @@ def render_latest_read_now_panel():
                 str(record.get('Antenna', '')).upper(): record
                 for record in records
             }
-            card_columns = st.columns(2)
-            for idx, antenna in enumerate(["ANT1", "ANT2"]):
+            card_columns = st.columns(len(display_antennas))
+            for idx, antenna in enumerate(display_antennas):
                 record = records_by_antenna.get(antenna)
                 with card_columns[idx]:
                     with st.container(border=True):
@@ -1156,8 +1204,8 @@ def render_latest_read_now_panel():
                             st.write("**Timestamp:** N/A")
         elif status == "no_tag":
             st.info(message or "No tag detected during the manual read window.")
-            card_columns = st.columns(2)
-            for idx, antenna in enumerate(["ANT1", "ANT2"]):
+            card_columns = st.columns(len(display_antennas))
+            for idx, antenna in enumerate(display_antennas):
                 with card_columns[idx]:
                     with st.container(border=True):
                         st.markdown(f"**{antenna}**")
@@ -1214,7 +1262,7 @@ def get_variable_with_markers(ser, var):
     # Check if serial connection is still valid
     if not is_serial_valid(ser):
         log_debug(f"[ERROR] Serial connection is invalid for get {var}")
-        st.error("⚠️ Serial connection lost. Please reconnect to the device.")
+        st.error("Serial connection lost. Please reconnect to the device.")
         st.session_state.connected = False
         st.session_state.connected_port = None
         st.session_state.serial_connection = None
@@ -1226,7 +1274,7 @@ def get_variable_with_markers(ser, var):
         ser.reset_input_buffer()
     except SERIAL_EXCEPTIONS as e:
         log_debug(f"[ERROR] Serial error in get_variable_with_markers for {var}: {e}")
-        st.error(f"⚠️ Serial communication error: {e}. Please reconnect to the device.")
+        st.error(f"Serial communication error: {e}. Please reconnect to the device.")
         st.session_state.connected = False
         st.session_state.connected_port = None
         st.session_state.serial_connection = None
@@ -1267,7 +1315,7 @@ def get_variable_with_markers(ser, var):
         while time.time() - start_time < 4:  # Slightly increased timeout for light-sleep wake
             if not is_serial_valid(ser):
                 log_debug(f"[ERROR] Serial connection lost during get {var}")
-                st.error("⚠️ Serial connection lost during operation. Please reconnect.")
+                st.error("Serial connection lost during operation. Please reconnect.")
                 st.session_state.connected = False
                 st.session_state.connected_port = None
                 st.session_state.serial_connection = None
@@ -1291,7 +1339,7 @@ def get_variable_with_markers(ser, var):
                         log_debug(f"[DEBUG] Added to lines_between: {line}")
             except SERIAL_EXCEPTIONS as e:
                 log_debug(f"[ERROR] Serial read error during get {var}: {e}")
-                st.error(f"⚠️ Serial read error: {e}. Please reconnect.")
+                st.error(f"Serial read error: {e}. Please reconnect.")
                 st.session_state.connected = False
                 st.session_state.connected_port = None
                 st.session_state.serial_connection = None
@@ -1303,7 +1351,7 @@ def get_variable_with_markers(ser, var):
         return value
     except SERIAL_EXCEPTIONS as e:
         log_debug(f"[ERROR] Serial error in get_variable_with_markers for {var}: {e}")
-        st.error(f"⚠️ Serial communication error: {e}. Please reconnect to the device.")
+        st.error(f"Serial communication error: {e}. Please reconnect to the device.")
         st.session_state.connected = False
         st.session_state.connected_port = None
         st.session_state.serial_connection = None
@@ -1507,8 +1555,12 @@ def apply_parsed_status(parsed):
     """Apply parsed status/debug fields to session state."""
     now_ts = time.time()
     if parsed["dashboard_mode"] is not None:
-        st.session_state['device_dashboard_mode'] = parsed["dashboard_mode"]
-        if parsed["dashboard_mode"]:
+        dashboard_mode = parsed["dashboard_mode"]
+        st.session_state['device_dashboard_mode'] = dashboard_mode
+        if not st.session_state.get('esp32_dashboardModeActive_user_edited', False):
+            st.session_state['esp32_dashboardModeActive'] = dashboard_mode
+            st.session_state['esp32_dashboardModeActive_synced_port'] = st.session_state.get('connected_port')
+        if dashboard_mode:
             st.session_state['idle_recovery_active'] = False
             st.session_state['idle_recovery_remaining_s'] = 0
             st.session_state['idle_recovery_updated_at'] = 0
@@ -1635,7 +1687,7 @@ with tabs[0]:
             if st.session_state.get('live_view_enabled', False):
                 log_general_debug("[DEBUG] Live View was enabled - connection validated, should resume auto-refresh")
     
-    st.sidebar.header("🔌 Connection Settings")
+    st.sidebar.header("Connection Settings")
     available_ports = get_available_ports()
     if not available_ports:
         st.sidebar.error("No serial ports found!")
@@ -1660,7 +1712,7 @@ with tabs[0]:
         disconnect_clicked = False
         
         if not st.session_state.connected:
-            connect_clicked = col1.button("🔗 Connect")
+            connect_clicked = col1.button("Connect")
         else:
             disconnect_clicked = col2.button("❌ Disconnect")
         
@@ -1681,7 +1733,7 @@ with tabs[0]:
                 st.session_state.serial_connection and
                 is_serial_valid(st.session_state.serial_connection)):
                 # Already connected to same port with valid connection - REUSE IT (no reset)
-                st.sidebar.success("✅ Already connected!")
+                st.sidebar.success("Already connected!")
                 st.rerun()
                 # Exit early to prevent any port operations
                 connect_clicked = False
@@ -1694,7 +1746,7 @@ with tabs[0]:
                 try:
                     if test_connection(st.session_state.serial_connection):
                         # Connection works! Keep using it
-                        st.sidebar.success("✅ Connection recovered")
+                        st.sidebar.success("Connection recovered")
                         st.rerun()
                         connect_clicked = False
                     else:
@@ -1747,7 +1799,7 @@ with tabs[0]:
                     log_general_debug(f"[CONNECT] Found existing valid connection - reusing (no port open)")
                     st.session_state.connected = True
                     st.session_state.connected_port = selected_port
-                    st.sidebar.success("✅ Connected!")
+                    st.sidebar.success("Connected!")
                     st.rerun()
                 else:
                     # Truly need to open a new connection
@@ -1774,7 +1826,7 @@ with tabs[0]:
                     log_general_debug(f"[CONNECT] Current session state: connected={st.session_state.connected}, port={st.session_state.connected_port}")
                     
                     # Show info message about expected reset
-                    st.sidebar.info("ℹ️ **Note:** On macOS, opening the port will reset the ESP32. This is expected and normal.")
+                    st.sidebar.info("**Note:** On macOS, opening the port will reset the ESP32. This is expected and normal.")
                     
                     # Try to connect (single attempt - retries are handled inside connect_to_arduino if needed)
                     # Note: We don't retry here to avoid multiple ESP32 resets
@@ -1795,7 +1847,7 @@ with tabs[0]:
                             st.session_state.serial_connection = None
                             st.session_state.connected = False
                             st.session_state.connected_port = None
-                            st.sidebar.error("⚠️ ESP32 did not respond. Confirm Dashboard Mode is active and try again.")
+                            st.sidebar.error("ESP32 did not respond. Confirm Dashboard Mode is active and try again.")
                             st.stop()
                         
                         st.session_state.connected = True
@@ -1803,7 +1855,7 @@ with tabs[0]:
                         st.session_state['last_status_poll'] = 0  # Force fresh status poll after connect
                         st.session_state['status_state_initialized'] = False
                         st.session_state['status_retry_count'] = 0
-                        st.sidebar.success("✅ Connected!")
+                        st.sidebar.success("Connected!")
                         st.rerun()
                     else:
                         log_general_debug(f"[CONNECT] Connection failed")
@@ -1835,6 +1887,8 @@ with tabs[0]:
             st.session_state['idle_recovery_updated_at'] = 0
             st.session_state['status_state_initialized'] = False
             st.session_state['status_retry_count'] = 0
+            st.session_state['esp32_dashboardModeActive_user_edited'] = False
+            st.session_state['esp32_dashboardModeActive_synced_port'] = None
             st.sidebar.info("Disconnected! (Dashboard mode remains active on ESP32)")
             st.rerun()  # Force rerun to update button display
         
@@ -1845,7 +1899,7 @@ with tabs[0]:
             # Live View readnow cycles are the liveness probe. Avoid injecting
             # separate status commands into the same serial stream while reads run.
             if not is_serial_valid(st.session_state.serial_connection):
-                st.error("⚠️ **Connection Lost:** Serial port is no longer valid. Please reconnect.")
+                st.error("**Connection Lost:** Serial port is no longer valid. Please reconnect.")
                 st.session_state.connected = False
                 st.session_state.connected_port = None
                 st.session_state.serial_connection = None
@@ -1855,17 +1909,17 @@ with tabs[0]:
         if st.session_state.connected:
             poll_device_status_if_due()
             expire_idle_recovery_state()
-            st.success("✅ Connected to RFID Reader")
+            st.success("Connected to RFID Reader")
 
             if st.session_state.get('idle_mode_active', False):
                 idle_reason = st.session_state.get('idle_mode_reason', '').strip() or "Unknown reason"
                 if st.session_state.get('device_dashboard_mode', False):
-                    st.warning(f"🟨 **Idle Mode Active:** {idle_reason}. USB dashboard data retrieval and configuration remain available; RFID reads stay blocked while idle is active.")
+                    st.warning(f"**Idle Mode Active:** {idle_reason}. USB dashboard data retrieval and configuration remain available; RFID reads stay blocked while idle is active.")
                 elif st.session_state.get('idle_recovery_active', False):
                     recovery_remaining = st.session_state.get('idle_recovery_remaining_s', 0)
-                    st.warning(f"🟨 **Idle Mode Active:** {idle_reason}. USB recovery window active ({recovery_remaining}s remaining); dashboard data/config access is available and RFID reads stay blocked.")
+                    st.warning(f"**Idle Mode Active:** {idle_reason}. USB recovery window active ({recovery_remaining}s remaining); dashboard data/config access is available and RFID reads stay blocked.")
                 else:
-                    st.warning(f"🟨 **Idle Mode Active:** {idle_reason}")
+                    st.warning(f"**Idle Mode Active:** {idle_reason}")
             
             # Show connection status and last update time
             if st.session_state.get('live_view_enabled', False):
@@ -1873,17 +1927,17 @@ with tabs[0]:
                 with col_status1:
                     if st.session_state.get('last_successful_update'):
                         last_update = datetime.fromtimestamp(st.session_state['last_successful_update'])
-                        st.caption(f"🕒 Last update: {last_update.strftime('%H:%M:%S')}")
+                        st.caption(f"Last update: {last_update.strftime('%H:%M:%S')}")
                     else:
-                        st.caption("🕒 Last update: Never")
+                        st.caption("Last update: Never")
                 with col_status2:
                     if st.session_state.get('connection_error_count', 0) > 0:
-                        st.warning(f"⚠️ Connection errors: {st.session_state['connection_error_count']}")
+                        st.warning(f"Connection errors: {st.session_state['connection_error_count']}")
                     else:
-                        st.caption(f"➕ Rows added last refresh: {st.session_state.get('live_view_last_new_rows', 0)}")
+                        st.caption(f"Rows added last refresh: {st.session_state.get('live_view_last_new_rows', 0)}")
         
         # Timezone selection
-        st.header("🌍 Display Timezone")
+        st.header("Display Timezone")
         timezone_options = {
             'America/Costa_Rica': 'Costa Rica (UTC-6)',
             'UTC': 'UTC',
@@ -1914,7 +1968,7 @@ with tabs[0]:
         live_view_enabled_for_date_range = checkbox_state_for_date_range and not stop_requested_for_date_range
         
         # Always show date range section (no longer hidden when Live View is enabled)
-        st.header("📅 Select Date Range")
+        st.header("Select Date Range")
         col1, col2 = st.columns(2)
         with col1:
             start_date = st.date_input(
@@ -1978,7 +2032,7 @@ with tabs[0]:
 
         # Retrieve Data button - disabled when Live View is active
         retrieve_clicked = st.button(
-            "🔍 Retrieve Data", 
+            "Retrieve Data",
             type="primary",
             disabled=live_view_enabled_for_date_range,
             help="Disabled while Live View is active. Disable Live View to use this button."
@@ -2006,7 +2060,7 @@ with tabs[0]:
         if live_view_enabled_for_refresh and st.session_state.connected and start_epoch_live is not None:
             # Validate connection before attempting auto-refresh
             if not is_serial_valid(st.session_state.serial_connection):
-                st.error("⚠️ **Connection Lost:** Serial port is no longer valid. Please reconnect.")
+                st.error("**Connection Lost:** Serial port is no longer valid. Please reconnect.")
                 st.session_state.connected = False
                 st.session_state.connected_port = None
                 st.session_state.serial_connection = None
@@ -2066,14 +2120,14 @@ with tabs[0]:
                             else:
                                 # Parsing failed or no data
                                 if not response.strip():
-                                    st.warning("⚠️ **No Data:** ESP32 returned empty response. Check device connection.")
+                                    st.warning("**No Data:** ESP32 returned empty response. Check device connection.")
                                 else:
-                                    st.info("ℹ️ **No Readings Found:** No data in the selected time range.")
+                                    st.info("**No Readings Found:** No data in the selected time range.")
                                 # Keep last_df if no new readings (don't clear it)
                                 pass
                         else:
                             # No response from ESP32
-                            st.error("⚠️ **Connection Error:** ESP32 did not respond. Please check connection and try again.")
+                            st.error("**Connection Error:** ESP32 did not respond. Please check connection and try again.")
                             # Keep last_df if no response (don't clear it)
                             pass
                         log_general_debug(f"[HOSTDBG] manual_range_done t={time.time():.3f} response_len={len(response) if response else 0}")
@@ -2144,7 +2198,7 @@ with tabs[0]:
                                     "The serial port stayed open; disable/enable Live View or use Test Connection before reconnecting."
                                 )
                                 pause_live_view_after_errors(message)
-                                st.warning(f"⚠️ **Live View Paused:** {message}")
+                                st.warning(f"**Live View Paused:** {message}")
                                 log_general_debug(
                                     f"[HOSTDBG] live_readnow_paused empty_count={empty_count} "
                                     f"t={time.time():.3f}"
@@ -2179,7 +2233,7 @@ with tabs[0]:
                     # Reset last_live_update to try again next cycle
                     st.session_state['last_live_update'] = time.time() - live_view_refresh_interval
                     if live_view_enabled_for_refresh:
-                        st.warning("⚠️ **Not Connected:** Please connect to the device to enable Live View updates.")
+                        st.warning("**Not Connected:** Please connect to the device to enable Live View updates.")
 
         # Output below the button (only once)
         if 'last_raw_response' in st.session_state:
@@ -2192,7 +2246,7 @@ with tabs[0]:
             st.text("Raw response from Arduino (summary only):")
             st.code(summary)
         
-        st.header("📡 Live View")
+        st.header("Live View")
         
         previous_live_view_state = st.session_state.get('live_view_enabled', False)
         
@@ -2275,27 +2329,27 @@ with tabs[0]:
         
         if live_view_status_enabled:
             if st.session_state.connected:
-                st.info(f"🔄 **Live View Active:** Dashboard will command an RFID read every {get_live_view_refresh_interval():.0f} seconds, then update the graph.")
+                st.info(f"**Live View Active:** Dashboard will command an RFID read every {get_live_view_refresh_interval():.0f} seconds, then update the graph.")
                 if st.session_state.get('live_view_last_error'):
-                    st.warning(f"⚠️ {st.session_state['live_view_last_error']}")
+                    st.warning(f"{st.session_state['live_view_last_error']}")
             else:
                 # Live View is enabled but connection was lost (possibly due to browser disconnection)
-                st.warning("⚠️ **Live View Enabled but Not Connected:** Please reconnect to the device to resume auto-updates. Live View will continue from where it left off once reconnected.")
+                st.warning("**Live View Enabled but Not Connected:** Please reconnect to the device to resume auto-updates. Live View will continue from where it left off once reconnected.")
         else:
             if st.session_state.get('live_view_last_error'):
-                st.warning(f"⚠️ {st.session_state['live_view_last_error']}")
-            st.info("💡 Enable Live View to command RFID reads and refresh the temperature graph automatically.")
+                st.warning(f"{st.session_state['live_view_last_error']}")
+            st.info("Enable Live View to command RFID reads and refresh the temperature graph automatically.")
         
         if st.session_state.get('last_df') is not None:
-            st.header("📋 RFID Readings")
+            st.header("RFID Readings")
             df_display = st.session_state['last_df']
             if df_display.empty:
-                st.warning("⚠️ **No Data Available:** The data frame is empty. Please retrieve data or check device connection.")
+                st.warning("**No Data Available:** The data frame is empty. Please retrieve data or check device connection.")
             else:
                 st.dataframe(df_display, use_container_width=True)
             csv = st.session_state['last_df'].to_csv(index=False)
             st.download_button(
-                label="📥 Download CSV",
+                label="Download CSV",
                 data=csv,
                 file_name="rfid_readings_last.csv",
                 mime="text/csv"
@@ -2308,7 +2362,7 @@ with tabs[0]:
                 timezone_display = timezone_options.get(st.session_state['selected_timezone'], st.session_state['selected_timezone'])
                 
                 # Debug: Show data summary
-                st.subheader("📊 Data Summary")
+                st.subheader("Data Summary")
                 st.write(f"Total records: {len(df)}")
                 st.write(f"Unique tags: {df['Tag'].nunique()}")
                 st.write(f"Tags found: {sorted(df['Tag'].unique())}")
@@ -2334,13 +2388,13 @@ with tabs[0]:
                     df_clean = df_chart.dropna(subset=['Temperature_C'])
                     
                     if na_count > 0:
-                        st.info(f"ℹ️ {na_count} reading(s) have no temperature data (N/A) and are excluded from the chart but shown in the table below.")
+                        st.info(f"{na_count} reading(s) have no temperature data (N/A) and are excluded from the chart but shown in the table below.")
                     
                     if len(df_clean) != len(df_chart) and na_count == 0:
                         # Only show warning if there are invalid numeric values (not just N/A)
                         invalid_count = len(df_chart) - len(df_clean) - na_count
                         if invalid_count > 0:
-                            st.warning(f"⚠️ Filtered out {invalid_count} row(s) with invalid temperature data")
+                            st.warning(f"Filtered out {invalid_count} row(s) with invalid temperature data")
                     
                     if not df_clean.empty:
                         fig = px.line(
@@ -2386,7 +2440,7 @@ with tabs[0]:
                         st.plotly_chart(fig, use_container_width=True)
                     else:
                         # All readings have N/A temperature
-                        st.warning("⚠️ No temperature data available for charting (all readings show N/A)")
+                        st.warning("No temperature data available for charting (all readings show N/A)")
                         fig = px.line(title=f"Temperature vs Timestamp by Antenna and Tag ({timezone_display})")
                         fig.update_layout(xaxis_title="Timestamp", yaxis_title="Temperature (°C)")
                         st.plotly_chart(fig, use_container_width=True)
@@ -2412,29 +2466,26 @@ with tabs[0]:
                 clear_display_state()
                 st.rerun()
 
-        st.header("⚡ Quick Commands")
+        st.header("Quick Commands")
         
         # Create single-button-per-row layout for maximum display space
-        st.subheader("📡 Manual Read")
+        st.subheader("Manual Read")
 
         live_view_active_for_read_now = (
             st.session_state.get('live_view_checkbox', False) and
             not st.session_state.get('live_view_stop_requested', False)
         )
-        read_now_clicked = st.button(
-            "📡 Read Now",
-            use_container_width=True,
-            disabled=live_view_active_for_read_now,
-            help="Trigger one RFID read cycle like pressing the physical read button. Disabled while Live View is active."
-        )
-        if read_now_clicked:
+
+        def run_manual_read_command(command, label, display_antennas):
             with st.spinner("Commanding RFID read..."):
-                log_general_debug(f"[HOSTDBG] manual_readnow_start t={time.time():.3f}")
-                readnow_response = send_command(st.session_state.serial_connection, "readnow")
+                log_general_debug(f"[HOSTDBG] manual_read_start t={time.time():.3f} cmd={command}")
+                readnow_response = send_command(st.session_state.serial_connection, command)
                 st.session_state['read_now_latest_response'] = readnow_response if readnow_response is not None else ""
                 st.session_state['read_now_latest_at'] = datetime.now()
+                st.session_state['read_now_latest_label'] = label
+                st.session_state['read_now_latest_antennas'] = display_antennas
                 log_general_debug(
-                    f"[HOSTDBG] manual_readnow_done t={time.time():.3f} "
+                    f"[HOSTDBG] manual_read_done t={time.time():.3f} cmd={command} "
                     f"response_len={len(readnow_response) if readnow_response else 0}"
                 )
 
@@ -2453,10 +2504,16 @@ with tabs[0]:
                         st.session_state['last_successful_update'] = time.time()
                         st.session_state['read_now_latest_records'] = readnow_df.to_dict('records')
                         st.session_state['read_now_latest_status'] = "readings"
-                        st.session_state['read_now_latest_message'] = (
-                            f"{len(readnow_readings)} antenna reading(s) captured; "
-                            f"{new_rows} new row(s) added to the display."
-                        )
+                        if len(display_antennas) == 1:
+                            st.session_state['read_now_latest_message'] = (
+                                f"{len(readnow_readings)} reading(s) captured for {display_antennas[0]}; "
+                                f"{new_rows} new row(s) added to the display."
+                            )
+                        else:
+                            st.session_state['read_now_latest_message'] = (
+                                f"{len(readnow_readings)} antenna reading(s) captured; "
+                                f"{new_rows} new row(s) added to the display."
+                            )
                     elif "[MANUAL] RFID read skipped" in readnow_response:
                         st.session_state['read_now_latest_records'] = []
                         st.session_state['read_now_latest_status'] = "skipped"
@@ -2468,34 +2525,70 @@ with tabs[0]:
                             " ".join(skipped_lines) if skipped_lines else
                             "The device skipped the manual read."
                         )
-                    elif "[MANUAL] RFID read complete" in readnow_response:
+                    elif "RFID read complete" in readnow_response:
                         st.session_state['read_now_latest_records'] = []
                         st.session_state['read_now_latest_status'] = "no_tag"
                         st.session_state['read_now_latest_message'] = (
-                            "No tag was detected during this Read Now cycle. "
+                            f"No tag was detected during this {label} cycle. "
                             "Existing graph data was kept unchanged."
                         )
                     else:
                         st.session_state['read_now_latest_records'] = []
                         st.session_state['read_now_latest_status'] = "skipped"
                         st.session_state['read_now_latest_message'] = (
-                            "Read Now returned a response, but no stored tag result was found."
+                            f"{label} returned a response, but no stored tag result was found."
                         )
                 else:
                     st.session_state['read_now_latest_records'] = []
                     st.session_state['read_now_latest_status'] = "empty"
                     st.session_state['read_now_latest_message'] = (
-                        "The device returned no serial bytes for Read Now. "
+                        f"The device returned no serial bytes for {label}. "
                         "The dashboard connection was left open."
                     )
                 st.rerun()
 
+        read_now_clicked = st.button(
+            "Read Now",
+            use_container_width=True,
+            disabled=live_view_active_for_read_now,
+            help="Trigger one RFID read cycle across both antennas. Disabled while Live View is active."
+        )
+        if read_now_clicked:
+            run_manual_read_command("readnow", "Read Now", ["ANT1", "ANT2"])
+
+        # Only expose active controls when the connected firmware confirms support.
+        readant_supported = (
+            supports_individual_antenna_reads(st.session_state.serial_connection)
+            if not live_view_active_for_read_now else False
+        )
+        ant1_col, ant2_col = st.columns(2)
+        with ant1_col:
+            read_ant1_clicked = st.button(
+                "Read ANT1",
+                use_container_width=True,
+                disabled=live_view_active_for_read_now or not readant_supported,
+                help="Read ANT1 only. Requires current firmware and Live View stopped."
+            )
+        with ant2_col:
+            read_ant2_clicked = st.button(
+                "Read ANT2",
+                use_container_width=True,
+                disabled=live_view_active_for_read_now or not readant_supported,
+                help="Read ANT2 only. Requires current firmware and Live View stopped."
+            )
+        if not live_view_active_for_read_now and not readant_supported:
+            st.caption("Individual antenna reads require updated firmware. Flash the current firmware and reconnect.")
+        if read_ant1_clicked:
+            run_manual_read_command("readant 1", "Read ANT1", ["ANT1"])
+        if read_ant2_clicked:
+            run_manual_read_command("readant 2", "Read ANT2", ["ANT2"])
+
         render_latest_read_now_panel()
 
-        st.subheader("📊 Data Management")
+        st.subheader("Data Management")
         
         # Print All Button
-        if st.button("📊 Print All", use_container_width=True):
+        if st.button("Print All", use_container_width=True):
             response = send_command(st.session_state.serial_connection, "print")
             if response:
                 st.text("All stored readings:")
@@ -2506,34 +2599,34 @@ with tabs[0]:
         # Clear Storage Button
         if 'clear_confirm' not in st.session_state:
             st.session_state['clear_confirm'] = False
-        if st.button("🗑️ Clear Storage", use_container_width=True):
+        if st.button("Clear Storage", use_container_width=True):
             st.session_state['clear_confirm'] = True
         if st.session_state['clear_confirm']:
-            st.warning("⚠️ **Clear All Data**")
+            st.warning("**Clear All Data**")
             st.warning("Are you sure you want to clear all stored readings? This action cannot be undone.")
             password = st.text_input("Enter password to confirm:", type="password", key="clear_password")
-            if st.button("⚠️ Confirm Clear", key="confirm_clear"):
+            if st.button("Confirm Clear", key="confirm_clear"):
                 if password == CLEAR_PASSWORD:
                     response = send_command(st.session_state.serial_connection, "clear")
                     if response:
-                        st.success("✅ Memory Cleared Successfully!")
+                        st.success("Memory Cleared Successfully!")
                         st.info("All stored RFID readings have been permanently deleted from the device.")
                     else:
-                        st.error("❌ Failed to clear storage. Please try again.")
+                        st.error("Failed to clear storage. Please try again.")
                     # Update session state and trigger rerun
                     st.session_state.update({
                         'clear_confirm': False
                     })
                     st.rerun()
                 else:
-                    st.error("❌ Incorrect password. Storage not cleared.")
+                    st.error("Incorrect password. Storage not cleared.")
         
         st.divider()
         
-        st.subheader("🔧 System Diagnostics")
+        st.subheader("System Diagnostics")
         
         # Debug Info Button
-        if st.button("🔢 Debug Info", use_container_width=True):
+        if st.button("Debug Info", use_container_width=True):
             response = send_command(st.session_state.serial_connection, "debug")
             if response:
                 parsed_debug_status = parse_status_response(response)
@@ -2549,15 +2642,15 @@ with tabs[0]:
                         st.code(f"{response}\n\n[LATEST_SOC] N/A")
         
         # Test Connection Button
-        if st.button("🔍 Test Connection", use_container_width=True):
+        if st.button("Test Connection", use_container_width=True):
             if test_connection(st.session_state.serial_connection):
-                st.success("✅ ESP32 is responsive!")
+                st.success("ESP32 is responsive!")
             else:
-                st.error("❌ ESP32 not responding")
+                st.error("ESP32 not responding")
         
         st.divider()
     else:
-        st.info("🔌 Please connect to your RFID reader using the sidebar.")
+        st.info("Please connect to your RFID reader using the sidebar.")
     
     # Auto-rerun for Live View. Use Streamlit's non-blocking fragment timer; do not
     # sleep in the main script, because that disables the whole page while it runs.
@@ -2593,7 +2686,7 @@ with tabs[0]:
             st.session_state['last_live_update'] = 0
 
 with tabs[1]:
-    st.title("⚙️ Configuration")
+    st.title("Configuration")
     st.markdown("Set and program ESP32 variables via serial.")
     # Read values from session state if available
     if 'pending_esp32_update' in st.session_state and st.session_state['pending_esp32_update']:
@@ -2638,8 +2731,7 @@ with tabs[1]:
     if effective_live_view_interval > requested_live_view_interval:
         st.caption(
             f"Dashboard-requested auto-read interval. Current safe minimum is "
-            f"{live_view_min_interval:.0f}s for the dual-antenna RFID ON time, "
-            f"so Live View will run every {effective_live_view_interval:.0f}s."
+            f"{live_view_min_interval:.0f}s for the dual-antenna RFID ON time, "f"so Live View will run every {effective_live_view_interval:.0f}s."
         )
     else:
         st.caption(
@@ -2670,7 +2762,11 @@ with tabs[1]:
     st.markdown("### Diagnostics and Runtime")
     verbose = st.checkbox("Verbose Serial Prints", key="esp32_verbose")
     st.caption("Enables detailed firmware debug logs over serial; leave off for normal dashboard use.")
-    dashboardModeActive = st.checkbox("Dashboard Mode Active", key="esp32_dashboardModeActive")
+    dashboardModeActive = st.checkbox(
+        "Dashboard Mode Active",
+        key="esp32_dashboardModeActive",
+        on_change=mark_dashboard_mode_checkbox_edited
+    )
     st.caption("Service mode latch. Keep ON while using USB dashboard access; turn OFF only when releasing the device back to normal light-sleep operation.")
 
     st.markdown("### LED Heartbeat")
@@ -2694,6 +2790,21 @@ with tabs[1]:
                     log_set_debug("[ERROR] LED heartbeat on duration must be shorter than the heartbeat interval.")
 
                 if valid_config:
+                    dashboard_mode_for_set = dashboardModeActive
+                    if not st.session_state.get('esp32_dashboardModeActive_user_edited', False):
+                        dashboard_mode_for_set = st.session_state.get('device_dashboard_mode', dashboardModeActive)
+                        latest_dashboard_mode = get_variable_with_markers(
+                            st.session_state.serial_connection,
+                            "dashboardModeActive"
+                        )
+                        if str(latest_dashboard_mode).strip() in ("0", "1"):
+                            dashboard_mode_for_set = str(latest_dashboard_mode).strip() == "1"
+                            st.session_state['device_dashboard_mode'] = dashboard_mode_for_set
+                        if dashboard_mode_for_set != dashboardModeActive:
+                            log_set_debug(
+                                "[DEBUG] Dashboard Mode checkbox reconciled from device status "
+                                f"for this set operation: {int(dashboard_mode_for_set)}"
+                            )
                     cmds = [
                         f"set ssid {ssid}",
                         f"set password {password}",
@@ -2707,13 +2818,21 @@ with tabs[1]:
                         f"set batteryMinVoltage {batteryMinVoltage:.2f}",
                         f"set batteryMaxVoltage {batteryMaxVoltage:.2f}",
                         f"set verbose {1 if verbose else 0}",
-                        f"set dashboardModeActive {1 if dashboardModeActive else 0}",
                         f"set ledHeartbeatIntervalMs {int(ledHeartbeatInterval*1000)}",
-                        f"set ledHeartbeatOnMs {int(ledHeartbeatOn*1000)}"
+                        f"set ledHeartbeatOnMs {int(ledHeartbeatOn*1000)}",
+                        f"set dashboardModeActive {1 if dashboard_mode_for_set else 0}"
                     ]
+                    all_ok = True
                     for cmd in cmds:
                         log_set_debug(f"[DEBUG] Sending command: {cmd}")
-                        resp = send_command(st.session_state.serial_connection, cmd)
+                        resp = ""
+                        for attempt in range(2):
+                            if attempt:
+                                log_set_debug(f"[DEBUG] Retrying command after missing confirmation: {cmd}")
+                                time.sleep(0.8)
+                            resp = send_command(st.session_state.serial_connection, cmd)
+                            if response_has_ok(resp) or response_has_error(resp):
+                                break
                         # Move 'OK' to immediately after 'Response received:' if present
                         if resp:
                             lines = resp.splitlines()
@@ -2723,8 +2842,18 @@ with tabs[1]:
                                 log_set_debug(f"[DEBUG] Response received:\nOK\n" + "\n".join(other_lines))
                             else:
                                 log_set_debug(f"[DEBUG] Response received:\n" + resp)
+                                all_ok = False
+                                st.error("ESP32 did not confirm one of the configuration commands. Stopped before sending the remaining commands.")
+                                break
                         else:
                             log_set_debug(f"[DEBUG] Response received: (empty response)")
+                            all_ok = False
+                            st.error("ESP32 returned no response while setting configuration. Stopped before sending the remaining commands.")
+                            break
+                    if all_ok:
+                        st.session_state['device_dashboard_mode'] = dashboard_mode_for_set
+                        st.session_state['esp32_dashboardModeActive_synced_port'] = st.session_state.get('connected_port')
+                        st.success("Variables sent to ESP32.")
             else:
                 log_set_debug("[DEBUG] Not connected to ESP32.")
     with col2:
@@ -2803,7 +2932,11 @@ with tabs[1]:
                     elif v == "verbose":
                         updates["esp32_verbose"] = str(resp).strip() == "1"
                     elif v == "dashboardModeActive":
-                        updates["esp32_dashboardModeActive"] = str(resp).strip() == "1"
+                        dashboard_mode_from_device = str(resp).strip() == "1"
+                        updates["esp32_dashboardModeActive"] = dashboard_mode_from_device
+                        updates["device_dashboard_mode"] = dashboard_mode_from_device
+                        updates["esp32_dashboardModeActive_user_edited"] = False
+                        updates["esp32_dashboardModeActive_synced_port"] = st.session_state.get('connected_port')
                     elif v == "ledHeartbeatIntervalMs":
                         try:
                             updates["esp32_ledHeartbeatInterval"] = int(resp) / 1000 if resp else 20.0
@@ -2845,10 +2978,10 @@ with tabs[1]:
             st.caption("No general debug messages yet.")
 
 with tabs[2]:
-    st.title("📖 User Guide")
+    st.title("User Guide")
     st.markdown("Current operating notes for the dashboard, Live View, stored readings, and device configuration.")
 
-    with st.expander("🔌 Connection", expanded=False):
+    with st.expander("Connection", expanded=False):
         st.markdown("""
         1. Connect the device over USB.
         2. Select the serial port in the sidebar. On macOS, use the `/dev/cu.*` entry. Windows uses `COM` ports.
@@ -2859,7 +2992,7 @@ with tabs[2]:
         For Silicon Labs CP210x adapters, the dashboard skips the extra cleanup probe because that driver can reject probe opens on macOS. If both `/dev/cu.usbserial-*` and `/dev/cu.SLAB_USBtoUART` are shown with the same serial number, they are aliases for the same adapter.
         """)
 
-    with st.expander("📡 Live View", expanded=False):
+    with st.expander("Live View", expanded=False):
         st.markdown("""
         Live View is controlled by the dashboard. When enabled, the dashboard sends `readnow` automatically at the configured interval.
 
@@ -2876,7 +3009,7 @@ with tabs[2]:
         - If data was already retrieved manually, enabling Live View keeps that graph and appends new live points.
         """)
 
-    with st.expander("📊 Data Display", expanded=False):
+    with st.expander("Data Display", expanded=False):
         st.markdown("""
         **Manual retrieval**
         - Select a date/time range and click **Retrieve Data**.
@@ -2885,13 +3018,14 @@ with tabs[2]:
 
         **Display controls**
         - **Read Now** commands one immediate RFID read, appends any stored antenna results to the displayed graph/table, and highlights the latest ANT1 and ANT2 results in separate cards.
+        - **Read ANT1** and **Read ANT2** read only the selected antenna. They are enabled when connected firmware confirms support and Live View is stopped.
         - **Download CSV** exports the currently displayed table.
         - **Clear Display** clears only the dashboard table and graph. It does not delete readings stored on the device.
         - **Clear Storage** permanently deletes stored readings from the device after password confirmation.
         - **Print All** shows the raw stored-reading output from the device.
         """)
 
-    with st.expander("⚙️ Configuration", expanded=False):
+    with st.expander("Configuration", expanded=False):
         st.markdown("""
         Use **Set Variables on ESP32** to write the displayed values to device flash. Use **Read Variables from ESP32** to reload the values currently stored on the device.
 
@@ -2908,7 +3042,7 @@ with tabs[2]:
         - **LED Heartbeat settings**: configure heartbeat interval and on duration.
         """)
 
-    with st.expander("🔘 Button and Device Behavior", expanded=False):
+    with st.expander("Button and Device Behavior", expanded=False):
         st.markdown("""
         **Short press**
         - Commands a manual RFID read when reads are allowed.
@@ -2924,7 +3058,7 @@ with tabs[2]:
         - Low-SoC idle can block RFID reads until the configured recovery behavior allows service access.
         """)
 
-    with st.expander("🔧 Troubleshooting", expanded=False):
+    with st.expander("Troubleshooting", expanded=False):
         st.markdown("""
         **Connection**
         - If macOS reports `(22, Invalid argument)` for a CP210x adapter, reset or unplug/replug the device, then reconnect.
@@ -2941,7 +3075,7 @@ with tabs[2]:
         - Stored timestamps are UTC; only the dashboard display timezone changes.
         """)
 
-    with st.expander("💻 Software", expanded=False):
+    with st.expander("Software", expanded=False):
         st.markdown("""
         **Dashboard requirements**
         - Python 3.8+

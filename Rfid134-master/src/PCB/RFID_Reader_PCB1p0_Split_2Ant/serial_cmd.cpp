@@ -24,6 +24,13 @@ static void printIdleStatus() {
 // priority check and regular Serial processing to ensure consistent behavior
 void processSerialCommand(const String& command) {
   VERBOSE_PRINTF("[SERDBG] CMD_START t=%lu len=%u cmd='%s'\n", millis(), command.length(), command.c_str());
+  // Match the BLE capability reply; this probe never powers the RFID module.
+  if (command == "protocol") {
+    Serial.println("RFID_PROTOCOL_V2");
+    Serial.flush();
+    return;
+  }
+
   // Check for status command to show dashboard mode status
   if (command == "status") {
     Serial.printf("[DASHBOARD] Dashboard Mode: %s\n", dashboardModeActive ? "ACTIVE" : "INACTIVE");
@@ -45,6 +52,24 @@ void processSerialCommand(const String& command) {
     powerOnAndReadTagWindow(rfidOnTimeMs);
     lastPeriodicRead = millis();
     Serial.printf("[MANUAL] RFID read complete count=%u\n", readingCount);
+    Serial.flush();
+    return;
+  }
+
+  if (command == "readant 1" || command == "readant 2") {
+    uint8_t antennaId = command.endsWith("2") ? 2 : 1;
+    if (!rfidReadsAllowed()) {
+      Serial.printf("[IDLE] Manual read blocked: %s\n", idleReasonToString(latestIdleReason));
+      Serial.println("[MANUAL] RFID read skipped");
+      Serial.flush();
+      return;
+    }
+
+    Serial.printf("[MANUAL] Starting ANT%u RFID read window (%lums)\n", antennaId, rfidOnTimeMs);
+    Serial.flush();
+    powerOnAndReadSingleAntennaWindow(rfidOnTimeMs, antennaId);
+    lastPeriodicRead = millis();
+    Serial.printf("[MANUAL] ANT%u RFID read complete count=%u\n", antennaId, readingCount);
     Serial.flush();
     return;
   }

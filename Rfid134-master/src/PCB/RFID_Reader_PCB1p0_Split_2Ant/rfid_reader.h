@@ -7,6 +7,7 @@ bool isTemperatureAvailable(const Rfid134Reading& tag);
 void tryReadAndStoreTag(uint8_t antennaId);
 void powerCycleRFIDModule();
 void powerOnAndReadTagWindow(unsigned long windowMs);
+void powerOnAndReadSingleAntennaWindow(unsigned long windowMs, uint8_t antennaId);
 
 class RfidNotify {
 public:

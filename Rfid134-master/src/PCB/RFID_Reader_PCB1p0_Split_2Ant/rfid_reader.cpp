@@ -94,11 +94,23 @@ void tryReadAndStoreTag(uint8_t antennaId) {
     VERBOSE_PRINTF("[READDBG] STORE_OK t=%lu ant=%u count=%u ts=%lu\n",
                    millis(), antennaId, readingCount, (unsigned long)storedReading.timestamp);
     if (temperatureAvailable) {
-      Serial.printf("[RFID_RESULT] stored=true ant=ANT%u reading=%d ts=%lu tag=%03u %012llu temp=%.2f°C\n",
-                    antennaId, readingCount, (unsigned long)storedReading.timestamp, lastTag.country, lastTag.id, temperature);
+      char resultLine[160];
+      snprintf(resultLine, sizeof(resultLine),
+               "[RFID_RESULT] stored=true ant=ANT%u reading=%d ts=%lu tag=%03u %012llu temp=%.2f°C",
+               antennaId, readingCount, (unsigned long)storedReading.timestamp, lastTag.country, lastTag.id, temperature);
+      Serial.println(resultLine);
+      if (deviceConnected) {
+        sendBLEResponse(String(resultLine));
+      }
     } else {
-      Serial.printf("[RFID_RESULT] stored=true ant=ANT%u reading=%d ts=%lu tag=%03u %012llu temp=N/A\n",
-                    antennaId, readingCount, (unsigned long)storedReading.timestamp, lastTag.country, lastTag.id);
+      char resultLine[160];
+      snprintf(resultLine, sizeof(resultLine),
+               "[RFID_RESULT] stored=true ant=ANT%u reading=%d ts=%lu tag=%03u %012llu temp=N/A",
+               antennaId, readingCount, (unsigned long)storedReading.timestamp, lastTag.country, lastTag.id);
+      Serial.println(resultLine);
+      if (deviceConnected) {
+        sendBLEResponse(String(resultLine));
+      }
     }
     VERBOSE_PRINTF("#%d\n", readingCount);
     if (temperatureAvailable) {
@@ -393,26 +405,26 @@ static AntennaReadResult runSingleAntennaReadWindow(unsigned long windowMs, cons
           float temperature = 23.3 + (0.112 * firstByte);
           if (hasValidTimestamp && ti != nullptr) {
             snprintf(readingStr, sizeof(readingStr),
-                     "#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C",
+                     "#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, %.2f°C, %s",
                      readingCount, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
                      ti->tm_hour, ti->tm_min, ti->tm_sec,
-                     lastTag.country, lastTag.id, temperature);
+                     lastTag.country, lastTag.id, temperature, antennaLabel);
           } else {
             snprintf(readingStr, sizeof(readingStr),
-                     "#%d: NO_RTC_TIME, %u, %llu, %.2f°C",
-                     readingCount, lastTag.country, lastTag.id, temperature);
+                     "#%d: NO_RTC_TIME, %u, %llu, %.2f°C, %s",
+                     readingCount, lastTag.country, lastTag.id, temperature, antennaLabel);
           }
         } else {
           if (hasValidTimestamp && ti != nullptr) {
             snprintf(readingStr, sizeof(readingStr),
-                     "#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A",
+                     "#%d: %04d-%02d-%02d %02d:%02d:%02d, %u, %llu, N/A, %s",
                      readingCount, ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
                      ti->tm_hour, ti->tm_min, ti->tm_sec,
-                     lastTag.country, lastTag.id);
+                     lastTag.country, lastTag.id, antennaLabel);
           } else {
             snprintf(readingStr, sizeof(readingStr),
-                     "#%d: NO_RTC_TIME, %u, %llu, N/A",
-                     readingCount, lastTag.country, lastTag.id);
+                     "#%d: NO_RTC_TIME, %u, %llu, N/A, %s",
+                     readingCount, lastTag.country, lastTag.id, antennaLabel);
           }
         }
         sendBLEResponse(readingStr);
@@ -544,4 +556,56 @@ void powerOnAndReadTagWindow(unsigned long windowMs) {
                  millis(), readSucceeded ? "success" : "failed");
 
   // Don't immediately reset LED status - let updateLEDStatus() handle timing.
+}
+
+void powerOnAndReadSingleAntennaWindow(unsigned long windowMs, uint8_t antennaId) {
+  const bool useAntenna2 = (antennaId == 2);
+  const char* antennaLabel = useAntenna2 ? "ANT2" : "ANT1";
+
+  VERBOSE_PRINTF("[READDBG] SINGLE_READ_EFFORT_START t=%lu ant=%u window_ms=%lu dashboard=%d idle=%d\n",
+                 millis(), useAntenna2 ? 2 : 1, windowMs, dashboardModeActive ? 1 : 0, idleModeActive ? 1 : 0);
+
+  if (rfidConsecutiveErrors >= MAX_RFID_ERRORS) {
+    VERBOSE_PRINTF("[RFID] Too many errors (%u), power cycling module...\n", rfidConsecutiveErrors);
+    if (dashboardModeActive) {
+      sendBLEResponse("[RFID] Module error detected, attempting recovery...");
+    }
+    powerCycleRFIDModule();
+  }
+
+  if (useAntenna2) {
+    selectAntenna2();
+  } else {
+    selectAntenna1();
+  }
+
+  bool readSucceeded = false;
+  AntennaReadResult result = runSingleAntennaReadWindow(windowMs, antennaLabel, useAntenna2 ? 2 : 1);
+  if (result.stored) {
+    readSucceeded = true;
+  }
+
+  if (!result.packetSeen && result.sawError130) {
+    VERBOSE_PRINTF("[READDBG] %s had Error130 with no packet - power cycling and retrying once\n", antennaLabel);
+    powerCycleRFIDModule();
+    nextWindowIsRecovery = true;
+    if (useAntenna2) {
+      selectAntenna2();
+    } else {
+      selectAntenna1();
+    }
+    AntennaReadResult recovery = runSingleAntennaReadWindow(windowMs, antennaLabel, useAntenna2 ? 2 : 1);
+    if (recovery.stored) {
+      readSucceeded = true;
+    }
+  }
+
+  // Return antenna select to ANT1 default HiZ state after any directed read.
+  selectAntenna1();
+
+  printBatterySoc("Single-antenna read effort complete");
+  VERBOSE_PRINTF("[READDBG] SINGLE_READ_EFFORT_END t=%lu ant=%u count=%u led=%s\n",
+                 millis(), useAntenna2 ? 2 : 1, readingCount, currentLEDStatus.c_str());
+  VERBOSE_PRINTF("[READDBG] SINGLE_READ_EFFORT_RESULT t=%lu ant=%u result=%s\n",
+                 millis(), useAntenna2 ? 2 : 1, readSucceeded ? "success" : "failed");
 }

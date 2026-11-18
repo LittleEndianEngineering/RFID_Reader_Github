@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "observed_on": "2026-11-17",
+  "status": "experimental_unreleased",
+  "local_branch_at_observation": "main_2Ant",
+  "base_head": "c17d36c188ca3f82e28b5284dc7ca61641cfb6da",
+  "delivered_firmware_commit": "dbf098dbd869d88fe63274aad421fdba6d7ed18a",
+  "warning": "Dirty working tree, not one reproducible source commit. Hashes identify observed files, not a backup or release.",
+  "components": {
+    "firmware": {
+      "header_version": "1.5",
+      "customer_approved": false,
+      "scope": "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/* (all current source files)",
+      "files": {
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/RFID_Reader_PCB1p0_Split_2Ant.ino": "854bb2f43661813510705abb78a9608874bbac4365a3d365cfde02dff312d4e8",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/ble_comm.cpp": "b11cff111dc557f3298a43bd2f5deb03c5080fec9fcf9dad799b0ac3fa4c6710",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/ble_comm.h": "f67c8c4d5ee150e3125fdf83439ee78c7db0c0f5f162cc5e10e6e810073b1d63",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/button.cpp": "4e293db02e77b554ea8bffee6ba9f9e31143184d3b7e779debd287af7e8815bb",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/button.h": "e3d7d53ccd7cf3ba885271a5d7c4530ba74caae498b55d7adab5a146d753cd90",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/config.cpp": "fa956274d5a48973a8a2fbe93f0e409e4731b085f326f24a15ceab9f3d602647",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/config.h": "589894950110657bc5d314346338017418f50b39056374e2aec8546d9dfcb6b3",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/flash_store.cpp": "df3d8a4ace959bc59cf3ef57258e19c6345aa30b23783d424d8e193ac4c86288",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/flash_store.h": "5fe3d26ce86b88098c02d77b7070220d6efaa1ed723415895fb5a8db44c343a7",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/globals.cpp": "5eeb06790461f3476c9d18ed004a1ec3be94959443b6a693a77479446baa0685",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/globals.h": "adbe8c0fb53f0020e9f40e34309a3dc4db5a4dc4bd1b173d0acc4006174190d3",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/led_status.cpp": "69c79ec69c850e5bb30fe43980f5628d8270f2dfe6106229eaf7e322bc82f210",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/led_status.h": "0e9a356000c7c7de6012bd5aa5fc98c67ac64ecaf604a6ce76d21916d3c92094",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/pins.h": "82fece5cf420a0c72be65c1c60eb3c6485fb5861fb52017d293e19d55926c73d",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/rfid_reader.cpp": "fd0c0f4a9cb153ddefc10f60c586ccf75c397bbbae842f4ee87559a263b8424b",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/rfid_reader.h": "7dca9fd335a8dcdf216bdcbda768c25371eb2bb8038f3c53c358139787b5b281",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/rtc_time.cpp": "acdd93972f699fcaa45707c50da195f3d019e1cab019c546da3cb3c558949fac",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/rtc_time.h": "e6475e986cb146a4c9ee34d55a35db4f6b84adb9d2f941545de7550783b7123f",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/serial_cmd.cpp": "eb3cd1f74101cefb97a8ef2cce62a10d4a1673a6420c1d6dc436b3a3d531f09c",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/serial_cmd.h": "e4ecf4811a7c8ac5db24ddc01a80fb556e809dff556a9996f503e0a0728e53a6",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/sleep_wake.cpp": "025aa3902ed687a74f86e69e5409411b0782604e9ec796c0ffd35cd2bd8262e6",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/sleep_wake.h": "2db3c517fdd2c7e1dd876792cd0b17844d29c2bfca8f8c5c31f67e9c67b63077",
+        "src/PCB/RFID_Reader_PCB1p0_Split_2Ant/types.h": "194867464b89f4b12047f9714640e15e51b4826274858d2ac1c948ff6dac35ca"
+      }
+    },
+    "original_local_dashboard": {
+      "header_version": "6.1",
+      "customer_release_source": false,
+      "files": {
+        "dashboard/src/rfid_dashboard_configure_lightsleep_multibutton_S3_live_2Ant.py": "89bbb0a455a5f074d4728861c0f91b8e2c84409f44ef521494253be8a3fd3540"
+      }
+    },
+    "mobile_core": {
+      "pubspec_version": "1.0.0+1",
+      "customer_release": false,
+      "scope": "Selected core source, dependency lock and contract/planning files; not the full Flutter tree",
+      "files": {
+        "mobile_app/CODE_REVIEW_FINDINGS.md": "28ed9435660ec76cb3563e3f30ddacaacbdd02c49d55b0f42ff5c81fda9f52f4",
+        "mobile_app/MOBILE_APP_UPDATE_PLAN.md": "3b92fa03c0ee0cd389c6a96c96b926d2045300f46318ecc82d3a70ff0add3b6b",
+        "mobile_app/MOBILE_BLE_PROTOCOL_CONTRACT.md": "f5372895972951269eb2e61231a6a2a5eb25402916ac9c801431368f0a178eaa",
+        "mobile_app/rfid_reader_app/lib/ble_protocol.dart": "07ac12a12549e40c13ef8c0981a8fc44b61806cbe368edd4a34fb1deb52e649a",
+        "mobile_app/rfid_reader_app/lib/main.dart": "7d51d2eb536eb87e332c6ad10fa36943ecf05bce7ad61ef15b1cf256c3a3a264",
+        "mobile_app/rfid_reader_app/pubspec.lock": "40344fa958312a7fe4af153656250dfe0fae6062ad51579be50f4ee6f72e9369",
+        "mobile_app/rfid_reader_app/pubspec.yaml": "e6927d1ad46a428eb99b50c2add262648a5ab60eee1b9a3436546b39286917c7",
+        "mobile_app/rfid_reader_app/test/ble_protocol_test.dart": "2b42ba402c7c31d531b3a683432939424253dcfb6195b2e1eefd8e23975bdf52"
+      }
+    }
+  },
+  "compatibility_matrix": [
+    {
+      "firmware": "delivered_dbf098d",
+      "client": "customer_dashboard_6.2.1",
+      "status": "source_contract_and_software_checks_passed_physical_acceptance_pending"
+    },
+    {
+      "firmware": "delivered_dbf098d",
+      "client": "original_local_dashboard",
+      "status": "unverified_on_hardware"
+    },
+    {
+      "firmware": "experimental_local",
+      "client": "customer_dashboard_6.2.1",
+      "status": "unverified_on_hardware"
+    },
+    {
+      "firmware": "experimental_local",
+      "client": "original_local_dashboard",
+      "status": "unverified_on_hardware"
+    },
+    {
+      "firmware": "delivered_dbf098d",
+      "client": "local_mobile",
+      "status": "legacy_fallback_unverified_on_hardware"
+    },
+    {
+      "firmware": "experimental_local",
+      "client": "local_mobile",
+      "status": "paired_changes_unverified_on_hardware"
+    }
+  ],
+  "promotion_requirements": [
+    "Commit experimental work on its own development branch with distinct component version/build identity",
+    "Run compatibility tests with customer dashboard, original dashboard and mobile on PCB v2/v3",
+    "Verify USB/BLE, storage/configuration persistence, battery/idle/sleep and rollback plan",
+    "Create a new delivery record and tags only after explicit review; preserve dbf098d baseline"
+  ]
+}
