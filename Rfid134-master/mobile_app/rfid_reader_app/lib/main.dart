@@ -14,21 +14,46 @@ import 'package:timezone/timezone.dart' as tz;
 import 'package:timezone/data/latest_all.dart' as tz_data;
 import 'package:flutter/foundation.dart';
 
+import 'app_info.dart';
 import 'ble_protocol.dart';
+import 'device_settings.dart';
+import 'device_tab.dart';
+
+/// Detailed BLE traffic logs include tag IDs and timestamps, so they are off
+/// by default. Enable for bring-up with
+/// `flutter run --dart-define=RFID_VERBOSE_LOGS=true` (debug builds only).
+const bool _kVerboseBleLogs = bool.fromEnvironment('RFID_VERBOSE_LOGS');
+
+void _log(Object? message) {
+  if (kDebugMode && _kVerboseBleLogs) debugPrint('$message');
+}
+
+String _csvField(Object? value) {
+  final text = '${value ?? ''}';
+  if (!text.contains(RegExp(r'[",\r\n]'))) return text;
+  return '"${text.replaceAll('"', '""')}"';
+}
 
 // Static function for CSV generation in isolate
 String _generateCSVContent(List<Map<String, dynamic>> readings) {
   final csvBuffer = StringBuffer();
   csvBuffer.writeln('Reading #,Timestamp,Country,Tag ID,Temperature (°C),Antenna');
-  
+
   for (var reading in readings) {
     final tempStr = reading['temperature'] != null
         ? (reading['temperature'] as double).toStringAsFixed(2)
         : 'N/A';
     final antenna = reading['antenna'] ?? 'ANT1';
-    csvBuffer.writeln('${reading['readingNum']},${reading['timestamp']},${reading['country']},${reading['tag']},$tempStr,$antenna');
+    csvBuffer.writeln([
+      reading['readingNum'],
+      reading['timestamp'],
+      reading['country'],
+      reading['tag'],
+      tempStr,
+      antenna,
+    ].map(_csvField).join(','));
   }
-  
+
   return csvBuffer.toString();
 }
 
@@ -100,6 +125,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   StreamSubscription<List<int>>? _responseSubscription;
   StreamSubscription<List<int>>? _statusSubscription;
   final BleResponseBuffer _responseBuffer = BleResponseBuffer();
+  late final DeviceSettingsController _deviceSettings = DeviceSettingsController(
+    send: _writeDeviceCommand,
+    canSend: _canSendDeviceCommand,
+  );
+  static const int _deviceTabIndex = 2;
   
   // Date/Time filtering (matching dashboard functionality)
   DateTime startDate = DateTime.now().subtract(const Duration(days: 7));
@@ -144,9 +174,9 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     // Request Bluetooth permissions
     _adapterStateSubscription = FlutterBluePlus.adapterState.listen((state) {
       if (state == BluetoothAdapterState.on) {
-        print("Bluetooth is on");
+        _log("Bluetooth is on");
       } else {
-        print("Bluetooth is off: $state");
+        _log("Bluetooth is off: $state");
       }
     });
   }
@@ -185,7 +215,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           .first
           .timeout(const Duration(seconds: 12), onTimeout: () => false);
     } catch (e) {
-      print("Error starting scan: $e");
+      _log("Error starting scan: $e");
     } finally {
       if (FlutterBluePlus.isScanningNow) {
         await FlutterBluePlus.stopScan();
@@ -260,9 +290,9 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
 
       // Older firmware answers Unknown command; it stays in legacy mode.
       await commandChar.write(utf8.encode('protocol'));
-      print("Connected to device: ${device.platformName}");
+      _log("Connected to device: ${device.platformName}");
     } catch (e) {
-      print("Error connecting to device: $e");
+      _log("Error connecting to device: $e");
       try {
         await device.disconnect();
       } catch (_) {}
@@ -278,7 +308,6 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
 
   // Debug counters for "All Readings" tracking
   int _printResponseCount = 0;
-  int _totalReadingsReceived = 0;
   int _lastParsedCount = 0;
   
   // Pagination state for chunked reading retrieval
@@ -318,8 +347,16 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     
     // Log empty responses to help diagnose BLE issues
     if (response.isEmpty || response.trim().isEmpty) {
-      print("⚠️ Received EMPTY ESP32 response (length: $sourceByteLength) - possible BLE buffer issue");
+      _log("⚠️ Received EMPTY ESP32 response (length: $sourceByteLength) - possible BLE buffer issue");
       return; // Don't process empty responses
+    }
+
+    // Status/get/set replies for the Device tab are not readings.
+    if (_deviceSettings.handleLine(response)) {
+      _safeSetState(() {
+        rfidReadings.add(response);
+      });
+      return;
     }
     
     // Track "print" command responses
@@ -328,10 +365,10 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         response.contains('---END_READINGS---') ||
         (response.startsWith('#') && (response.contains('°C') || response.contains('N/A')))) {
       _printResponseCount++;
-      print("📊 [PRINT DEBUG] Response #$_printResponseCount | Length: ${response.length} bytes | Preview: ${response.length > 100 ? response.substring(0, 100) + '...' : response}");
+      _log("📊 [PRINT DEBUG] Response #$_printResponseCount | Length: ${response.length} bytes | Preview: ${response.length > 100 ? response.substring(0, 100) + '...' : response}");
     }
     
-    print("🔍 Received ESP32 response: $response (length: ${response.length}, bytes: $sourceByteLength)");
+    _log("🔍 Received ESP32 response: $response (length: ${response.length}, bytes: $sourceByteLength)");
     
     _safeSetState(() {
       rfidReadings.add(response);
@@ -385,7 +422,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           isLoadingData = expectedCount > 0;
           _isRangeQuery = true; // Mark as range query for pagination
         });
-        print("📊 Found $expectedCount readings in range");
+        _log("📊 Found $expectedCount readings in range");
         if (expectedCount > 0) {
           // Start timeout timer for range query
           _startDataRetrievalTimeout();
@@ -447,10 +484,10 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         });
       } else if (_totalChunks == 0) {
         // Chunk info not detected yet - this shouldn't happen, but log it
-        print("⚠️ CHUNK_COMPLETE received but _totalChunks is 0 - chunk info may not have been detected");
+        _log("⚠️ CHUNK_COMPLETE received but _totalChunks is 0 - chunk info may not have been detected");
         // Don't abort - wait for more data or timeout will handle it
       } else {
-        print("✅ Pagination complete: ${parsedReadings.length} readings received");
+        _log("✅ Pagination complete: ${parsedReadings.length} readings received");
         _isFetchingChunks = false;
         _currentChunkIndex = 0;
         _totalChunks = 0;
@@ -471,13 +508,13 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           _isFetchingChunks = true;
           _isRangeQuery = true; // Ensure range query flag is set
         });
-        print("📊 [RANGE PAGINATION] Detected chunk $currentChunk/$totalChunks | Starting pagination");
+        _log("📊 [RANGE PAGINATION] Detected chunk $currentChunk/$totalChunks | Starting pagination");
       }
     } else if (response.contains('---END_READINGS---')) {
-      print("✅ DETECTED RANGE/PRINT RESPONSE END - calling _parseReadings");
+      _log("✅ DETECTED RANGE/PRINT RESPONSE END - calling _parseReadings");
       _lastParsedCount = parsedReadings.length;
       _parseReadings(response);
-      print("📊 [PARSE DEBUG] After END: ${parsedReadings.length} readings (was $_lastParsedCount) | Total responses received: $_printResponseCount");
+      _log("📊 [PARSE DEBUG] After END: ${parsedReadings.length} readings (was $_lastParsedCount) | Total responses received: $_printResponseCount");
       
       // Query complete (print or range) - end loading state and show results
       // Cancel timeout timer
@@ -499,9 +536,8 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       
       // Reset counter after completion
       _printResponseCount = 0;
-      _totalReadingsReceived = 0;
       
-      print("✅ Loading complete: ${parsedReadings.length} readings received (expected: $_totalExpectedReadings)");
+      _log("✅ Loading complete: ${parsedReadings.length} readings received (expected: $_totalExpectedReadings)");
       
       // Clean buffers and caches after successful data retrieval
       _cleanupAfterSuccessfulOperation();
@@ -517,7 +553,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             _lastReceivedCount = 0;
             _isLoadingReadings = expectedCount > 0; // Start loading state - this enables parsing of individual readings
           });
-          print("📊 [PRINT DEBUG] ESP32 reports $expectedCount stored readings | Starting loading state");
+          _log("📊 [PRINT DEBUG] ESP32 reports $expectedCount stored readings | Starting loading state");
           if (expectedCount > 0) {
             // Start timeout timer for print query
             _startDataRetrievalTimeout();
@@ -550,9 +586,6 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         // Individual reading from "Read Now" - already handled above, skip here
       } else if (_isLoadingReadings || _waitingForLastReading) {
         // Individual reading line from "print", "range", or "last" command
-        // Count how many readings are in this response
-        final readingCount = RegExp(r'#\d+:').allMatches(response).length;
-        _totalReadingsReceived += readingCount;
         _lastParsedCount = parsedReadings.length;
         
         // Reset timeout immediately when reading data is detected (before parsing)
@@ -571,19 +604,48 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         }
       } else {
         // Reading line received but not in any expected context - this shouldn't happen
-        print("⚠️ Reading line received but not in loading state: _isLoadingReadings=$_isLoadingReadings, _waitingForLastReading=$_waitingForLastReading, isReadingRFID=$isReadingRFID");
+        _log("⚠️ Reading line received but not in loading state: _isLoadingReadings=$_isLoadingReadings, _waitingForLastReading=$_waitingForLastReading, isReadingRFID=$isReadingRFID");
       }
+    }
+  }
+
+  Future<void> _writeDeviceCommand(String command) async {
+    final characteristic = commandCharacteristic;
+    if (characteristic == null) throw StateError('Not connected');
+    _log("Sent command: $command");
+    await characteristic.write(utf8.encode(command));
+  }
+
+  bool _canSendDeviceCommand() =>
+      isConnected &&
+      commandCharacteristic != null &&
+      !isReadingRFID &&
+      !_isLoadingReadings &&
+      !_isFetchingChunks &&
+      !isLoadingData;
+
+  Future<void> _openDeviceTab() async {
+    if (!isConnected || _deviceSettings.busy) return;
+    await _deviceSettings.refreshStatus();
+    if (mounted && _responseBuffer.usesLineFraming && !_deviceSettings.hasSettings) {
+      await _deviceSettings.loadSettings();
     }
   }
 
   void _handleESP32Status(List<int> value) {
     if (!mounted) return;
     String status = utf8.decode(value, allowMalformed: true);
-    print("Received ESP32 status: $status");
+    _log("Received ESP32 status: $status");
   }
 
   void _sendCommand(String command) {
     if (isReadingRFID && command != 'readnow' && !command.startsWith('readant ')) return;
+    if (_deviceSettings.busy) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please wait: the reader is busy with the Device tab.')),
+      );
+      return;
+    }
     if (commandCharacteristic != null) {
       // Clear previous readings when starting a new query
       // NOTE: For 'print' (All Readings), we clear to get fresh data from ESP32
@@ -602,7 +664,6 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         });
         // Reset debug counters for new query
         _printResponseCount = 0;
-        _totalReadingsReceived = 0;
         _lastParsedCount = 0;
         _responseBuffer.clear();
         // Reset pagination state
@@ -634,7 +695,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       
       List<int> bytes = utf8.encode(command);
       commandCharacteristic!.write(bytes);
-      print("Sent command: $command");
+      _log("Sent command: $command");
     }
   }
 
@@ -684,6 +745,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     _responseBuffer.reset();
     _manualReadSession = null;
     isReadingRFID = false;
+    _deviceSettings.reset();
     await _responseSubscription?.cancel();
     await _statusSubscription?.cancel();
     _responseSubscription = null;
@@ -694,7 +756,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       try {
         await device.disconnect();
       } catch (e) {
-        print("Error disconnecting device: $e");
+        _log("Error disconnecting device: $e");
       }
     }
 
@@ -723,7 +785,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
 
   void _cleanupAfterSuccessfulOperation() {
     // Clean buffers and caches after successful operation to ensure clean state for next execution
-    print("🧹 Cleaning buffers and caches after successful operation");
+    _log("🧹 Cleaning buffers and caches after successful operation");
     
     // Clear ESP32 responses buffer (rfidReadings) to prevent accumulation
     // Keep only the last 50 responses to prevent memory issues while preserving recent history
@@ -731,12 +793,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       setState(() {
         rfidReadings.removeRange(0, rfidReadings.length - 50);
       });
-      print("🧹 Trimmed rfidReadings buffer (kept last 50 responses)");
+      _log("🧹 Trimmed rfidReadings buffer (kept last 50 responses)");
     }
     
     // Reset debug counters
     _printResponseCount = 0;
-    _totalReadingsReceived = 0;
     _lastParsedCount = 0;
     
     // Ensure timeout timer is cancelled
@@ -754,7 +815,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     // Reset last reading flag
     _waitingForLastReading = false;
     
-    print("✅ Cleanup complete - ready for next operation");
+    _log("✅ Cleanup complete - ready for next operation");
   }
 
   Future<void> _exportToCSV() async {
@@ -891,8 +952,6 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       // Format date/time range for subtitle
       final startDateTime = DateTime(startDate.year, startDate.month, startDate.day, startTime.hour, startTime.minute);
       final endDateTime = DateTime(endDate.year, endDate.month, endDate.day, endTime.hour, endTime.minute);
-      final dateFormat = 'yyyy-MM-dd';
-      final timeFormat = 'HH:mm';
       final startDateStr = '${startDateTime.year}-${startDateTime.month.toString().padLeft(2, '0')}-${startDateTime.day.toString().padLeft(2, '0')}';
       final startTimeStr = '${startDateTime.hour.toString().padLeft(2, '0')}:${startDateTime.minute.toString().padLeft(2, '0')}';
       final endDateStr = '${endDateTime.year}-${endDateTime.month.toString().padLeft(2, '0')}-${endDateTime.day.toString().padLeft(2, '0')}';
@@ -1005,12 +1064,6 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     }
   }
 
-  // Helper functions for date/time filtering (based on dashboard functionality)
-  int _getEpochFromDateTime(DateTime date, TimeOfDay time) {
-    final combined = DateTime(date.year, date.month, date.day, time.hour, time.minute);
-    return combined.millisecondsSinceEpoch ~/ 1000; // Convert to Unix timestamp
-  }
-
   // Convert UTC timestamp string to selected timezone for display
   String _convertUtcToTimezone(String utcTimestamp) {
     try {
@@ -1049,7 +1102,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       
       return '$year-$month-$day $hour:$minute:$second';
     } catch (e) {
-      print("❌ Error converting UTC to timezone: $e");
+      _log("❌ Error converting UTC to timezone: $e");
       return utcTimestamp; // Return original if conversion fails
     }
   }
@@ -1074,7 +1127,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   Map<String, dynamic>? _recordToReadingMap(RfidReadingRecord record) {
     final utcDateTime = record.timestampUtc;
     if (utcDateTime == null) {
-      print("⚠️ Skipping reading #${record.readingNum}: invalid timestamp '${record.timestampText}'");
+      _log("⚠️ Skipping reading #${record.readingNum}: invalid timestamp '${record.timestampText}'");
       return null;
     }
 
@@ -1126,7 +1179,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       final isDuplicate = _isDuplicateReading(reading, parsedReadings) ||
           _isDuplicateReading(reading, newReadings);
       if (isDuplicate) {
-        print("⚠️ Duplicate skipped: ${record.country}, ${record.tag}, ${record.antenna}, ${record.temperatureC ?? 'N/A'}");
+        _log("⚠️ Duplicate skipped: ${record.country}, ${record.tag}, ${record.antenna}, ${record.temperatureC ?? 'N/A'}");
         continue;
       }
 
@@ -1166,7 +1219,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       final allMatches = flexibleRegex.allMatches(response);
       
       if (allMatches.isEmpty) {
-        print("❌ No readings found in response: '$response'");
+        _log("❌ No readings found in response: '$response'");
         return;
       }
       
@@ -1187,13 +1240,13 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           double? temperature;
           if (tempStr == 'N/A') {
             temperature = null; // null indicates temperature not available
-            print("⚠️ Temperature not available for reading #$readingNum");
+            _log("⚠️ Temperature not available for reading #$readingNum");
           } else {
             // Extract numeric value (remove °C)
             final tempValue = tempStr.replaceAll('°C', '');
             temperature = double.tryParse(tempValue);
             if (temperature == null) {
-              print("⚠️ Could not parse temperature '$tempStr' for reading #$readingNum");
+              _log("⚠️ Could not parse temperature '$tempStr' for reading #$readingNum");
               temperature = null;
             }
           }
@@ -1201,7 +1254,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           // Validate timestamp - must be RTC format (YYYY-MM-DD HH:MM:SS), not ms timestamp
           // RTC timestamps start with a year (4 digits), ms timestamps are just numbers
           if (!timestamp.contains('-') || !timestamp.contains(':')) {
-            print("⚠️ Skipping reading #$readingNum: Invalid timestamp format (likely ms timestamp): '$timestamp'");
+            _log("⚠️ Skipping reading #$readingNum: Invalid timestamp format (likely ms timestamp): '$timestamp'");
             continue; // Skip this reading but continue with others
           }
           
@@ -1209,14 +1262,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           // Allow single-digit hours, minutes, and seconds (they'll be padded later)
           final rtcPattern = RegExp(r'^\d{4}-\d{1,2}-\d{1,2}\s\d{1,2}:\d{1,2}:\d{1,2}');
           if (!rtcPattern.hasMatch(timestamp)) {
-            print("⚠️ Skipping reading #$readingNum: Timestamp doesn't match RTC format: '$timestamp'");
+            _log("⚠️ Skipping reading #$readingNum: Timestamp doesn't match RTC format: '$timestamp'");
             continue; // Skip this reading but continue with others
           }
           
           if (temperature != null) {
-            print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
+            _log("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
           } else {
-            print("✅ PARSED READING: #$readingNum, $timestamp, N/A");
+            _log("✅ PARSED READING: #$readingNum, $timestamp, N/A");
           }
           
           // Fix timestamp format for DateTime parsing (add leading zeros)
@@ -1236,7 +1289,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             }
           }
           
-          print("🔧 Fixed timestamp: $fixedTimestamp");
+          _log("🔧 Fixed timestamp: $fixedTimestamp");
           
           // Convert UTC timestamp to selected timezone for display
           final displayTimestamp = _convertUtcToTimezone(fixedTimestamp);
@@ -1263,7 +1316,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           }
           
           if (isDuplicate) {
-            print("⚠️ DUPLICATE READING DETECTED - skipping: #$readingNum, $timestamp, $country, $tag");
+            _log("⚠️ DUPLICATE READING DETECTED - skipping: #$readingNum, $timestamp, $country, $tag");
             continue; // Skip duplicate reading
           }
           
@@ -1277,7 +1330,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             'dateTime': utcDateTime, // Keep UTC for sorting
           });
         } catch (e) {
-          print("❌ Error parsing reading: $e");
+          _log("❌ Error parsing reading: $e");
           // Continue with next reading even if this one fails
           continue;
         }
@@ -1342,7 +1395,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       final allMatches = flexibleRegex.allMatches(response);
       
       if (allMatches.isEmpty) {
-        print("❌ No readings found in range response: '$response'");
+        _log("❌ No readings found in range response: '$response'");
         return;
       }
       
@@ -1361,20 +1414,20 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           double? temperature;
           if (tempStr == 'N/A') {
             temperature = null; // null indicates temperature not available
-            print("⚠️ Temperature not available for reading #$readingNum");
+            _log("⚠️ Temperature not available for reading #$readingNum");
           } else {
             // Extract numeric value (remove °C)
             final tempValue = tempStr.replaceAll('°C', '');
             temperature = double.tryParse(tempValue);
             if (temperature == null) {
-              print("⚠️ Could not parse temperature '$tempStr' for reading #$readingNum");
+              _log("⚠️ Could not parse temperature '$tempStr' for reading #$readingNum");
               temperature = null;
             }
           }
           
           // Validate timestamp - must be RTC format (YYYY-MM-DD HH:MM:SS), not ms timestamp
           if (!timestamp.contains('-') || !timestamp.contains(':')) {
-            print("⚠️ Skipping reading #$readingNum: Invalid timestamp format (likely ms timestamp): '$timestamp'");
+            _log("⚠️ Skipping reading #$readingNum: Invalid timestamp format (likely ms timestamp): '$timestamp'");
             continue; // Skip this reading but continue with others
           }
           
@@ -1382,14 +1435,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           // Allow single-digit hours, minutes, and seconds (they'll be padded later)
           final rtcPattern = RegExp(r'^\d{4}-\d{1,2}-\d{1,2}\s\d{1,2}:\d{1,2}:\d{1,2}');
           if (!rtcPattern.hasMatch(timestamp)) {
-            print("⚠️ Skipping reading #$readingNum: Timestamp doesn't match RTC format: '$timestamp'");
+            _log("⚠️ Skipping reading #$readingNum: Timestamp doesn't match RTC format: '$timestamp'");
             continue; // Skip this reading but continue with others
           }
           
           if (temperature != null) {
-            print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
+            _log("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
           } else {
-            print("✅ PARSED READING: #$readingNum, $timestamp, N/A");
+            _log("✅ PARSED READING: #$readingNum, $timestamp, N/A");
           }
           
           // Fix timestamp format for DateTime parsing (add leading zeros)
@@ -1434,7 +1487,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           }
           
           if (isDuplicate) {
-            print("⚠️ DUPLICATE READING DETECTED in range response - skipping: #$readingNum, $timestamp, $country, $tag");
+            _log("⚠️ DUPLICATE READING DETECTED in range response - skipping: #$readingNum, $timestamp, $country, $tag");
             continue;
           }
           
@@ -1447,7 +1500,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             'dateTime': utcDateTime, // Keep UTC for sorting
           });
         } catch (e) {
-          print("❌ Error parsing reading: $e");
+          _log("❌ Error parsing reading: $e");
           // Continue with next reading even if this one fails
           continue;
         }
@@ -1465,14 +1518,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
               (existing['dateTime'] as DateTime).difference(newReading['dateTime'] as DateTime).inSeconds.abs() < 1
             );
             if (isDuplicate) {
-              print("⚠️ DUPLICATE READING DETECTED in range batch - skipping: #${newReading['readingNum']}, ${newReading['timestamp']}, ${newReading['country']}, ${newReading['tag']}");
+              _log("⚠️ DUPLICATE READING DETECTED in range batch - skipping: #${newReading['readingNum']}, ${newReading['timestamp']}, ${newReading['country']}, ${newReading['tag']}");
             }
             return !isDuplicate;
           }).toList();
           
           final beforeAdd = parsedReadings.length;
           parsedReadings.addAll(filteredNewReadings);
-          print("📊 [PARSE DEBUG] Added ${filteredNewReadings.length} new readings from range batch (${newReadings.length - filteredNewReadings.length} duplicates skipped) | Total: ${parsedReadings.length} (was $beforeAdd)");
+          _log("📊 [PARSE DEBUG] Added ${filteredNewReadings.length} new readings from range batch (${newReadings.length - filteredNewReadings.length} duplicates skipped) | Total: ${parsedReadings.length} (was $beforeAdd)");
         });
       }
       return; // Exit early since we processed batched readings
@@ -1501,7 +1554,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         final allMatches = flexibleRegex.allMatches(line);
         
         if (allMatches.isEmpty) {
-          print("❌ Line did not match regex: '$line'");
+          _log("❌ Line did not match regex: '$line'");
           continue;
         }
         
@@ -1518,20 +1571,20 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             double? temperature;
             if (tempStr == 'N/A') {
               temperature = null; // null indicates temperature not available
-              print("⚠️ Temperature not available for reading #$readingNum");
+              _log("⚠️ Temperature not available for reading #$readingNum");
             } else {
               // Extract numeric value (remove °C)
               final tempValue = tempStr.replaceAll('°C', '');
               temperature = double.tryParse(tempValue);
               if (temperature == null) {
-                print("⚠️ Could not parse temperature '$tempStr' for reading #$readingNum");
+                _log("⚠️ Could not parse temperature '$tempStr' for reading #$readingNum");
                 temperature = null;
               }
             }
             
             // Validate timestamp - must be RTC format (YYYY-MM-DD HH:MM:SS), not ms timestamp
             if (!timestamp.contains('-') || !timestamp.contains(':')) {
-              print("⚠️ Skipping reading #$readingNum: Invalid timestamp format (likely ms timestamp): '$timestamp'");
+              _log("⚠️ Skipping reading #$readingNum: Invalid timestamp format (likely ms timestamp): '$timestamp'");
               continue; // Skip this reading but continue with others
             }
             
@@ -1539,14 +1592,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             // Allow single-digit hours, minutes, and seconds (they'll be padded later)
             final rtcPattern = RegExp(r'^\d{4}-\d{1,2}-\d{1,2}\s\d{1,2}:\d{1,2}:\d{1,2}');
             if (!rtcPattern.hasMatch(timestamp)) {
-              print("⚠️ Skipping reading #$readingNum: Timestamp doesn't match RTC format: '$timestamp'");
+              _log("⚠️ Skipping reading #$readingNum: Timestamp doesn't match RTC format: '$timestamp'");
               continue; // Skip this reading but continue with others
             }
             
             if (temperature != null) {
-              print("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
+              _log("✅ PARSED READING: #$readingNum, $timestamp, $temperature°C");
             } else {
-              print("✅ PARSED READING: #$readingNum, $timestamp, N/A");
+              _log("✅ PARSED READING: #$readingNum, $timestamp, N/A");
             }
             
             // Fix timestamp format for DateTime parsing (add leading zeros)
@@ -1581,7 +1634,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
               'dateTime': utcDateTime, // Keep UTC for sorting
             });
           } catch (e) {
-            print("❌ Error parsing reading: $e");
+            _log("❌ Error parsing reading: $e");
             // Continue with next reading even if this one fails
             continue;
           }
@@ -1598,7 +1651,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         if (response.contains('---BEGIN_READINGS---') && !response.contains('---END_READINGS---')) {
           // This is the start of a new range - replace existing readings
           parsedReadings = newReadings;
-          print("📊 [PARSE DEBUG] Replaced with ${newReadings.length} readings (was $initialCount)");
+          _log("📊 [PARSE DEBUG] Replaced with ${newReadings.length} readings (was $initialCount)");
         } else {
           // This is continuation or end - filter out duplicates before appending
           final filteredNewReadings = newReadings.where((newReading) {
@@ -1609,26 +1662,26 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
               (existing['dateTime'] as DateTime).difference(newReading['dateTime'] as DateTime).inSeconds.abs() < 1
             );
             if (isDuplicate) {
-              print("⚠️ DUPLICATE READING DETECTED in range response - skipping: #${newReading['readingNum']}, ${newReading['timestamp']}, ${newReading['country']}, ${newReading['tag']}");
+              _log("⚠️ DUPLICATE READING DETECTED in range response - skipping: #${newReading['readingNum']}, ${newReading['timestamp']}, ${newReading['country']}, ${newReading['tag']}");
             }
             return !isDuplicate;
           }).toList();
           
           final beforeAdd = parsedReadings.length;
           parsedReadings.addAll(filteredNewReadings);
-          print("📊 [PARSE DEBUG] Added ${filteredNewReadings.length} new readings (${newReadings.length - filteredNewReadings.length} duplicates skipped) | Total: ${parsedReadings.length} (was $beforeAdd)");
+          _log("📊 [PARSE DEBUG] Added ${filteredNewReadings.length} new readings (${newReadings.length - filteredNewReadings.length} duplicates skipped) | Total: ${parsedReadings.length} (was $beforeAdd)");
         }
-        print("🎯 UPDATED parsedReadings with ${parsedReadings.length} total readings (added ${newReadings.length} from range response, was $initialCount)");
+        _log("🎯 UPDATED parsedReadings with ${parsedReadings.length} total readings (added ${newReadings.length} from range response, was $initialCount)");
       });
     } else {
       // No new readings found - don't overwrite existing parsedReadings
       // This prevents "---END_READINGS---" from wiping out already-parsed readings
-      print("⚠️ No new readings found in range response - keeping existing ${parsedReadings.length} readings (was $initialCount)");
+      _log("⚠️ No new readings found in range response - keeping existing ${parsedReadings.length} readings (was $initialCount)");
     }
   }
 
   void _abortDataRetrieval() {
-    print("🛑 Aborting data retrieval - clearing state and timers");
+    _log("🛑 Aborting data retrieval - clearing state and timers");
     _dataRetrievalTimeoutTimer?.cancel();
     _dataRetrievalTimeoutTimer = null;
     
@@ -1671,7 +1724,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         // Check if we've received new data since timeout started
         final currentCount = _currentReceivedReadings;
         if (currentCount == _lastReceivedCount && currentCount < _totalExpectedReadings) {
-          print("⏱️ Data retrieval timeout - no new data received in 30 seconds (stuck at $currentCount/$_totalExpectedReadings)");
+          _log("⏱️ Data retrieval timeout - no new data received in 30 seconds (stuck at $currentCount/$_totalExpectedReadings)");
           _abortDataRetrieval();
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
@@ -1682,13 +1735,13 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           );
         } else {
           // Data is still coming, update last count and reset timeout
-          print("📊 Timeout check: Data progressing ($currentCount/$_totalExpectedReadings), resetting timeout");
+          _log("📊 Timeout check: Data progressing ($currentCount/$_totalExpectedReadings), resetting timeout");
           _lastReceivedCount = currentCount;
           _startDataRetrievalTimeout();
         }
       }
     });
-    print("⏱️ Started 30-second timeout timer (current: $_currentReceivedReadings/$_totalExpectedReadings)");
+    _log("⏱️ Started 30-second timeout timer (current: $_currentReceivedReadings/$_totalExpectedReadings)");
   }
 
   void _retrieveFilteredData() async {
@@ -1739,9 +1792,9 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       final startEpoch = startUtcDateTime.millisecondsSinceEpoch ~/ 1000;
       final endEpoch = endUtcDateTime.millisecondsSinceEpoch ~/ 1000;
       
-      print("🕐 Timezone conversion: $selectedTimezone");
-      print("🕐 Start: ${startLocalDateTime.toString()} (local) -> ${startUtcDateTime.toString()} (UTC) -> $startEpoch");
-      print("🕐 End: ${endLocalDateTime.toString()} (local) -> ${endUtcDateTime.toString()} (UTC) -> $endEpoch");
+      _log("🕐 Timezone conversion: $selectedTimezone");
+      _log("🕐 Start: ${startLocalDateTime.toString()} (local) -> ${startUtcDateTime.toString()} (UTC) -> $startEpoch");
+      _log("🕐 End: ${endLocalDateTime.toString()} (local) -> ${endUtcDateTime.toString()} (UTC) -> $endEpoch");
       
       // Store range parameters for pagination
       setState(() {
@@ -1757,7 +1810,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       // This allows the loading indicator to show during data transfer
       // Timeout will be started when "Found X readings in range" is received
     } catch (e) {
-      print("❌ Error converting timezone: $e");
+      _log("❌ Error converting timezone: $e");
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Timezone conversion error: $e')),
@@ -1874,6 +1927,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           setState(() {
             _currentIndex = index;
           });
+          if (index == _deviceTabIndex) _openDeviceTab();
         },
         type: BottomNavigationBarType.fixed,
         backgroundColor: Colors.grey[800],
@@ -1896,6 +1950,10 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             label: 'Filter & Graph',
           ),
           BottomNavigationBarItem(
+            icon: Icon(Icons.tune),
+            label: 'Device',
+          ),
+          BottomNavigationBarItem(
             icon: Icon(Icons.info),
             label: 'About',
           ),
@@ -1915,7 +1973,13 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         return _buildDashboardTab();
       case 1:
         return _buildFilterGraphTab();
-      case 2:
+      case _deviceTabIndex:
+        return DeviceTab(
+          controller: _deviceSettings,
+          isConnected: isConnected,
+          supportsSettings: _responseBuffer.usesLineFraming,
+        );
+      case 3:
         return _buildAboutTab();
       default:
         return _buildDashboardTab();
@@ -3296,8 +3360,8 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                     ),
                   ),
                   const SizedBox(height: 12),
-                  _buildInfoRow('Version', '1.2 (Multi-Button + RGB LED)'),
-                  _buildInfoRow('Build', 'September 2025'),
+                  _buildInfoRow('Version', '$kAppVersion (development)'),
+                  _buildInfoRow('Pairs with firmware', kPairedFirmwareVersion),
                   _buildInfoRow('Platform', 'Flutter (macOS/iOS/Android)'),
                   _buildInfoRow('BLE Support', 'ESP32-S3 Compatible'),
                 ],
@@ -3604,6 +3668,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     }
     _horizontalScrollController.dispose();
     unawaited(_disconnect(updateState: false));
+    _deviceSettings.dispose();
     super.dispose();
   }
 }
