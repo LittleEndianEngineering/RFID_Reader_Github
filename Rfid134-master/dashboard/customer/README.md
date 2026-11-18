@@ -11,6 +11,14 @@ The exact commit identifies the delivery; a firmware version string alone is ins
 The firmware on the customer-release branch must stay identical to this baseline.
 Experimental firmware and the future mobile app are developed separately.
 
+## Release tracking
+
+See [the project versioning guide](../../VERSIONING.md) and
+[the frozen v6 delivery record](../../release_records/delivery-v6.json) for independent
+firmware/dashboard/mobile versions, exact customer ZIP identity and follow-up releases.
+The local firmware and original dashboard are experimental; the current customer
+firmware remains `dbf098d`. Developer records stay outside the simple customer ZIP.
+
 ## Layout
 
 ```text
