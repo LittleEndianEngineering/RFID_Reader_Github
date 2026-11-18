@@ -18,6 +18,8 @@ import 'app_info.dart';
 import 'ble_protocol.dart';
 import 'device_settings.dart';
 import 'device_tab.dart';
+import 'live_view.dart';
+import 'live_view_panel.dart';
 
 /// Detailed BLE traffic logs include tag IDs and timestamps, so they are off
 /// by default. Enable for bring-up with
@@ -124,12 +126,18 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   StreamSubscription<List<ScanResult>>? _scanResultsSubscription;
   StreamSubscription<List<int>>? _responseSubscription;
   StreamSubscription<List<int>>? _statusSubscription;
+  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
   final BleResponseBuffer _responseBuffer = BleResponseBuffer();
   late final DeviceSettingsController _deviceSettings = DeviceSettingsController(
     send: _writeDeviceCommand,
     canSend: _canSendDeviceCommand,
   );
   static const int _deviceTabIndex = 2;
+  late final LiveViewController _liveView = LiveViewController(
+    startRead: _startLiveViewRead,
+  );
+  bool _liveCycleActive = false;
+  Map<String, RfidReadingRecord> _latestByAntenna = {};
   
   // Date/Time filtering (matching dashboard functionality)
   DateTime startDate = DateTime.now().subtract(const Duration(days: 7));
@@ -162,7 +170,67 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   @override
   void initState() {
     super.initState();
+    _liveView.addListener(_onLiveViewChanged);
     _initializeBLE();
+  }
+
+  void _onLiveViewChanged() => _safeSetState(() {});
+
+  bool get _liveViewRunning => _liveView.running;
+
+  Duration _currentLiveViewInterval() => liveViewInterval(
+    intervalMsRaw: _deviceSettings.values['liveViewAutoReadIntervalMs'],
+    rfidOnTimeMsRaw: _deviceSettings.values['rfidOnTimeMs'],
+  );
+
+  Future<void> _toggleLiveView(bool on) async {
+    if (!on) {
+      _liveView.stop();
+      return;
+    }
+    if (!isConnected) return;
+    // Use the interval saved on the reader, like the USB dashboard.
+    if (_responseBuffer.usesLineFraming &&
+        !_deviceSettings.values.containsKey('liveViewAutoReadIntervalMs')) {
+      await _deviceSettings.loadSettings();
+    }
+    if (!mounted || !isConnected) return;
+    _liveView.start(_currentLiveViewInterval());
+  }
+
+  bool _startLiveViewRead() {
+    final started = _triggerManualRead(
+      command: 'readnow',
+      label: 'Live View read',
+      keepPrevious: true,
+    );
+    _liveCycleActive = started;
+    return started;
+  }
+
+  /// Called once whenever Read Now / Read ANTx / a Live View read ends.
+  void _onManualReadFinished(List<RfidReadingRecord> readings) {
+    _safeSetState(() {
+      _latestByAntenna = updateLatestByAntenna(_latestByAntenna, readings);
+    });
+    if (_liveCycleActive) {
+      _liveCycleActive = false;
+      _liveView.readFinished(
+        readOutcomeFromResult(lastReadResult),
+        readings,
+        _manualReadMessage,
+      );
+    }
+  }
+
+  String _formatUtcForDisplay(DateTime utc) {
+    try {
+      final t = tz.TZDateTime.from(utc, tz.getLocation(selectedTimezone));
+      String two(int v) => v.toString().padLeft(2, '0');
+      return '${t.year}-${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}:${two(t.second)}';
+    } catch (_) {
+      return '${utc.toIso8601String()} UTC';
+    }
   }
 
   void _safeSetState(VoidCallback update) {
@@ -288,6 +356,15 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         statusCharacteristic = statusChar;
       });
 
+      // Notice when the reader drops the link (out of range, sleep, reset).
+      await _connectionSubscription?.cancel();
+      _connectionSubscription = device.connectionState.listen((state) {
+        if (state == BluetoothConnectionState.disconnected &&
+            identical(connectedDevice, device)) {
+          _handleUnexpectedDisconnect();
+        }
+      });
+
       // Older firmware answers Unknown command; it stays in legacy mode.
       await commandChar.write(utf8.encode('protocol'));
       _log("Connected to device: ${device.platformName}");
@@ -394,6 +471,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           _manualReadMessage = result.message;
           lastReadData = parsedReadings.isEmpty ? null : parsedReadings.last;
         });
+        _onManualReadFinished(result.readings);
         _cleanupAfterSuccessfulOperation();
       }
       return;
@@ -622,7 +700,8 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       !isReadingRFID &&
       !_isLoadingReadings &&
       !_isFetchingChunks &&
-      !isLoadingData;
+      !isLoadingData &&
+      !_liveView.running;
 
   Future<void> _openDeviceTab() async {
     if (!isConnected || _deviceSettings.busy) return;
@@ -699,12 +778,17 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     }
   }
 
-  void _triggerManualRead({
+  /// Returns true when the read was started.
+  bool _triggerManualRead({
     String command = 'readnow',
     String label = 'Read Now',
+    bool keepPrevious = false,
   }) {
-    if (!isConnected || isReadingRFID || _isLoadingReadings || isLoadingData) return;
-    if (command.startsWith('readant ') && !_responseBuffer.usesLineFraming) return;
+    if (!isConnected || isReadingRFID || _isLoadingReadings || isLoadingData ||
+        _isFetchingChunks || _deviceSettings.busy) {
+      return false;
+    }
+    if (command.startsWith('readant ') && !_responseBuffer.usesLineFraming) return false;
     _responseBuffer.clear();
     _manualReadSession = ManualReadSession(
       expectedAntennas: command == 'readant 1' ? {'ANT1'} :
@@ -717,10 +801,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       _manualReadMessage = null;
       lastReadResult = null;
       lastReadData = null;
-      parsedReadings.clear();
+      if (!keepPrevious) parsedReadings.clear();
     });
     _armManualReadTimeout();
     _sendCommand(command);
+    return true;
   }
 
   void _armManualReadTimeout() {
@@ -736,16 +821,39 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             '${_manualReadSession!.timeout.inSeconds} seconds. '
             'Any readings already received were kept.';
       });
+      _onManualReadFinished(_manualReadSession!.readings);
     });
   }
 
+  Future<void> _handleUnexpectedDisconnect() async {
+    _log("Reader disconnected unexpectedly");
+    final wasBusy = isReadingRFID || _isLoadingReadings || _isFetchingChunks || isLoadingData;
+    await _disconnect();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(wasBusy
+            ? 'Reader disconnected. The current task was stopped; readings already received were kept.'
+            : 'Reader disconnected.'),
+        backgroundColor: Colors.orange,
+      ),
+    );
+  }
+
   Future<void> _disconnect({bool updateState = true}) async {
+    // Cancel first so a deliberate disconnect is not reported as a drop.
+    await _connectionSubscription?.cancel();
+    _connectionSubscription = null;
     _readTimeoutTimer?.cancel();
     _dataRetrievalTimeoutTimer?.cancel();
     _responseBuffer.reset();
     _manualReadSession = null;
     isReadingRFID = false;
     _deviceSettings.reset();
+    _liveCycleActive = false;
+    if (_liveView.running) {
+      _liveView.stop('Live View stopped because the reader disconnected.');
+    }
     await _responseSubscription?.cancel();
     await _statusSubscription?.cancel();
     _responseSubscription = null;
@@ -765,14 +873,21 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     responseCharacteristic = null;
     statusCharacteristic = null;
 
-    if (updateState) {
-      _safeSetState(() {
-        isConnected = false;
-        rfidReadings.clear();
-      });
-    } else {
+    void clearConnectionState() {
       isConnected = false;
       rfidReadings.clear();
+      _isLoadingReadings = false;
+      isLoadingData = false;
+      _isFetchingChunks = false;
+      _waitingForLastReading = false;
+      _totalExpectedReadings = 0;
+      _currentReceivedReadings = 0;
+    }
+
+    if (updateState) {
+      _safeSetState(clearConnectionState);
+    } else {
+      clearConnectionState();
     }
   }
 
@@ -2362,7 +2477,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                     children: [
                       Expanded(
                         child: ElevatedButton.icon(
-                          onPressed: isLoadingData ? null : _retrieveFilteredData,
+                          onPressed: isLoadingData || _liveViewRunning ? null : _retrieveFilteredData,
                           icon: isLoadingData 
                             ? const SizedBox(
                                 width: 16,
@@ -2415,7 +2530,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton.icon(
-                      onPressed: isReadingRFID
+                      onPressed: isReadingRFID || _liveViewRunning
                           ? null
                           : () => _triggerManualRead(
                                 command: 'readnow',
@@ -2447,7 +2562,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                     children: [
                       Expanded(
                         child: ElevatedButton.icon(
-                          onPressed: isReadingRFID || !_responseBuffer.usesLineFraming
+                          onPressed: isReadingRFID || _liveViewRunning || !_responseBuffer.usesLineFraming
                               ? null
                               : () => _triggerManualRead(
                                     command: 'readant 1',
@@ -2477,7 +2592,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: ElevatedButton.icon(
-                          onPressed: isReadingRFID || !_responseBuffer.usesLineFraming
+                          onPressed: isReadingRFID || _liveViewRunning || !_responseBuffer.usesLineFraming
                               ? null
                               : () => _triggerManualRead(
                                     command: 'readant 2',
@@ -2517,7 +2632,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                     children: [
                       Expanded(
                         child: ElevatedButton.icon(
-                          onPressed: () => _sendCommand('last'),
+                          onPressed: _liveViewRunning ? null : () => _sendCommand('last'),
                         icon: const Icon(Icons.history, size: 16),
                         label: const Text(
                           'Last Reading',
@@ -2536,7 +2651,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: ElevatedButton.icon(
-                          onPressed: _isLoadingReadings ? null : () => _sendCommand('print'),
+                          onPressed: _isLoadingReadings || _liveViewRunning ? null : () => _sendCommand('print'),
                         icon: _isLoadingReadings
                           ? const SizedBox(
                               width: 14,
@@ -2581,8 +2696,17 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
             ),
           ),
           
+          const SizedBox(height: 16),
+          LiveViewPanel(
+            controller: _liveView,
+            latestByAntenna: _latestByAntenna,
+            isConnected: isConnected,
+            onToggle: _toggleLiveView,
+            formatTime: _formatUtcForDisplay,
+          ),
+
           // Manual Read Result Display
-          if (lastReadResult != null) ...[
+          if (lastReadResult != null && !_liveViewRunning) ...[
             const SizedBox(height: 16),
             Card(
               color: lastReadResult == "success" 
@@ -3663,12 +3787,15 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     _scanResultsSubscription?.cancel();
     _responseSubscription?.cancel();
     _statusSubscription?.cancel();
+    _connectionSubscription?.cancel();
     if (FlutterBluePlus.isScanningNow) {
       unawaited(FlutterBluePlus.stopScan());
     }
     _horizontalScrollController.dispose();
     unawaited(_disconnect(updateState: false));
     _deviceSettings.dispose();
+    _liveView.removeListener(_onLiveViewChanged);
+    _liveView.dispose();
     super.dispose();
   }
 }

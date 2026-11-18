@@ -24,7 +24,10 @@ The original planning baseline is preserved below. The implementation update des
 - New **Device** tab: reader status cards (battery, stored readings, dashboard/idle mode, low-battery idle, USB recovery, LED) from `status`, and a settings list using `get <var>` / `set <var> <value>` for the 12 dashboard settings (all except `dashboardModeActive`).
 - The app edits seconds/volts/percent and sends firmware units. Limits match the USB dashboard, because firmware does not range-check `rfidOnTimeMs`, `periodicIntervalMs` or `longPressMs`. Each `set` must reply `OK` and is confirmed by a fresh `get`.
 - Status works with any firmware; settings are shown only after `RFID_PROTOCOL_V2`. Requests run one at a time and are refused while a read or history transfer is running.
-- Still not implemented: Live View, per-antenna latest cards, Dashboard Mode toggle, clear device storage. Verified by unit/widget tests only, not on a real phone and board.
+- **Live View** (Filter & Graph tab): repeats `readnow` like the USB dashboard. It waits `liveViewAutoReadIntervalMs` after each read, kept between 8 and 300 s and at least `2 × rfidOnTimeMs + 2 s`. It pauses on a missing completion marker or a blocked (idle) read, and after two failed reads in a row. While it runs, manual reads, history and Device-tab commands are disabled. Readings are added to the table and chart.
+- **Latest reading cards** for ANT1 and ANT2, updated by Read Now, Read ANTx and Live View.
+- The app now notices when the reader drops the BLE link, stops the current task and keeps the readings it already received.
+- Still not implemented: Dashboard Mode toggle, clear device storage. Verified by unit/widget tests only, not on a real phone and board.
 
 ## Original Planning Baseline
 

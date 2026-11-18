@@ -46,4 +46,21 @@ void main() {
       findsOneWidget,
     );
   });
+
+  testWidgets('Live View switch is off and disabled without a reader', (
+    WidgetTester tester,
+  ) async {
+    FlutterBluePlusPlatform.instance = FakeFlutterBluePlusPlatform();
+
+    await tester.pumpWidget(const RFIDReaderApp());
+    await tester.pump();
+    await tester.tap(find.text('Filter & Graph'));
+    await tester.pump();
+
+    expect(find.text('📡 Live View'), findsOneWidget);
+    final liveSwitch = tester.widget<Switch>(find.byType(Switch));
+    expect(liveSwitch.value, isFalse);
+    expect(liveSwitch.onChanged, isNull);
+    expect(find.text('No reading yet'), findsNWidgets(2));
+  });
 }
