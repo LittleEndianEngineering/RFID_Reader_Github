@@ -1,0 +1,77 @@
+name: Build RFID Reader 2026 customer dashboards
+# Delivered firmware: 1.5 / main_2Ant / dbf098dbd869d88fe63274aad421fdba6d7ed18a.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'customer/final-deliverable-*'
+      - 'customer/windows-dashboard-*'
+    paths:
+      - 'Rfid134-master/dashboard/customer/src/**'
+      - 'Rfid134-master/dashboard/customer/packaging/**'
+      - 'Rfid134-master/dashboard/customer/tests/**'
+      - '.github/workflows/build-customer-dashboard.yml'
+permissions:
+  contents: read
+jobs:
+  dashboard:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            architecture: x64
+            target: windows-x64
+          - runner: macos-15
+            architecture: arm64
+            target: macos-arm64
+          - runner: macos-15-intel
+            architecture: x64
+            target: macos-x64
+          - runner: ubuntu-22.04
+            architecture: x64
+            target: linux-x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: Rfid134-master/dashboard/customer
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+          architecture: ${{ matrix.architecture }}
+      - name: Install Linux desktop test libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth python3-tk libx11-6 libxext6 libxrender1 libxss1
+      - name: Install pinned build dependencies
+        run: python -m pip install -r packaging/requirements-build.txt
+      - name: Build and verify Windows or macOS
+        if: runner.os != 'Linux'
+        run: python packaging/build.py --target '${{ matrix.target }}'
+      - name: Build and verify Linux with a virtual display
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum python packaging/build.py --target '${{ matrix.target }}'
+      - name: Upload deliverable and verification results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: RFIDReader2026-${{ matrix.target }}
+          path: Rfid134-master/dashboard/customer/dist/${{ matrix.target }}/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: RFIDReader2026-${{ matrix.target }}-diagnostics
+          path: |
+            Rfid134-master/dashboard/customer/dist/${{ matrix.target }}/*.json
+            Rfid134-master/dashboard/customer/dist/${{ matrix.target }}/*.log
+            Rfid134-master/dashboard/customer/build/${{ matrix.target }}/work/RFIDDashboard/warn-RFIDDashboard.txt
+          if-no-files-found: ignore
+          retention-days: 7

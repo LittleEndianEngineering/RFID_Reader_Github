@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "health": true,
+  "frontend_assets": [
+    "static/js/index.CAj-7vWz.js",
+    "static/css/index.BpABIXK9.css"
+  ],
+  "shutdown_released_port": true
+}

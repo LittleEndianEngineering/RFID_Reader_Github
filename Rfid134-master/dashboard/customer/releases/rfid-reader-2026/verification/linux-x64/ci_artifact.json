@@ -1,0 +1,19 @@
+{
+  "id": 14338047127,
+  "name": "RFIDReader2026-linux-x64",
+  "size_in_bytes": 132815760,
+  "url": "https://api.github.com/repos/LittleEndianEngineering/RFID_Reader_Github/actions/artifacts/14338047127",
+  "archive_download_url": "https://api.github.com/repos/LittleEndianEngineering/RFID_Reader_Github/actions/artifacts/14338047127/zip",
+  "expired": false,
+  "created_at": "2026-11-17T14:39:02Z",
+  "expires_at": "2026-12-17T14:38:57Z",
+  "updated_at": "2026-11-17T14:39:02Z",
+  "digest": "sha256:50186b7584a3141399d828d955de4bdb6a83a46e023dfc68b08ef16e31846a8e",
+  "workflow_run": {
+    "id": 44104997815,
+    "repository_id": 1090665695,
+    "head_repository_id": 1090665695,
+    "head_branch": "customer/final-deliverable-rfid-reader-2026",
+    "head_sha": "4f1f01e22cb9411a7b76aa0c45fdf358053cc1a1"
+  }
+}
