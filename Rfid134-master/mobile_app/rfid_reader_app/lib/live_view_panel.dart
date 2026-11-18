@@ -118,7 +118,7 @@ class LiveViewPanel extends StatelessWidget {
   String _subtitle() {
     if (!controller.running) {
       return 'Reads both antennas again and again, like the USB dashboard. '
-          'The time between reads is the Live View interval on the Device tab.';
+          'The time between reads is the Live View interval on the Configuration tab.';
     }
     final parts = <String>['Every ${controller.interval.inSeconds} s', '${controller.cycles} read(s)'];
     final next = controller.nextReadAt;

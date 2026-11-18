@@ -721,7 +721,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     if (isReadingRFID && command != 'readnow' && !command.startsWith('readant ')) return;
     if (_deviceSettings.busy) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please wait: the reader is busy with the Device tab.')),
+        const SnackBar(content: Text('Please wait: the reader is busy with the Configuration tab.')),
       );
       return;
     }
@@ -2066,7 +2066,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
           ),
           BottomNavigationBarItem(
             icon: Icon(Icons.tune),
-            label: 'Device',
+            label: 'Configuration',
           ),
           BottomNavigationBarItem(
             icon: Icon(Icons.info),

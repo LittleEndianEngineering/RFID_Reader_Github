@@ -31,14 +31,14 @@ void main() {
     expect(find.byIcon(Icons.bluetooth_searching), findsOneWidget);
   });
 
-  testWidgets('Device tab asks to connect when no reader is connected', (
+  testWidgets('Configuration tab asks to connect when no reader is connected', (
     WidgetTester tester,
   ) async {
     FlutterBluePlusPlatform.instance = FakeFlutterBluePlusPlatform();
 
     await tester.pumpWidget(const RFIDReaderApp());
     await tester.pump();
-    await tester.tap(find.text('Device'));
+    await tester.tap(find.text('Configuration'));
     await tester.pump();
 
     expect(
