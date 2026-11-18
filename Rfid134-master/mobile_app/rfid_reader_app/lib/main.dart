@@ -14,16 +14,19 @@ import 'package:timezone/timezone.dart' as tz;
 import 'package:timezone/data/latest_all.dart' as tz_data;
 import 'package:flutter/foundation.dart';
 
+import 'ble_protocol.dart';
+
 // Static function for CSV generation in isolate
 String _generateCSVContent(List<Map<String, dynamic>> readings) {
   final csvBuffer = StringBuffer();
-  csvBuffer.writeln('Reading #,Timestamp,Country,Tag ID,Temperature (°C)');
+  csvBuffer.writeln('Reading #,Timestamp,Country,Tag ID,Temperature (°C),Antenna');
   
   for (var reading in readings) {
     final tempStr = reading['temperature'] != null
         ? (reading['temperature'] as double).toStringAsFixed(2)
         : 'N/A';
-    csvBuffer.writeln('${reading['readingNum']},${reading['timestamp']},${reading['country']},${reading['tag']},$tempStr');
+    final antenna = reading['antenna'] ?? 'ANT1';
+    csvBuffer.writeln('${reading['readingNum']},${reading['timestamp']},${reading['country']},${reading['tag']},$tempStr,$antenna');
   }
   
   return csvBuffer.toString();
@@ -96,6 +99,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   StreamSubscription<List<ScanResult>>? _scanResultsSubscription;
   StreamSubscription<List<int>>? _responseSubscription;
   StreamSubscription<List<int>>? _statusSubscription;
+  final BleResponseBuffer _responseBuffer = BleResponseBuffer();
   
   // Date/Time filtering (matching dashboard functionality)
   DateTime startDate = DateTime.now().subtract(const Duration(days: 7));
@@ -112,6 +116,9 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
   bool isReadingRFID = false;
   String? lastReadResult; // "success" or "no_tag" or null
   Map<String, dynamic>? lastReadData; // The actual reading data if successful
+  String _manualReadLabel = 'Read Now';
+  String? _manualReadMessage;
+  ManualReadSession? _manualReadSession;
   Timer? _readTimeoutTimer; // Timeout timer for Read Now button
   Timer? _dataRetrievalTimeoutTimer; // Timeout timer for data retrieval (30 seconds)
 
@@ -203,7 +210,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       BluetoothCharacteristic? commandChar;
       BluetoothCharacteristic? responseChar;
       BluetoothCharacteristic? statusChar;
-      
+
       for (BluetoothService service in services) {
         if (service.uuid.toString().toUpperCase() == SERVICE_UUID.toUpperCase()) {
           for (BluetoothCharacteristic characteristic in service.characteristics) {
@@ -236,6 +243,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       await _responseSubscription?.cancel();
       await _statusSubscription?.cancel();
 
+      _responseBuffer.reset();
       await responseChar.setNotifyValue(true);
       await statusChar.setNotifyValue(true);
 
@@ -249,7 +257,9 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         responseCharacteristic = responseChar;
         statusCharacteristic = statusChar;
       });
-      
+
+      // Older firmware answers Unknown command; it stays in legacy mode.
+      await commandChar.write(utf8.encode('protocol'));
       print("Connected to device: ${device.platformName}");
     } catch (e) {
       print("Error connecting to device: $e");
@@ -290,11 +300,25 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
 
   void _handleESP32Response(List<int> value) {
     if (!mounted) return;
-    String response = utf8.decode(value);
+    final messages = _responseBuffer.add(
+      value,
+      (bytes) => utf8.decode(bytes, allowMalformed: true),
+    );
+
+    for (final message in messages) {
+      _handleESP32ResponseText(message, value.length);
+    }
+    if (messages.contains(BleResponseBuffer.protocolMarker)) {
+      setState(() {}); // Refresh availability of firmware-dependent controls.
+    }
+  }
+
+  void _handleESP32ResponseText(String response, int sourceByteLength) {
+    if (!mounted) return;
     
     // Log empty responses to help diagnose BLE issues
     if (response.isEmpty || response.trim().isEmpty) {
-      print("⚠️ Received EMPTY ESP32 response (length: ${value.length}) - possible BLE buffer issue");
+      print("⚠️ Received EMPTY ESP32 response (length: $sourceByteLength) - possible BLE buffer issue");
       return; // Don't process empty responses
     }
     
@@ -307,98 +331,37 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       print("📊 [PRINT DEBUG] Response #$_printResponseCount | Length: ${response.length} bytes | Preview: ${response.length > 100 ? response.substring(0, 100) + '...' : response}");
     }
     
-    print("🔍 Received ESP32 response: $response (length: ${response.length}, bytes: ${value.length})");
+    print("🔍 Received ESP32 response: $response (length: ${response.length}, bytes: $sourceByteLength)");
     
     _safeSetState(() {
       rfidReadings.add(response);
     });
     
-    // Check for error responses that indicate device reset or failure
-    if (isReadingRFID && (response.contains('[RTC]') || response.contains('Guru Meditation') || response.contains('Rebooting'))) {
-      print("⚠️ Device error detected during read");
-      _readTimeoutTimer?.cancel();
-      setState(() {
-        isReadingRFID = false;
-        lastReadResult = "error";
-        lastReadData = null;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Device error detected. Check RTC connection and power.'),
-          backgroundColor: Colors.red,
-          duration: Duration(seconds: 3),
-        ),
-      );
-    }
-    
-    // Check for manual RFID read results
-    if (isReadingRFID) {
-      // Check if reading data is in this response (might come with tag detected message)
-      bool hasReadingData = response.startsWith('#') && (response.contains('°C') || response.contains('N/A'));
-      
-      if (response.contains('[RFID] Tag detected and stored') || 
-          response.contains('Tag detected and stored')) {
-        print("✅ RFID TAG DETECTED!");
-        _readTimeoutTimer?.cancel(); // Cancel timeout - we got a response
-        
-        // If reading data is in the same response, parse it immediately and show success
-        if (hasReadingData) {
-          print("📊 Reading data found in same response - parsing immediately");
-          _parseReadings(response);
-          if (parsedReadings.isNotEmpty) {
-            setState(() {
-              isReadingRFID = false;
-              lastReadResult = "success";
-              lastReadData = parsedReadings.last;
-              // Clear parsedReadings for manual read (we only want to show the last one)
-              parsedReadings.clear();
-              parsedReadings.add(lastReadData!);
-            });
-            // Clean buffers after successful Read Now operation
-            _cleanupAfterSuccessfulOperation();
-            return; // Exit early - we've handled everything
-          }
-        }
-        
-        // If no reading data yet, DON'T set success flag yet - wait for reading data
-        // Keep isReadingRFID = true so we can catch the reading data in the next response
-        // This prevents showing "RFID Tag Detected!" with "No data available"
-        print("⏳ Waiting for reading data in next response...");
-        // Don't update state yet - wait for reading data
-      } else if (response.contains('[RFID] No tag detected during window') ||
-                 response.contains('No tag detected during window')) {
-        print("❌ NO RFID TAG DETECTED");
-        _readTimeoutTimer?.cancel(); // Cancel timeout - we got a response
+    // Keep collecting antenna results until the entire command completes.
+    if (isReadingRFID && _manualReadSession != null) {
+      final result = _manualReadSession!.add(response);
+      if (response.contains('read window (')) {
+        _armManualReadTimeout();
+      }
+      if (result.type != ManualReadResponseType.pending) {
+        _readTimeoutTimer?.cancel();
+        _appendParsedProtocolReadings(result.readings);
         setState(() {
           isReadingRFID = false;
-          lastReadResult = "no_tag";
-          lastReadData = null;
+          lastReadResult = switch (result.type) {
+            ManualReadResponseType.success => 'success',
+            ManualReadResponseType.noTag => 'no_tag',
+            ManualReadResponseType.blocked => 'blocked',
+            _ => 'error',
+          };
+          _manualReadMessage = result.message;
+          lastReadData = parsedReadings.isEmpty ? null : parsedReadings.last;
         });
-      } else if (hasReadingData && isReadingRFID) {
-        // This is the reading data after tag detection (could be same or separate response)
-        // NOTE: The reading is already stored on ESP32 by powerOnAndReadTagWindow()
-        // We parse it here for display only - it will appear in "All Readings" when retrieved
-        // Handles both temperature values and "N/A" for tags without temperature
-        print("📊 PARSING LIVE READING DATA");
-        _readTimeoutTimer?.cancel(); // Cancel timeout - we got the reading data
-        _parseReadings(response);
-        // Extract the reading data from parsedReadings for display
-        if (parsedReadings.isNotEmpty) {
-          setState(() {
-            isReadingRFID = false;
-            lastReadResult = "success"; // NOW set success - we have the data
-            lastReadData = parsedReadings.last;
-            // Clear parsedReadings for manual read (we only want to show the last one)
-            // The reading is stored on ESP32, so it will appear in "All Readings"
-            parsedReadings.clear();
-            parsedReadings.add(lastReadData!);
-          });
-          // Clean buffers after successful Read Now operation
-          _cleanupAfterSuccessfulOperation();
-        }
+        _cleanupAfterSuccessfulOperation();
       }
+      return;
     }
-    
+
     // Check if this is the start of a new query (clear previous readings)
     // Only clear on ---BEGIN_READINGS--- or Found, NOT on "Printing X stored readings:"
     // because "Printing" comes AFTER ---BEGIN_READINGS--- and would clear already-parsed readings
@@ -581,7 +544,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         _currentChunkIndex = currentChunk - 1; // Convert to 0-based index
         _totalChunks = totalChunks;
       }
-    } else if (response.startsWith('#') && (response.contains('°C') || response.contains('N/A'))) {
+    } else if (_responseContainsReadingData(response)) {
       // This is a reading line - check which context it belongs to
       if (isReadingRFID) {
         // Individual reading from "Read Now" - already handled above, skip here
@@ -615,11 +578,12 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
 
   void _handleESP32Status(List<int> value) {
     if (!mounted) return;
-    String status = utf8.decode(value);
+    String status = utf8.decode(value, allowMalformed: true);
     print("Received ESP32 status: $status");
   }
 
   void _sendCommand(String command) {
+    if (isReadingRFID && command != 'readnow' && !command.startsWith('readant ')) return;
     if (commandCharacteristic != null) {
       // Clear previous readings when starting a new query
       // NOTE: For 'print' (All Readings), we clear to get fresh data from ESP32
@@ -640,6 +604,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
         _printResponseCount = 0;
         _totalReadingsReceived = 0;
         _lastParsedCount = 0;
+        _responseBuffer.clear();
         // Reset pagination state
         _currentChunkIndex = 0;
         _totalChunks = 0;
@@ -673,44 +638,52 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     }
   }
 
-  void _triggerManualRead() {
-    if (!isConnected || isReadingRFID) return;
-    
+  void _triggerManualRead({
+    String command = 'readnow',
+    String label = 'Read Now',
+  }) {
+    if (!isConnected || isReadingRFID || _isLoadingReadings || isLoadingData) return;
+    if (command.startsWith('readant ') && !_responseBuffer.usesLineFraming) return;
+    _responseBuffer.clear();
+    _manualReadSession = ManualReadSession(
+      expectedAntennas: command == 'readant 1' ? {'ANT1'} :
+          command == 'readant 2' ? {'ANT2'} : {'ANT1', 'ANT2'},
+      requiresCompletionMarker: _responseBuffer.usesLineFraming,
+    );
     setState(() {
       isReadingRFID = true;
+      _manualReadLabel = label;
+      _manualReadMessage = null;
       lastReadResult = null;
       lastReadData = null;
-      parsedReadings.clear(); // Clear previous readings for manual read display
-      // NOTE: The reading will be stored on ESP32 and will appear in "All Readings"
+      parsedReadings.clear();
     });
-    
-    // Start timeout timer (15 seconds - enough for RFID read window + processing)
+    _armManualReadTimeout();
+    _sendCommand(command);
+  }
+
+  void _armManualReadTimeout() {
     _readTimeoutTimer?.cancel();
-    _readTimeoutTimer = Timer(const Duration(seconds: 15), () {
-      if (!mounted) return;
-      if (isReadingRFID) {
-        print("⏱️ Read Now timeout - no response received");
-        setState(() {
-          isReadingRFID = false;
-          lastReadResult = "timeout";
-          lastReadData = null;
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Read timeout: No response from device. Device may have reset.'),
-            backgroundColor: Colors.orange,
-            duration: Duration(seconds: 3),
-          ),
-        );
-      }
+    _readTimeoutTimer = Timer(_manualReadSession!.timeout, () {
+      if (!mounted || !isReadingRFID) return;
+      _appendParsedProtocolReadings(_manualReadSession!.readings);
+      setState(() {
+        isReadingRFID = false;
+        lastReadResult = 'timeout';
+        lastReadData = parsedReadings.isEmpty ? null : parsedReadings.last;
+        _manualReadMessage = 'The reader did not complete $_manualReadLabel within '
+            '${_manualReadSession!.timeout.inSeconds} seconds. '
+            'Any readings already received were kept.';
+      });
     });
-    
-    _sendCommand('readnow');
   }
 
   Future<void> _disconnect({bool updateState = true}) async {
     _readTimeoutTimer?.cancel();
     _dataRetrievalTimeoutTimer?.cancel();
+    _responseBuffer.reset();
+    _manualReadSession = null;
+    isReadingRFID = false;
     await _responseSubscription?.cancel();
     await _statusSubscription?.cancel();
     _responseSubscription = null;
@@ -745,6 +718,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     setState(() {
       rfidReadings.clear();
     });
+    _responseBuffer.clear();
   }
 
   void _cleanupAfterSuccessfulOperation() {
@@ -1080,8 +1054,106 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     }
   }
 
+  String _formatUtcDateTimeToTimezone(DateTime utcDateTime) {
+    final timeZoneLocation = tz.getLocation(selectedTimezone);
+    final localDateTime = tz.TZDateTime.from(utcDateTime.toUtc(), timeZoneLocation);
+    final year = localDateTime.year.toString();
+    final month = localDateTime.month.toString().padLeft(2, '0');
+    final day = localDateTime.day.toString().padLeft(2, '0');
+    final hour = localDateTime.hour.toString().padLeft(2, '0');
+    final minute = localDateTime.minute.toString().padLeft(2, '0');
+    final second = localDateTime.second.toString().padLeft(2, '0');
+
+    return '$year-$month-$day $hour:$minute:$second';
+  }
+
+  bool _responseContainsReadingData(String response) {
+    return BleProtocolParser.parseReadings(response).isNotEmpty;
+  }
+
+  Map<String, dynamic>? _recordToReadingMap(RfidReadingRecord record) {
+    final utcDateTime = record.timestampUtc;
+    if (utcDateTime == null) {
+      print("⚠️ Skipping reading #${record.readingNum}: invalid timestamp '${record.timestampText}'");
+      return null;
+    }
+
+    return {
+      'readingNum': record.readingNum.toString(),
+      'timestamp': _formatUtcDateTimeToTimezone(utcDateTime),
+      'country': record.country,
+      'tag': record.tag,
+      'temperature': record.temperatureC,
+      'antenna': record.antenna,
+      'dateTime': utcDateTime.toUtc(),
+      'source': record.source,
+    };
+  }
+
+  bool _sameTemperature(double? left, double? right) {
+    if (left == null || right == null) return left == right;
+    return (left - right).abs() < 0.01;
+  }
+
+  bool _isDuplicateReading(
+    Map<String, dynamic> candidate,
+    Iterable<Map<String, dynamic>> existingReadings,
+  ) {
+    final candidateDateTime = candidate['dateTime'] as DateTime;
+    final candidateTemperature = candidate['temperature'] as double?;
+    final candidateAntenna = candidate['antenna'] ?? 'ANT1';
+
+    return existingReadings.any((existing) {
+      final existingDateTime = existing['dateTime'] as DateTime;
+      final existingTemperature = existing['temperature'] as double?;
+      final existingAntenna = existing['antenna'] ?? 'ANT1';
+
+      return existing['country'] == candidate['country'] &&
+          existing['tag'] == candidate['tag'] &&
+          existingAntenna == candidateAntenna &&
+          _sameTemperature(existingTemperature, candidateTemperature) &&
+          existingDateTime.difference(candidateDateTime).inSeconds.abs() <= 1;
+    });
+  }
+
+  void _appendParsedProtocolReadings(List<RfidReadingRecord> records) {
+    final newReadings = <Map<String, dynamic>>[];
+
+    for (final record in records) {
+      final reading = _recordToReadingMap(record);
+      if (reading == null) continue;
+
+      final isDuplicate = _isDuplicateReading(reading, parsedReadings) ||
+          _isDuplicateReading(reading, newReadings);
+      if (isDuplicate) {
+        print("⚠️ Duplicate skipped: ${record.country}, ${record.tag}, ${record.antenna}, ${record.temperatureC ?? 'N/A'}");
+        continue;
+      }
+
+      newReadings.add(reading);
+    }
+
+    if (newReadings.isEmpty) return;
+
+    setState(() {
+      parsedReadings.addAll(newReadings);
+      _currentReceivedReadings = parsedReadings.length;
+    });
+
+    if (_isLoadingReadings) {
+      _lastReceivedCount = _currentReceivedReadings;
+      _startDataRetrievalTimeout();
+    }
+  }
+
   void _parseReadings(String response) {
     final initialCount = parsedReadings.length;
+
+    final protocolReadings = BleProtocolParser.parseReadings(response);
+    if (protocolReadings.isNotEmpty) {
+      _appendParsedProtocolReadings(protocolReadings);
+      return;
+    }
     
     // Handle individual reading responses (format: #X: timestamp, country, tag, temperature)
     // IMPORTANT: Handle concatenated readings (multiple #X: patterns in one response)
@@ -2271,45 +2343,123 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                   ),
                   const SizedBox(height: 16),
                   
-                  // Quick action buttons in a grid
-                  GridView.count(
-                    crossAxisCount: 3,
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    childAspectRatio: 2.2, // Reduced to give more vertical space for text
-                    mainAxisSpacing: 8,
-                    crossAxisSpacing: 8,
+                  Text(
+                    'Manual Read',
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      onPressed: isReadingRFID
+                          ? null
+                          : () => _triggerManualRead(
+                                command: 'readnow',
+                                label: 'Read Now',
+                              ),
+                      icon: isReadingRFID
+                        ? const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.radio_button_checked, size: 16),
+                      label: Text(
+                        isReadingRFID ? 'Reading...' : 'Read Now',
+                        style: const TextStyle(fontSize: 12),
+                        textAlign: TextAlign.center,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
                     children: [
-                      ElevatedButton.icon(
-                        onPressed: isReadingRFID ? null : _triggerManualRead,
-                        icon: isReadingRFID 
-                          ? const SizedBox(
-                              width: 14,
-                              height: 14,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.radio_button_checked, size: 16),
-                        label: Text(
-                          isReadingRFID ? 'Reading...' : 'Read Now',
-                          style: const TextStyle(fontSize: 10),
-                          textAlign: TextAlign.center,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.green,
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: isReadingRFID || !_responseBuffer.usesLineFraming
+                              ? null
+                              : () => _triggerManualRead(
+                                    command: 'readant 1',
+                                    label: 'Read ANT1',
+                                  ),
+                          icon: isReadingRFID
+                              ? const SizedBox(
+                                  width: 14,
+                                  height: 14,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : const Icon(Icons.radio_button_checked, size: 16),
+                          label: Text(
+                            isReadingRFID ? 'Reading...' : 'Read ANT1',
+                            style: const TextStyle(fontSize: 10),
+                            textAlign: TextAlign.center,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.green,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+                          ),
                         ),
                       ),
-                      ElevatedButton.icon(
-                        onPressed: () => _sendCommand('last'),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: isReadingRFID || !_responseBuffer.usesLineFraming
+                              ? null
+                              : () => _triggerManualRead(
+                                    command: 'readant 2',
+                                    label: 'Read ANT2',
+                                  ),
+                          icon: isReadingRFID
+                            ? const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.radio_button_checked, size: 16),
+                          label: Text(
+                            isReadingRFID ? 'Reading...' : 'Read ANT2',
+                            style: const TextStyle(fontSize: 10),
+                            textAlign: TextAlign.center,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.green,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  const SizedBox(height: 16),
+                  Text(
+                    'Retrieve Readings',
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: () => _sendCommand('last'),
                         icon: const Icon(Icons.history, size: 16),
                         label: const Text(
-                          'Last\nReading',
+                          'Last Reading',
                           style: TextStyle(fontSize: 10),
                           textAlign: TextAlign.center,
-                          maxLines: 2,
+                          maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
                         style: ElevatedButton.styleFrom(
@@ -2318,8 +2468,11 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                           padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
                         ),
                       ),
-                      ElevatedButton.icon(
-                        onPressed: _isLoadingReadings ? null : () => _sendCommand('print'),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: _isLoadingReadings ? null : () => _sendCommand('print'),
                         icon: _isLoadingReadings
                           ? const SizedBox(
                               width: 14,
@@ -2328,10 +2481,10 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                             )
                           : const Icon(Icons.list, size: 16),
                         label: Text(
-                          _isLoadingReadings ? 'Loading...' : 'All\nReadings',
+                          _isLoadingReadings ? 'Loading...' : 'All Readings',
                           style: const TextStyle(fontSize: 10),
                           textAlign: TextAlign.center,
-                          maxLines: 2,
+                          maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
                         style: ElevatedButton.styleFrom(
@@ -2339,6 +2492,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                           foregroundColor: Colors.white,
                           padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
                         ),
+                      ),
                       ),
                     ],
                   ),
@@ -2395,12 +2549,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                         const SizedBox(width: 8),
                         Text(
                           lastReadResult == "success" 
-                              ? 'RFID Tag Detected!' 
+                              ? '$_manualReadLabel Complete'
                               : lastReadResult == "timeout"
                                   ? 'Read Timeout'
                                   : lastReadResult == "error"
                                       ? 'Device Error'
-                                      : 'No RFID Tag Detected',
+                                      : lastReadResult == 'blocked'
+                                          ? 'Read Blocked'
+                                          : 'No RFID Tag Detected',
                           style: TextStyle(
                             fontSize: 18,
                             fontWeight: FontWeight.bold,
@@ -2413,15 +2569,23 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                         ),
                       ],
                     ),
-                    if (lastReadResult == "timeout" || lastReadResult == "error") ...[
+                    if (lastReadResult == "timeout" || lastReadResult == "error" || lastReadResult == "blocked") ...[
                       const SizedBox(height: 8),
                       Text(
-                        lastReadResult == "timeout"
-                            ? 'No response received from device within 15 seconds. The device may have reset.'
-                            : 'Device error detected.',
+                        _manualReadMessage ?? 'The reader could not complete this read.',
                         style: TextStyle(
                           fontSize: 14,
                           color: Colors.red[700],
+                        ),
+                      ),
+                    ],
+                    if (lastReadResult == "no_tag") ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        'No tag was detected during $_manualReadLabel.',
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: Colors.orange[700],
                         ),
                       ),
                     ],
@@ -2479,6 +2643,15 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                       const SizedBox(height: 8),
                       Text(
                         'Timestamp: ${lastReadData!['timestamp']}',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.grey[600],
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Antenna: ${lastReadData!['antenna'] ?? 'ANT1'} '
+                        '(${parsedReadings.length} reading(s) received)',
                         style: TextStyle(
                           fontSize: 12,
                           color: Colors.grey[600],
@@ -2655,6 +2828,14 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                                         const SizedBox(width: 16),
                                         if (isTablet)
                                           Expanded(
+                                            flex: 1,
+                                            child: const Text('Antenna', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                                          )
+                                        else
+                                          SizedBox(width: 70, child: const Text('Antenna', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold))),
+                                        const SizedBox(width: 16),
+                                        if (isTablet)
+                                          Expanded(
                                             flex: 3,
                                             child: const Text('Tag ID', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
                                           )
@@ -2797,6 +2978,55 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                                                     const SizedBox(height: 2),
                                                     Text(
                                                       'Country',
+                                                      style: TextStyle(
+                                                        fontSize: 10,
+                                                        color: Colors.grey[600],
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                            const SizedBox(width: 16),
+                                            if (isTablet)
+                                              Expanded(
+                                                flex: 1,
+                                                child: Column(
+                                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                                  children: [
+                                                    Text(
+                                                      reading['antenna'] ?? 'ANT1',
+                                                      style: const TextStyle(
+                                                        fontSize: 12,
+                                                        fontWeight: FontWeight.w500,
+                                                      ),
+                                                    ),
+                                                    const SizedBox(height: 2),
+                                                    Text(
+                                                      'Antenna',
+                                                      style: TextStyle(
+                                                        fontSize: 11,
+                                                        color: Colors.grey[600],
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              )
+                                            else
+                                              SizedBox(
+                                                width: 70,
+                                                child: Column(
+                                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                                  children: [
+                                                    Text(
+                                                      reading['antenna'] ?? 'ANT1',
+                                                      style: const TextStyle(
+                                                        fontSize: 10,
+                                                        fontWeight: FontWeight.w500,
+                                                      ),
+                                                    ),
+                                                    const SizedBox(height: 2),
+                                                    Text(
+                                                      'Antenna',
                                                       style: TextStyle(
                                                         fontSize: 10,
                                                         color: Colors.grey[600],
@@ -3210,10 +3440,10 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
     final sortedReadings = List<Map<String, dynamic>>.from(validReadings);
     sortedReadings.sort((a, b) => (a['dateTime'] as DateTime).compareTo(b['dateTime'] as DateTime));
 
-    // Group readings by tag (country + tag ID)
+    // Group readings by tag and antenna so dual-antenna reads stay distinct.
     final Map<String, List<Map<String, dynamic>>> readingsByTag = {};
     for (var reading in sortedReadings) {
-      final tagKey = '${reading['country']}_${reading['tag']}';
+      final tagKey = '${reading['country']}_${reading['tag']}_${reading['antenna'] ?? 'ANT1'}';
       if (!readingsByTag.containsKey(tagKey)) {
         readingsByTag[tagKey] = [];
       }
@@ -3267,11 +3497,6 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
       // Get color for this tag
       final color = tagColors[colorIndex % tagColors.length];
       colorIndex++;
-      
-      // Create tag label (country + last 4 digits of tag ID)
-      final tagLabel = tagReadings.isNotEmpty 
-          ? '${tagReadings.first['country']}-${tagReadings.first['tag'].toString().substring(tagReadings.first['tag'].toString().length - 4)}'
-          : tagKey;
       
       lineBarsData.add(
         LineChartBarData(
@@ -3348,7 +3573,7 @@ class _RFIDReaderScreenState extends State<RFIDReaderScreen> {
                 final index = spot.x.toInt();
                 if (index < sortedReadings.length) {
                   final reading = sortedReadings[index];
-                  final tagLabel = '${reading['country']}-${reading['tag'].toString().substring(reading['tag'].toString().length - 4)}';
+                  final tagLabel = '${reading['country']}-${reading['tag'].toString().substring(reading['tag'].toString().length - 4)} ${reading['antenna'] ?? 'ANT1'}';
                   final tempStr = reading['temperature'] != null
                       ? '${(reading['temperature'] as double).toStringAsFixed(1)}°C'
                       : 'N/A';

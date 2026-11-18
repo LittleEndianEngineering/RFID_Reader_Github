@@ -92,6 +92,7 @@ Scope:
 - Configuration screen for RFID on time, periodic interval, Live View interval, long press, low-SoC settings, battery calibration, verbose logging, dashboard mode, and LED heartbeat timing.
 - Clear display vs clear device storage, with confirmation for destructive storage clear.
 - Live View auto-read using `readnow` and `[RFID_RESULT]` records.
+- Quick actions should keep `Read Now` as the dual-antenna read and add `Read ANT1` / `Read ANT2` buttons that send `readant 1` and `readant 2`.
 
 ## Step 6: End-To-End Verification
 
